@@ -200,16 +200,19 @@ jobs:
             *) echo "::error::no sccache checksum for $PLATFORM"; exit 1 ;;
           esac
           name="sccache-$SCCACHE_VERSION-$PLATFORM"
+          # Windows: a POSIX path for Git Bash's tar, which reads "D:\..." as
+          # a remote host "D" ("Cannot connect to D: resolve failed").
           dir="$RUNNER_TEMP/sccache"
+          if command -v cygpath >/dev/null; then dir=$(cygpath -u "$dir"); fi
           mkdir -p "$dir"
           curl -fsSL -o "$dir/$name.tar.gz" "https://github.com/mozilla/sccache/releases/download/$SCCACHE_VERSION/$name.tar.gz"
-          got=$(python3 -c 'import hashlib,sys; print(hashlib.sha256(open(sys.argv[1],"rb").read()).hexdigest())' "$dir/$name.tar.gz")
+          got=$( (sha256sum "$dir/$name.tar.gz" 2>/dev/null || shasum -a 256 "$dir/$name.tar.gz") | cut -d' ' -f1)
           if [ "$got" != "$sum" ]; then echo "::error::sccache checksum mismatch: $got"; exit 1; fi
           tar -xzf "$dir/$name.tar.gz" -C "$dir"
           bin="$dir/$name"
-          if command -v cygpath >/dev/null; then bin=$(cygpath -u "$bin"); fi
-          echo "$bin" >>"$GITHUB_PATH"
           "$bin/sccache" --start-server
+          if command -v cygpath >/dev/null; then bin=$(cygpath -w "$bin"); fi
+          echo "$bin" >>"$GITHUB_PATH"
 
       # One rolling cache entry per target: restore the newest, save a new one
       # even when the build fails or runs out of time, so a re-run is warm.
