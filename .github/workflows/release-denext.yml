@@ -232,10 +232,18 @@ jobs:
           df -h . || true
           sccache --show-stats || true
 
+      # One process per test, as upstream's ci.yml runs them: under a plain
+      # `cargo test` tests/slots.rs died with SIGSEGV on aarch64-apple-darwin
+      # (run 40872852049), taking the rest of its binary with it.
+      - uses: taiki-e/install-action@ab6895351a88b908e96a4697860d4ffea5e57dbe # v2.87.27
+        if: matrix.test
+        with:
+          tool: nextest
+
       - name: Test
         if: matrix.test
         timeout-minutes: 60
-        run: cargo test --release --locked --target "$TARGET"
+        run: cargo nextest run --release --locked --all-targets --target "$TARGET"
 
       - name: Package
         run: |
@@ -304,13 +312,17 @@ jobs:
           rustup toolchain install "$tc" --profile minimal --no-self-update
           echo "RUSTUP_TOOLCHAIN=$tc" >>"$GITHUB_ENV"
 
+      - uses: taiki-e/install-action@ab6895351a88b908e96a4697860d4ffea5e57dbe # v2.87.27
+        with:
+          tool: nextest
+
       - name: Test with the built archive
         run: |
           set -euo pipefail
           d=$(cygpath -w "$PWD/dist")
           export RUSTY_V8_ARCHIVE="$d\\rusty_v8_release_aarch64-pc-windows-msvc.lib.gz"
           export RUSTY_V8_SRC_BINDING_PATH="$d\\src_binding_release_aarch64-pc-windows-msvc.rs"
-          cargo test --release --locked --target aarch64-pc-windows-msvc
+          cargo nextest run --release --locked --all-targets --target aarch64-pc-windows-msvc
 
   crate:
     name: crate branch
