@@ -1,0 +1,424 @@
+# Brainwires denext release of rusty_v8 (see DENEXT.md).
+#
+# Dispatch only; never scheduled. Builds the release profile with default
+# features from source, on GitHub-hosted standard runners, for the six targets
+# the Brainwires Deno fork ships, runs rusty_v8's own tests where the target
+# can execute, and publishes ONE immutable GitHub release with:
+#   - librusty_v8_release_<target>.a.gz / rusty_v8_release_<target>.lib.gz
+#   - src_binding_release_<target>.rs
+#   - SHA256SUMS, and a build-provenance attestation for every file
+# It also commits the `cargo package` output of this commit to the `crate`
+# branch, which the Deno fork consumes by git rev through [patch.crates-io]
+# (no submodules there, so Cargo never clones V8).
+#
+# Cross builds follow upstream's ci.yml: Chromium ships no Linux arm64 or
+# Windows arm64 host clang, so aarch64-unknown-linux-gnu builds on x64 Linux
+# (tests run under qemu-user) and aarch64-pc-windows-msvc builds on x64
+# Windows (tests run natively on windows-11-arm with the built archive).
+
+name: release-denext
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag (v<crate version without build metadata>-denext.<n>)
+        default: v152.2.1-denext.1
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-denext-${{ inputs.tag }}
+  cancel-in-progress: false
+
+env:
+  SCCACHE_VERSION: v0.8.2
+  # tools/win, as upstream's ci.yml downloads it (the submodule is update=none).
+  TOOLS_WIN_REV: faefd1b6fa9eeb033ad6fe60368ccb9bf908cbd0
+
+jobs:
+  check:
+    name: check tag
+    runs-on: ubuntu-22.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          submodules: false
+          persist-credentials: false
+      - name: Tag matches the crate version and is new
+        env:
+          TAG: ${{ inputs.tag }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          version=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -1)
+          base=${version%%+*}
+          echo "crate version $version, tag $TAG"
+          case "$TAG" in
+            "v$base-denext."[0-9]*) ;;
+            *) echo "::error::tag $TAG does not match crate version $version (want v$base-denext.<n>)"; exit 1 ;;
+          esac
+          if gh release view "$TAG" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "::error::release $TAG already exists"; exit 1
+          fi
+          echo "V8: $(git submodule status v8)"
+
+  build:
+    name: build ${{ matrix.target }}
+    needs: check
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 360
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-22.04
+            sccache: x86_64-unknown-linux-musl
+            test: true
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-22.04
+            sccache: x86_64-unknown-linux-musl
+            test: true # under qemu-user (binfmt)
+          - target: aarch64-apple-darwin
+            os: macos-15
+            sccache: aarch64-apple-darwin
+            test: true
+          - target: x86_64-apple-darwin
+            os: macos-15-intel
+            sccache: x86_64-apple-darwin
+            test: true
+          - target: x86_64-pc-windows-msvc
+            os: windows-2022
+            sccache: x86_64-pc-windows-msvc
+            test: true
+          - target: aarch64-pc-windows-msvc
+            os: windows-2022
+            sccache: x86_64-pc-windows-msvc
+            test: false # cross-built; tested by test-windows-arm64
+    defaults:
+      run:
+        shell: bash
+    env:
+      TARGET: ${{ matrix.target }}
+      V8_FROM_SOURCE: '1'
+      CARGO_TERM_COLOR: always
+      LIB_NAME: ${{ contains(matrix.target, 'windows') && 'rusty_v8' || 'librusty_v8' }}
+      LIB_EXT: ${{ contains(matrix.target, 'windows') && 'lib' || 'a' }}
+      SCCACHE_DIR: ${{ github.workspace }}/target/sccache
+      # Six targets share the repository's 10 GB cache.
+      SCCACHE_CACHE_SIZE: 1500M
+      SCCACHE_IDLE_TIMEOUT: '0'
+    steps:
+      - name: Configure git
+        run: |
+          git config --global core.symlinks true
+          git config --global core.longpaths true
+
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          submodules: recursive
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Download tools/win
+        if: runner.os == 'Windows'
+        run: |
+          set -euo pipefail
+          mkdir -p tools/win
+          curl -fsSL "https://chromium.googlesource.com/chromium/src/tools/win/+archive/$TOOLS_WIN_REV.tar.gz" |
+            tar -xz -C tools/win
+
+      - name: Free disk space (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          df -h /
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/.ghcup \
+            /opt/hostedtoolcache/CodeQL /usr/local/share/boost /usr/share/swift \
+            /usr/local/share/powershell /usr/local/share/chromium /opt/microsoft || true
+          df -h /
+
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: 3.11.x
+          architecture: x64
+
+      - name: Rust toolchain
+        run: |
+          set -euo pipefail
+          tc=$(sed -n 's/^channel = "\(.*\)"$/\1/p' rust-toolchain.toml)
+          rustup toolchain install "$tc" --profile minimal --target "$TARGET" --no-self-update
+          echo "RUSTUP_TOOLCHAIN=$tc" >>"$GITHUB_ENV"
+
+      - name: Cross toolchain (aarch64 Linux)
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -yq --no-install-suggests --no-install-recommends \
+            binfmt-support g++-10-aarch64-linux-gnu g++-10-multilib \
+            gcc-10-aarch64-linux-gnu libc6-arm64-cross qemu qemu-user \
+            qemu-user-binfmt
+          sudo ln -sf /usr/aarch64-linux-gnu/lib/ld-linux-aarch64.so.1 /lib/ld-linux-aarch64.so.1
+          echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=/usr/bin/aarch64-linux-gnu-gcc-10" >>"$GITHUB_ENV"
+          echo "QEMU_LD_PREFIX=/usr/aarch64-linux-gnu" >>"$GITHUB_ENV"
+
+      # bindgen's libclang (V8 itself builds with Chromium's pinned clang).
+      - name: libclang (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          set -euo pipefail
+          echo "deb http://apt.llvm.org/jammy/ llvm-toolchain-jammy-21 main" | sudo tee /etc/apt/sources.list.d/llvm-toolchain-jammy-21.list >/dev/null
+          curl -fsSL https://apt.llvm.org/llvm-snapshot.gpg.key | gpg --dearmor | sudo tee /etc/apt/trusted.gpg.d/llvm-snapshot.gpg >/dev/null
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libclang-21-dev
+          echo "LIBCLANG_PATH=/usr/lib/llvm-21/lib" >>"$GITHUB_ENV"
+
+      - name: libclang (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          brew install llvm@21
+          echo "LIBCLANG_PATH=$(brew --prefix llvm@21)/lib" >>"$GITHUB_ENV"
+
+      # Windows: build.rs fetches Chromium's matching libclang package itself
+      # when LIBCLANG_PATH is unset.
+
+      - name: sccache
+        env:
+          PLATFORM: ${{ matrix.sccache }}
+        run: |
+          set -euo pipefail
+          case "$PLATFORM" in
+            x86_64-unknown-linux-musl) sum=ecda4ddc89a49f1ec6f35bdce5ecbf6f205b399a680d11119d4ce9f6d962104e ;;
+            aarch64-apple-darwin) sum=32604da614ce679623a8de0d38eab91b87431d59f3344c5523c82e1b6e85ffc4 ;;
+            x86_64-apple-darwin) sum=fcbe1b76356f7183cee0b5bc150c0583abc01a5c42e9b2be94e9d17ed7dca3a4 ;;
+            x86_64-pc-windows-msvc) sum=de5e9f66bb8a6bbdf0e28cb8a086a8d12699af796bf70bcd9dc40d80715bf9b8 ;;
+            *) echo "::error::no sccache checksum for $PLATFORM"; exit 1 ;;
+          esac
+          name="sccache-$SCCACHE_VERSION-$PLATFORM"
+          dir="$RUNNER_TEMP/sccache"
+          mkdir -p "$dir"
+          curl -fsSL -o "$dir/$name.tar.gz" "https://github.com/mozilla/sccache/releases/download/$SCCACHE_VERSION/$name.tar.gz"
+          got=$(python3 -c 'import hashlib,sys; print(hashlib.sha256(open(sys.argv[1],"rb").read()).hexdigest())' "$dir/$name.tar.gz")
+          if [ "$got" != "$sum" ]; then echo "::error::sccache checksum mismatch: $got"; exit 1; fi
+          tar -xzf "$dir/$name.tar.gz" -C "$dir"
+          bin="$dir/$name"
+          if command -v cygpath >/dev/null; then bin=$(cygpath -u "$bin"); fi
+          echo "$bin" >>"$GITHUB_PATH"
+          "$bin/sccache" --start-server
+
+      # One rolling cache entry per target: restore the newest, save a new one
+      # even when the build fails or runs out of time, so a re-run is warm.
+      - name: Restore sccache
+        uses: actions/cache/restore@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
+        with:
+          path: target/sccache
+          key: denext-sccache-${{ matrix.target }}-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: denext-sccache-${{ matrix.target }}-
+
+      - name: Build
+        timeout-minutes: 320
+        run: |
+          set -euo pipefail
+          df -h . || true
+          cargo build --release --locked --lib --target "$TARGET" -v
+          df -h . || true
+          sccache --show-stats || true
+
+      - name: Test
+        if: matrix.test
+        timeout-minutes: 60
+        run: cargo test --release --locked --target "$TARGET"
+
+      - name: Package
+        run: |
+          set -euo pipefail
+          out="target/$TARGET/release/gn_out"
+          mkdir -p dist
+          gzip -9c "$out/obj/$LIB_NAME.$LIB_EXT" >"dist/${LIB_NAME}_release_$TARGET.$LIB_EXT.gz"
+          cp "$out/src_binding.rs" "dist/src_binding_release_$TARGET.rs"
+          ls -l dist
+
+      - name: Version check
+        if: matrix.test
+        run: |
+          set -euo pipefail
+          grep -E 'define V8_(MAJOR_VERSION|MINOR_VERSION|BUILD_NUMBER|PATCH_LEVEL)' v8/include/v8-version.h
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: rusty_v8-${{ matrix.target }}
+          path: dist/
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Stop sccache
+        if: always()
+        run: sccache --stop-server || true
+
+      - name: Save sccache
+        if: always()
+        uses: actions/cache/save@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
+        with:
+          path: target/sccache
+          key: denext-sccache-${{ matrix.target }}-${{ github.run_id }}-${{ github.run_attempt }}
+
+  test-windows-arm64:
+    name: test aarch64-pc-windows-msvc
+    needs: build
+    runs-on: windows-11-arm
+    timeout-minutes: 120
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Configure git
+        run: |
+          git config --global core.symlinks true
+          git config --global core.longpaths true
+
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          submodules: recursive
+          fetch-depth: 1
+          persist-credentials: false
+
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: rusty_v8-aarch64-pc-windows-msvc
+          path: dist
+
+      - name: Rust toolchain
+        run: |
+          set -euo pipefail
+          tc=$(sed -n 's/^channel = "\(.*\)"$/\1/p' rust-toolchain.toml)
+          # Name the host: an emulated x64 rustup would install an x86_64 toolchain.
+          tc="$tc-aarch64-pc-windows-msvc"
+          rustup toolchain install "$tc" --profile minimal --no-self-update
+          echo "RUSTUP_TOOLCHAIN=$tc" >>"$GITHUB_ENV"
+
+      - name: Test with the built archive
+        run: |
+          set -euo pipefail
+          d=$(cygpath -w "$PWD/dist")
+          export RUSTY_V8_ARCHIVE="$d\\rusty_v8_release_aarch64-pc-windows-msvc.lib.gz"
+          export RUSTY_V8_SRC_BINDING_PATH="$d\\src_binding_release_aarch64-pc-windows-msvc.rs"
+          cargo test --release --locked --target aarch64-pc-windows-msvc
+
+  crate:
+    name: crate branch
+    needs: check
+    runs-on: ubuntu-22.04
+    timeout-minutes: 60
+    permissions:
+      contents: write
+    outputs:
+      commit: ${{ steps.commit.outputs.commit }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          submodules: recursive
+          fetch-depth: 1
+
+      - name: Rust toolchain
+        run: |
+          set -euo pipefail
+          tc=$(sed -n 's/^channel = "\(.*\)"$/\1/p' rust-toolchain.toml)
+          rustup toolchain install "$tc" --profile minimal --no-self-update
+          echo "RUSTUP_TOOLCHAIN=$tc" >>"$GITHUB_ENV"
+
+      - name: cargo package
+        run: |
+          set -euo pipefail
+          cargo package --locked --no-verify --allow-dirty
+          crate=$(ls target/package/*.crate)
+          ls -l "$crate"
+          mkdir -p "$RUNNER_TEMP/pkg"
+          tar -xzf "$crate" -C "$RUNNER_TEMP/pkg"
+          dir=$(ls -d "$RUNNER_TEMP"/pkg/*/)
+          echo "PKG_DIR=$dir" >>"$GITHUB_ENV"
+          du -sh "$dir"
+          # GitHub refuses files over 100 MB.
+          big=$(find "$dir" -type f -size +95M)
+          if [ -n "$big" ]; then echo "::error::files too large for git: $big"; exit 1; fi
+
+      # A fast-forward on top of the existing `crate` branch (never a force
+      # push): each commit holds exactly one packaged crate, nothing else.
+      - name: Commit to the crate branch
+        id: commit
+        env:
+          TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          parent=()
+          if git fetch -q --depth=1 origin refs/heads/crate:refs/remotes/origin/crate 2>/dev/null; then
+            parent=(-p refs/remotes/origin/crate)
+          fi
+          export GIT_INDEX_FILE="$RUNNER_TEMP/crate.index"
+          rm -f "$GIT_INDEX_FILE"
+          git --work-tree="$PKG_DIR" add -A --force .
+          tree=$(git write-tree)
+          v8=$(git -C v8 rev-parse HEAD)
+          commit=$(printf 'crate: v8 %s (%s)\n\ncargo package output of %s (V8 submodule %s).\n' \
+            "$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -1)" "$TAG" "$GITHUB_SHA" "$v8" |
+            git commit-tree "$tree" "${parent[@]}")
+          git push origin "$commit:refs/heads/crate"
+          echo "commit=$commit" >>"$GITHUB_OUTPUT"
+          echo "crate branch: $commit" >>"$GITHUB_STEP_SUMMARY"
+
+  publish:
+    name: publish
+    needs: [build, test-windows-arm64, crate]
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          pattern: rusty_v8-*
+          path: dist
+          merge-multiple: true
+
+      - name: SHA256SUMS
+        run: |
+          set -euo pipefail
+          cd dist
+          n=$(ls | wc -l)
+          if [ "$n" -ne 12 ]; then echo "::error::expected 12 files, got $n"; ls -l; exit 1; fi
+          sha256sum * | sort -k2 >SHA256SUMS
+          cat SHA256SUMS
+
+      - uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2.4.0
+        with:
+          subject-path: dist/*
+
+      - name: Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag }}
+          CRATE_COMMIT: ${{ needs.crate.outputs.commit }}
+        run: |
+          set -euo pipefail
+          cat >notes.md <<EOF
+          rusty_v8 built from source at $GITHUB_SHA ($GITHUB_REF_NAME) by run $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID.
+          See DENEXT.md on that commit for what changed against upstream.
+
+          Crate source (\`cargo package\` output) for \`[patch.crates-io]\`: branch \`crate\`, commit \`$CRATE_COMMIT\`.
+
+          Verify: \`sha256sum -c SHA256SUMS\` and \`gh attestation verify <file> -R $GITHUB_REPOSITORY\`.
+          EOF
+          # Draft first, then publish: an immutable release is frozen once published.
+          gh release create "$TAG" -R "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" \
+            --title "$TAG" --notes-file notes.md --draft
+          gh release upload "$TAG" -R "$GITHUB_REPOSITORY" dist/*
+          gh release edit "$TAG" -R "$GITHUB_REPOSITORY" --draft=false --latest
+          gh release view "$TAG" -R "$GITHUB_REPOSITORY" --json url,assets --jq '.url, (.assets[].name)'
