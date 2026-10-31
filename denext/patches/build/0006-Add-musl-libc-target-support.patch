@@ -1,0 +1,142 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Bartek=20Iwa=C5=84czuk?= <bartek@deno.com>
+Date: Mon, 13 Jul 2026 23:06:07 +0200
+Subject: [PATCH 6/8] Add musl libc target support
+
+Adds a target-scoped `use_musl` GN arg that builds the target (C/C++ and
+Rust) against musl libc while keeping host build tools on glibc:
+
+- toolchain.gni: declare use_musl
+- config/rust.gni: rewrite rust_abi_target gnu->musl for the target toolchain
+- rust/known-target-triples.txt: register the musl triples
+- config/sysroot.gni: apply the musl target_sysroot only for the musl target
+- config/c++/BUILD.gn: musl libc++ rune-table + locale defines
+- toolchain/linux/BUILD.gn: clang_x64_glibc host toolchain for build tools
+---
+ config/c++/BUILD.gn           | 14 ++++++++++++++
+ config/rust.gni               |  9 +++++++++
+ config/sysroot.gni            |  4 +++-
+ rust/known-target-triples.txt |  2 ++
+ toolchain/linux/BUILD.gn      | 10 ++++++++++
+ toolchain/toolchain.gni       |  5 +++++
+ 6 files changed, 43 insertions(+), 1 deletion(-)
+
+diff --git a/config/c++/BUILD.gn b/config/c++/BUILD.gn
+index 8975d68..61025db 100644
+--- a/config/c++/BUILD.gn
++++ b/config/c++/BUILD.gn
+@@ -1,4 +1,5 @@
+ import("//build/config/c++/c++.gni")
++import("//build/toolchain/toolchain.gni")
+ import("//build/config/c++/modules.gni")
+ import("//build/config/chrome_build.gni")
+ import("//build/config/compiler/compiler.gni")
+@@ -19,6 +20,19 @@ config("runtime_library") {
+   ldflags = []
+   libs = []
+ 
++  # V8's bundled libc++ gates its ctype rune table on __GLIBC__, which
++  # musl doesn't define; use libc++'s portable default rune table and
++  # flag musl for the remaining locale differences. Target only.
++  if (use_musl && !toolchain_for_rust_host_build_tools) {
++    defines += [
++      "_LIBCPP_PROVIDES_DEFAULT_RUNE_TABLE",
++      "_LIBCPP_HAS_MUSL_LIBC",
++    ]
++    # The musl sysroot has no gcc runtime (crtbegin/libgcc); use
++    # clang's bundled compiler-rt for the C runtime instead.
++    ldflags += [ "-rtlib=compiler-rt" ]
++  }
++
+   # Fixed libc++ configuration macros are in
+   # buildtools/third_party/libc++/__config_site. This config only has defines
+   # that vary depending on gn args, and non-define flags.
+diff --git a/config/rust.gni b/config/rust.gni
+index 146007f..84c774b 100644
+--- a/config/rust.gni
++++ b/config/rust.gni
+@@ -344,6 +344,15 @@ if (is_linux || is_chromeos) {
+   }
+ }
+ 
++# When targeting musl, rewrite the gnu triple to its musl counterpart
++# (x86_64-unknown-linux-gnu -> x86_64-unknown-linux-musl, etc.) so V8's
++# internal Rust crates + libstd are built for musl. The host build-tools
++# toolchain must stay glibc, so exclude it.
++if (use_musl && rust_abi_target != "" &&
++    !toolchain_for_rust_host_build_tools) {
++  rust_abi_target = string_replace(rust_abi_target, "-gnu", "-musl")
++}
++
+ if (toolchain_has_rust) {
+   assert(rust_abi_target != "")
+ 
+diff --git a/config/sysroot.gni b/config/sysroot.gni
+index e7aaa18..cbbd3da 100644
+--- a/config/sysroot.gni
++++ b/config/sysroot.gni
+@@ -6,6 +6,7 @@
+ # of the sysroot. If no sysroot applies, the variable will be an empty string.
+ 
+ import("//build/toolchain/sysroot.gni")
++import("//build/toolchain/toolchain.gni")
+ 
+ declare_args() {
+   # The path of the sysroot that is applied when compiling using the target
+@@ -22,7 +23,8 @@ declare_args() {
+ 
+ if (sysroot == "") {
+   if (current_os == target_os && current_cpu == target_cpu &&
+-      target_sysroot != "") {
++      target_sysroot != "" && use_musl &&
++      !toolchain_for_rust_host_build_tools) {
+     sysroot = target_sysroot
+   } else if (is_android) {
+     import("//build/config/android/config.gni")
+diff --git a/rust/known-target-triples.txt b/rust/known-target-triples.txt
+index fc4780b..4a21c8a 100644
+--- a/rust/known-target-triples.txt
++++ b/rust/known-target-triples.txt
+@@ -43,3 +43,5 @@ x86_64-unknown-fuchsia
+ x86_64-unknown-linux-gnu
+ powerpc64le-unknown-linux-gnu
+ s390x-unknown-linux-gnu
++x86_64-unknown-linux-musl
++aarch64-unknown-linux-musl
+diff --git a/toolchain/linux/BUILD.gn b/toolchain/linux/BUILD.gn
+index fa3d1ba..3dbdf94 100644
+--- a/toolchain/linux/BUILD.gn
++++ b/toolchain/linux/BUILD.gn
+@@ -114,6 +114,16 @@ clang_toolchain("clang_x64") {
+   }
+ }
+ 
++clang_toolchain("clang_x64_glibc") {
++  enable_linker_map = true
++
++  toolchain_args = {
++    current_cpu = "x64"
++    current_os = "linux"
++    use_musl = false
++  }
++}
++
+ template("clang_v8_toolchain") {
+   clang_toolchain(target_name) {
+     toolchain_args = {
+diff --git a/toolchain/toolchain.gni b/toolchain/toolchain.gni
+index 9aafac8..cb2535c 100644
+--- a/toolchain/toolchain.gni
++++ b/toolchain/toolchain.gni
+@@ -28,6 +28,11 @@ declare_args() {
+   # scripts.
+   toolchain_for_rust_host_build_tools = false
+ 
++  # Build the target (C/C++ and Rust) against musl libc instead of
++  # glibc. Scoped to the target toolchain only; host build tools stay
++  # glibc via the toolchain_for_rust_host_build_tools guard.
++  use_musl = false
++
+   # If false, the toolchain overrides `use_partition_alloc_as_malloc` in
+   # PartitionAlloc, to allow use of the system allocator.
+   toolchain_allows_use_partition_alloc_as_malloc = true

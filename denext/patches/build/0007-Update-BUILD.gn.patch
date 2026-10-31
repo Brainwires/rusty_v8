@@ -1,0 +1,23 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Divy <dj.srivastava23@gmail.com>
+Date: Wed, 14 Jan 2026 20:13:55 +0530
+Subject: [PATCH 7/8] Update BUILD.gn
+
+---
+ config/win/BUILD.gn | 3 ++-
+ 1 file changed, 2 insertions(+), 1 deletion(-)
+
+diff --git a/config/win/BUILD.gn b/config/win/BUILD.gn
+index 1edf103..557b371 100644
+--- a/config/win/BUILD.gn
++++ b/config/win/BUILD.gn
+@@ -120,7 +120,8 @@ config("compiler") {
+     # microarchitecture. MSVC only supports a subset of architectures, and the
+     # next step after SSE2 will be AVX.
+     if (current_cpu == "x86" || current_cpu == "x64") {
+-      cflags += [ "-msse3" ]
++      # TODO(littledivy): current_cpu is set to rust_host_toolchain_arch for clang toolchain?
++      # cflags += [ "-msse3" ]
+     }
+ 
+     # Enable ANSI escape codes if something emulating them is around (cmd.exe

@@ -1,0 +1,30 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: snek <the@snek.dev>
+Date: Wed, 7 Aug 2024 11:29:16 +0200
+Subject: [PATCH 2/8] Add fake LASTCHANGE.committime
+
+---
+ .gitignore                 | 1 +
+ util/LASTCHANGE.committime | 1 +
+ 2 files changed, 2 insertions(+)
+ create mode 100644 util/LASTCHANGE.committime
+
+diff --git a/.gitignore b/.gitignore
+index 1bcfd82..f236729 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -15,6 +15,7 @@ ciopfs
+ /Release_x64
+ /win_toolchain.json
+ /util/LASTCHANGE*
++!/util/LASTCHANGE.committime
+ /util/support
+ /x64/
+ /linux/debian_*-sysroot/
+diff --git a/util/LASTCHANGE.committime b/util/LASTCHANGE.committime
+new file mode 100644
+index 0000000..800a224
+--- /dev/null
++++ b/util/LASTCHANGE.committime
+@@ -0,0 +1 @@
++1723023372

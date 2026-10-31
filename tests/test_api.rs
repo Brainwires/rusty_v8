@@ -2139,7 +2139,7 @@ fn object_template_set_accessor() {
                   key: v8::Local<v8::Name>,
                   value: v8::Local<v8::Value>,
                   args: v8::PropertyCallbackArguments,
-                  _rv: v8::ReturnValue<()>| {
+                  _rv: v8::ReturnValue<v8::Boolean>| {
       let this = args.holder();
 
       assert!(args.data().is_undefined());
@@ -2179,7 +2179,7 @@ fn object_template_set_accessor() {
        key: v8::Local<v8::Name>,
        value: v8::Local<v8::Value>,
        args: v8::PropertyCallbackArguments,
-       _rv: v8::ReturnValue<()>| {
+       _rv: v8::ReturnValue<v8::Boolean>| {
         let this = args.holder();
 
         assert!(args.data().is_string());
@@ -3466,6 +3466,66 @@ fn object_set_accessor() {
   }
 }
 
+// V8 15.3 dropped the V1 accessor setter: an accessor setter now receives
+// `PropertyCallbackInfo<Boolean>`, and `rv.set_bool(false)` reports a failed
+// [[Set]], which throws a TypeError in strict mode (and not in sloppy mode).
+#[test]
+fn object_set_accessor_setter_reports_failure() {
+  let _setup_guard = setup::parallel_test();
+  let isolate = &mut v8::Isolate::new(Default::default());
+  v8::scope!(let scope, isolate);
+
+  let context = v8::Context::new(scope, Default::default());
+  let scope = &mut v8::ContextScope::new(scope, context);
+
+  static SETS: AtomicUsize = AtomicUsize::new(0);
+
+  let getter = |_scope: &mut v8::PinScope,
+                _key: v8::Local<v8::Name>,
+                _args: v8::PropertyCallbackArguments,
+                mut rv: v8::ReturnValue<v8::Value>| {
+    rv.set_int32(7);
+  };
+  let setter = |_scope: &mut v8::PinScope,
+                _key: v8::Local<v8::Name>,
+                value: v8::Local<v8::Value>,
+                args: v8::PropertyCallbackArguments,
+                mut rv: v8::ReturnValue<v8::Boolean>| {
+    SETS.fetch_add(1, Ordering::SeqCst);
+    // Reject odd numbers, accept everything else.
+    let reject = value.is_int32()
+      && v8::Local::<v8::Int32>::try_from(value).unwrap().value() % 2 != 0;
+    if reject {
+      rv.set_bool(false);
+    }
+    let _ = args.should_throw_on_error();
+  };
+
+  let obj = v8::Object::new(scope);
+  let key = v8::String::new(scope, "guarded").unwrap();
+  obj.set_accessor_with_setter(scope, key.into(), getter, setter);
+  let obj_name = v8::String::new(scope, "obj").unwrap();
+  context
+    .global(scope)
+    .set(scope, obj_name.into(), obj.into());
+
+  // Accepted, in either mode.
+  assert!(eval(scope, "obj.guarded = 2").is_some());
+  assert!(eval(scope, "'use strict'; obj.guarded = 4").is_some());
+
+  // Rejected: sloppy mode ignores it, strict mode throws a TypeError.
+  assert!(eval(scope, "obj.guarded = 3").is_some());
+  {
+    let tc = pin!(v8::TryCatch::new(scope));
+    let tc = &mut tc.init();
+    assert!(eval(tc, "'use strict'; obj.guarded = 5").is_none());
+    assert!(tc.has_caught());
+    let message = tc.exception().unwrap().to_rust_string_lossy(tc);
+    assert!(message.starts_with("TypeError"), "{message}");
+  }
+  assert_eq!(SETS.load(Ordering::SeqCst), 4);
+}
+
 #[test]
 fn object_set_accessor_with_setter() {
   let _setup_guard = setup::parallel_test();
@@ -3506,7 +3566,7 @@ fn object_set_accessor_with_setter() {
                   key: v8::Local<v8::Name>,
                   value: v8::Local<v8::Value>,
                   args: v8::PropertyCallbackArguments,
-                  _rv: v8::ReturnValue<()>| {
+                  _rv: v8::ReturnValue<v8::Boolean>| {
       println!("setter called");
 
       let this = args.holder();
@@ -3607,7 +3667,7 @@ fn object_set_accessor_with_setter_with_property() {
                   key: v8::Local<v8::Name>,
                   value: v8::Local<v8::Value>,
                   args: v8::PropertyCallbackArguments,
-                  _rv: v8::ReturnValue<()>| {
+                  _rv: v8::ReturnValue<v8::Boolean>| {
       println!("setter called");
 
       let this = args.holder();
@@ -3712,7 +3772,7 @@ fn object_set_accessor_with_data() {
                   key: v8::Local<v8::Name>,
                   value: v8::Local<v8::Value>,
                   args: v8::PropertyCallbackArguments,
-                  _rv: v8::ReturnValue<()>| {
+                  _rv: v8::ReturnValue<v8::Boolean>| {
       println!("setter called");
 
       let this = args.holder();
@@ -8879,7 +8939,11 @@ fn synthetic_evaluation_steps<'s>(
     scope.reset();
   }
 
-  Some(v8::undefined(scope).into())
+  // From V8 15.3 the evaluation steps must return a Promise (V8 CHECKs it).
+  let resolver = v8::PromiseResolver::new(scope).unwrap();
+  let undefined = v8::undefined(scope).into();
+  resolver.resolve(scope, undefined).unwrap();
+  Some(resolver.get_promise(scope).into())
 }
 
 #[test]

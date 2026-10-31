@@ -1509,7 +1509,7 @@ void v8__ObjectTemplate__SetInternalFieldCount(const v8::ObjectTemplate& self,
 void v8__ObjectTemplate__SetNativeDataProperty(
     const v8::ObjectTemplate& self, const v8::Name& key,
     v8::AccessorNameGetterCallback getter,
-    v8::AccessorNameSetterCallback setter, const v8::Value* data_or_null,
+    v8::AccessorNameSetterCallbackV2 setter, const v8::Value* data_or_null,
     v8::PropertyAttribute attr) {
   ptr_to_local(&self)->SetNativeDataProperty(ptr_to_local(&key), getter, setter,
                                              ptr_to_local(data_or_null), attr);
@@ -1615,7 +1615,7 @@ bool v8__Object__IsApiWrapper(const v8::Object& self) {
 }
 
 const v8::Value* v8__Object__GetPrototype(const v8::Object& self) {
-  return local_to_ptr(ptr_to_local(&self)->GetPrototypeV2());
+  return local_to_ptr(ptr_to_local(&self)->GetPrototype());
 }
 
 MaybeBool v8__Object__Set(const v8::Object& self, const v8::Context& context,
@@ -1644,7 +1644,7 @@ MaybeBool v8__Object__SetIndex(const v8::Object& self,
 MaybeBool v8__Object__SetPrototype(const v8::Object& self,
                                    const v8::Context& context,
                                    const v8::Value& prototype) {
-  return maybe_to_maybe_bool(ptr_to_local(&self)->SetPrototypeV2(
+  return maybe_to_maybe_bool(ptr_to_local(&self)->SetPrototype(
       ptr_to_local(&context), ptr_to_local(&prototype)));
 }
 
@@ -1681,7 +1681,7 @@ MaybeBool v8__Object__SetAccessor(const v8::Object& self,
                                   const v8::Context& context,
                                   const v8::Name& key,
                                   v8::AccessorNameGetterCallback getter,
-                                  v8::AccessorNameSetterCallback setter,
+                                  v8::AccessorNameSetterCallbackV2 setter,
                                   const v8::Value* data_or_null,
                                   v8::PropertyAttribute attr) {
   return maybe_to_maybe_bool(ptr_to_local(&self)->SetNativeDataProperty(
@@ -2222,12 +2222,16 @@ uint32_t v8__Context__GetNumberOfEmbedderDataFields(const v8::Context& self) {
 
 void* v8__Context__GetAlignedPointerFromEmbedderData(const v8::Context& self,
                                                      int index) {
-  return ptr_to_local(&self)->GetAlignedPointerFromEmbedderData(index);
+  // V8 15.3 removed the untagged accessors; the Rust API stays untagged and
+  // uses V8's default tag, which is what the untagged forms did.
+  return ptr_to_local(&self)->GetAlignedPointerFromEmbedderData(
+      index, v8::kEmbedderDataTypeTagDefault);
 }
 
 void v8__Context__SetAlignedPointerInEmbedderData(v8::Context& self, int index,
                                                   void* value) {
-  ptr_to_local(&self)->SetAlignedPointerInEmbedderData(index, value);
+  ptr_to_local(&self)->SetAlignedPointerInEmbedderData(
+      index, value, v8::kEmbedderDataTypeTagDefault);
 }
 
 const v8::Value* v8__Context__GetEmbedderData(const v8::Context& self,
@@ -2309,8 +2313,11 @@ void v8__Context__SetContinuationPreservedEmbedderData(v8::Isolate* isolate,
 
 const v8::Value* v8__Context__GetContinuationPreservedEmbedderData(
     v8::Isolate* isolate) {
+  // V8 15.6 returns Local<Data>. Only Values are ever stored through
+  // v8__Context__SetContinuationPreservedEmbedderData, and the unset default
+  // is undefined, so the cast is sound.
   auto value = isolate->GetContinuationPreservedEmbedderData();
-  return local_to_ptr(value);
+  return local_to_ptr(value.As<v8::Value>());
 }
 
 class RustyMicrotaskQueueHandle {
@@ -2318,20 +2325,11 @@ class RustyMicrotaskQueueHandle {
   RustyMicrotaskQueueHandle(v8::Isolate* isolate, v8::MicrotasksPolicy policy)
       : queue_(v8::MicrotaskQueue::New(isolate, policy)) {}
 
-  v8::MicrotaskQueue* Get() const {
-#ifdef V8_CPPGC_MICROTASK_QUEUE
-    return queue_.Get();
-#else
-    return queue_.get();
-#endif
-  }
+  v8::MicrotaskQueue* Get() const { return queue_.Get(); }
 
  private:
-#ifdef V8_CPPGC_MICROTASK_QUEUE
+  // From V8 15.6 a MicrotaskQueue is always garbage collected (cppgc).
   cppgc::Persistent<v8::MicrotaskQueue> queue_;
-#else
-  std::unique_ptr<v8::MicrotaskQueue> queue_;
-#endif
 };
 
 RustyMicrotaskQueueHandle* v8__MicrotaskQueueHandle__New(
@@ -2638,7 +2636,7 @@ const v8::Value* v8__PropertyCallbackInfo__Data(
 
 const v8::Object* v8__PropertyCallbackInfo__Holder(
     const v8::PropertyCallbackInfo<v8::Value>& self) {
-  return local_to_ptr(self.HolderV2());
+  return local_to_ptr(self.Holder());
 }
 
 uintptr_t* v8__PropertyCallbackInfo__GetReturnValue(
@@ -4703,7 +4701,9 @@ v8::CppHeap* v8__CppHeap__Create(v8::Platform* platform,
   return heap.release();
 }
 
-void v8__CppHeap__Terminate(v8::CppHeap* cpp_heap) { cpp_heap->Terminate(); }
+// V8 15.3 removed CppHeap::Terminate(): a CppHeap now tears itself down when
+// it is destroyed. Kept as a no-op so the Rust API stays source compatible.
+void v8__CppHeap__Terminate(v8::CppHeap* cpp_heap) { (void)cpp_heap; }
 
 void v8__CppHeap__DELETE(v8::CppHeap* self) { delete self; }
 

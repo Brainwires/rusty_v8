@@ -1,0 +1,28 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: snek <the@snek.dev>
+Date: Mon, 28 Jul 2025 11:35:47 +0200
+Subject: [PATCH 4/8] Disable TARGET check in rust/run_bindgen.py
+
+---
+ rust/gni_impl/run_bindgen.py | 8 ++++----
+ 1 file changed, 4 insertions(+), 4 deletions(-)
+
+diff --git a/rust/gni_impl/run_bindgen.py b/rust/gni_impl/run_bindgen.py
+index 1d57eaa..918c3d2 100755
+--- a/rust/gni_impl/run_bindgen.py
++++ b/rust/gni_impl/run_bindgen.py
+@@ -90,10 +90,10 @@ def main():
+     # if it's set. In practice we've seen a case where someone had the value set
+     # in their build environment with no intention of it reaching bindgen, leading
+     # to a hard-to-debug build error.
+-    if 'TARGET' in os.environ:
+-        sys.exit(
+-            'ERROR: saw TARGET in environment, remove to avoid bindgen failures'
+-        )
++    #if 'TARGET' in os.environ:
++    #    sys.exit(
++    #        'ERROR: saw TARGET in environment, remove to avoid bindgen failures'
++    #    )
+ 
+     with contextlib.ExitStack() as stack:
+         # Args passed to the actual bindgen cli

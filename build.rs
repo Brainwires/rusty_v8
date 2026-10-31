@@ -169,16 +169,37 @@ fn acquire_lock() -> LockFile {
 }
 
 fn build_binding() {
-  // Bindgen needs Clang 21.1+ for V8's libc++ builtin type traits.
+  // Bindgen needs a libclang new enough for V8's libc++ (Clang 23 for V8
+  // 15.6; see DENEXT.md).
   if env::var("LIBCLANG_PATH").is_err() {
-    eprintln!("Warning: LIBCLANG_PATH not set. Bindgen requires Clang 21.1+.");
-    eprintln!("Set LIBCLANG_PATH to your Clang 21 installation:");
-    eprintln!("  Linux:  export LIBCLANG_PATH=/usr/lib/llvm-21/lib");
+    eprintln!("Warning: LIBCLANG_PATH not set. Bindgen requires Clang 23.");
+    eprintln!("Set LIBCLANG_PATH to your Clang 23 installation:");
+    eprintln!("  Linux:  export LIBCLANG_PATH=/usr/lib/llvm-23/lib");
     eprintln!("  macOS:  export LIBCLANG_PATH=$(brew --prefix llvm)/lib");
     eprintln!(
       "  Windows: set LIBCLANG_PATH to the directory containing libclang.dll"
     );
   }
+
+  // bindgen (clang-sys) also runs a `clang` executable to learn the default
+  // include paths, and takes the first one on PATH unless CLANG_PATH names
+  // one. A different Clang than the libclang mixes two versions' builtin
+  // headers, which V8 15.6's libc++ does not survive ("reference to
+  // unresolved using declaration"). Use the clang beside LIBCLANG_PATH.
+  if env::var_os("CLANG_PATH").is_none()
+    && let Ok(libclang_path) = env::var("LIBCLANG_PATH")
+    && let Some(llvm_dir) = Path::new(&libclang_path).parent()
+  {
+    let exe = if cfg!(windows) { "clang.exe" } else { "clang" };
+    let clang = llvm_dir.join("bin").join(exe);
+    if clang.exists() {
+      println!("clang_path (beside LIBCLANG_PATH) {}", clang.display());
+      unsafe {
+        env::set_var("CLANG_PATH", &clang);
+      }
+    }
+  }
+  println!("cargo:rerun-if-env-changed=CLANG_PATH");
 
   let output = Command::new(python())
     .arg("./tools/get_bindgen_args.py")
@@ -218,6 +239,12 @@ fn build_binding() {
     "-isystembuildtools/third_party/libc++".to_string(),
     "-isystemthird_party/libc++/src/include".to_string(),
     "-isystemthird_party/libc++abi/src/include".to_string(),
+    // libc++'s `std::aligned_union` (V8 15.6's libc++ 97b436d) is a recursive
+    // variadic union that makes bindgen panic while laying out bitfields
+    // ("Not an item: ItemId(..)"). Nothing bindgen reads uses it (it is
+    // deprecated and only <type_traits> includes it), so its include guard
+    // keeps the header out of bindgen's parse. The C++ build is unaffected.
+    "-D_LIBCPP___TYPE_TRAITS_ALIGNED_UNION_H".to_string(),
   ];
 
   let target_os = env::var("CARGO_CFG_TARGET_OS").unwrap();
@@ -444,6 +471,18 @@ fn build_v8(is_asan: bool) {
     "v8_enable_v8_checks={}",
     env::var("CARGO_FEATURE_V8_ENABLE_V8_CHECKS").is_ok()
   ));
+
+  // V8 15.6 harvests its instance types with `metagen`, which needs a
+  // separately downloaded libclang package (`third_party/llvm-libclang`, a GCS
+  // entry in V8's DEPS) plus `gn` and a bare `python` on PATH. Use Torque's
+  // instance-type emission instead, as V8's "no metagen" builders do; Torque
+  // runs either way, and the metagen action then leaves the build graph.
+  if !env::var("GN_ARGS")
+    .unwrap_or_default()
+    .contains("v8_use_metagen_instance_types")
+  {
+    gn_args.push("v8_use_metagen_instance_types=false".to_string());
+  }
 
   // Fix GN's host_cpu detection when using x86_64 bins on Apple Silicon
   if cfg!(target_os = "macos") && cfg!(target_arch = "aarch64") {

@@ -617,7 +617,7 @@ where
 pub(crate) type NamedSetterCallbackForAccessor = unsafe extern "C" fn(
   SealedLocal<Name>,
   SealedLocal<Value>,
-  *const PropertyCallbackInfo<()>,
+  *const PropertyCallbackInfo<Boolean>,
 );
 
 impl<F> MapFnFrom<F> for NamedSetterCallbackForAccessor
@@ -628,13 +628,13 @@ where
       Local<'s, Name>,
       Local<'s, Value>,
       PropertyCallbackArguments<'s>,
-      ReturnValue<()>,
+      ReturnValue<Boolean>,
     ),
 {
   fn mapping() -> Self {
     let f = |key: SealedLocal<Name>,
              value: SealedLocal<Value>,
-             info: *const PropertyCallbackInfo<()>| {
+             info: *const PropertyCallbackInfo<Boolean>| {
       let info = unsafe { &*info };
       callback_scope!(unsafe scope, info);
       let key = unsafe { scope.unseal(key) };

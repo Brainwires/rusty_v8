@@ -23,7 +23,7 @@ on:
     inputs:
       tag:
         description: Release tag (v<crate version without build metadata>-denext.<n>)
-        default: v152.2.1-denext.1
+        default: v156.0.0-denext.1
         required: true
         type: string
 
@@ -37,7 +37,7 @@ concurrency:
 env:
   SCCACHE_VERSION: v0.8.2
   # tools/win, as upstream's ci.yml downloads it (the submodule is update=none).
-  TOOLS_WIN_REV: faefd1b6fa9eeb033ad6fe60368ccb9bf908cbd0
+  TOOLS_WIN_REV: 13cb6e5d223dc49eadd082d3aef4c2a5b0e4c0a0
 
 jobs:
   check:
@@ -118,6 +118,8 @@ jobs:
         run: |
           git config --global core.symlinks true
           git config --global core.longpaths true
+          # denext/patches apply with `git apply`; keep checkouts byte-exact.
+          git config --global core.autocrlf false
 
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
@@ -147,6 +149,12 @@ jobs:
           python-version: 3.11.x
           architecture: x64
 
+      # The v8 and build submodules are Chromium's own commits; the embedder
+      # patches (denoland's, rebased per V8 major) apply from denext/patches.
+      - name: Apply denext patches
+        run: python tools/denext_patches.py
+
+
       - name: Rust toolchain
         run: |
           set -euo pipefail
@@ -168,24 +176,63 @@ jobs:
           echo "QEMU_LD_PREFIX=/usr/aarch64-linux-gnu" >>"$GITHUB_ENV"
 
       # bindgen's libclang (V8 itself builds with Chromium's pinned clang).
+      # V8 15.6's libc++ needs libclang 23: 21 cannot parse it, and Chromium's
+      # own libclang package (llvmorg-24-init) makes bindgen panic. DENEXT.md.
       - name: libclang (Linux)
         if: runner.os == 'Linux'
         run: |
           set -euo pipefail
-          echo "deb http://apt.llvm.org/jammy/ llvm-toolchain-jammy-21 main" | sudo tee /etc/apt/sources.list.d/llvm-toolchain-jammy-21.list >/dev/null
+          echo "deb http://apt.llvm.org/jammy/ llvm-toolchain-jammy-23 main" | sudo tee /etc/apt/sources.list.d/llvm-toolchain-jammy-23.list >/dev/null
           curl -fsSL https://apt.llvm.org/llvm-snapshot.gpg.key | gpg --dearmor | sudo tee /etc/apt/trusted.gpg.d/llvm-snapshot.gpg >/dev/null
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends libclang-21-dev
-          echo "LIBCLANG_PATH=/usr/lib/llvm-21/lib" >>"$GITHUB_ENV"
+          sudo apt-get install -y --no-install-recommends libclang-23-dev clang-23
+          echo "LIBCLANG_PATH=/usr/lib/llvm-23/lib" >>"$GITHUB_ENV"
 
       - name: libclang (macOS)
         if: runner.os == 'macOS'
         run: |
-          brew install llvm@21
-          echo "LIBCLANG_PATH=$(brew --prefix llvm@21)/lib" >>"$GITHUB_ENV"
+          set -euo pipefail
+          brew install llvm
+          prefix=$(brew --prefix llvm)
+          major=$("$prefix/bin/clang" --version | sed -n 's/.*clang version \([0-9]*\)\..*/\1/p' | head -1)
+          if [ "$major" != 23 ]; then echo "::error::Homebrew llvm is $major, want 23"; exit 1; fi
+          echo "LIBCLANG_PATH=$prefix/lib" >>"$GITHUB_ENV"
 
-      # Windows: build.rs fetches Chromium's matching libclang package itself
-      # when LIBCLANG_PATH is unset.
+      # Windows: LLVM's own release, pinned by SHA-256 (build.rs would
+      # otherwise fetch Chromium's libclang package, which bindgen rejects).
+      - name: libclang (Windows)
+        if: runner.os == 'Windows'
+        env:
+          LLVM_TARBALL: clang+llvm-23.1.4-x86_64-pc-windows-msvc.tar.xz
+          LLVM_SHA256: 854bffcfc84528e0ee92490ff5c178920abd358a79c3e98f053e41e3e8e4c6d2
+        run: |
+          set -euo pipefail
+          dir="$RUNNER_TEMP/llvm"
+          mkdir -p "$dir"
+          curl -fsSL -o "$dir/llvm.tar.xz" "https://github.com/llvm/llvm-project/releases/download/llvmorg-23.1.4/$LLVM_TARBALL"
+          # Checks the hash and extracts libclang, clang, clang-cl and the
+          # builtin headers (all regular files in this archive).
+          python - "$dir/llvm.tar.xz" "$dir" "$LLVM_SHA256" <<'PY'
+          import hashlib, os, re, sys, tarfile
+          src, dest, want = sys.argv[1:]
+          h = hashlib.sha256()
+          with open(src, "rb") as f:
+              for block in iter(lambda: f.read(1 << 20), b""):
+                  h.update(block)
+          if h.hexdigest() != want:
+              sys.exit(f"::error::LLVM checksum mismatch: {h.hexdigest()}")
+          keep = re.compile(r"^[^/]+/(bin/(libclang\.dll|clang\.exe|clang-cl\.exe)|lib/clang/.*)$")
+          with tarfile.open(src, "r:xz") as tar:
+              for m in tar:
+                  if not keep.match(m.name) or not (m.isfile() or m.isdir()):
+                      continue
+                  m.name = m.name.split("/", 1)[1]
+                  safe = {"filter": "data"} if hasattr(tarfile, "data_filter") else {}
+                  tar.extract(m, dest, **safe)
+          PY
+          rm "$dir/llvm.tar.xz"
+          ls "$dir/bin"
+          echo "LIBCLANG_PATH=$(cygpath -w "$dir/bin")" >>"$GITHUB_ENV"
 
       - name: sccache
         env:
@@ -291,6 +338,8 @@ jobs:
         run: |
           git config --global core.symlinks true
           git config --global core.longpaths true
+          # denext/patches apply with `git apply`; keep checkouts byte-exact.
+          git config --global core.autocrlf false
 
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
@@ -345,6 +394,9 @@ jobs:
           tc=$(sed -n 's/^channel = "\(.*\)"$/\1/p' rust-toolchain.toml)
           rustup toolchain install "$tc" --profile minimal --no-self-update
           echo "RUSTUP_TOOLCHAIN=$tc" >>"$GITHUB_ENV"
+
+      - name: Apply denext patches
+        run: python3 tools/denext_patches.py
 
       - name: cargo package
         run: |
