@@ -93,6 +93,37 @@ Behaviour:
   context's embedder data (test `context_aligned_pointer_out_of_range_is_null`), which is how an
   unset slot already reads.
 
+### Snapshot creators and concurrent isolates
+
+`tests/slots.rs` aborted intermittently under a plain `cargo test` (8 of 60 runs on 15.2, 2 of 60
+on 15.6, Linux x86_64) with `vector.h:415: libc++ Hardening assertion __n < size() failed:
+vector[] index out of bounds` in `Deserializer::ReadReadOnlyHeapRef`, or V8's `Check failed:
+IsFreeSpaceOrFiller(filler)`, or a SIGSEGV. Its tests run on parallel threads of one process, and
+one of them (`clear_all_context_slots`) makes a snapshot. Skipping that test: 0 of 60.
+
+The cause is in V8's design, not in concurrent deserialization: every isolate of a process shares
+one read-only heap (the isolate group's), set up by the first isolate created. When that is a
+`SnapshotCreator`, V8 leaves the heap writable (`--extensible-ro-snapshot`, on by default) until
+`CreateBlob` (or the creator's destructor) promotes objects into it and seals it, which detaches
+its pages into the shared space and **deletes** the space the creator started with
+(`ReadOnlyHeap::InitFromIsolate` → `Heap::ReplaceReadOnlySpace`). An isolate created in that
+window attaches to the creator's writable space: on another thread it reads the page vector while
+the creator appends to it, or allocates into it (the creator's own `ReadOnlySerializer` then
+crashed walking the pages), and on any thread it keeps `Heap::read_only_space_` pointing at the
+space V8 deletes (a use-after-free). V8's comment on that path expects it only in `mksnapshot`.
+
+The binding now enforces the window (`snapshot::read_only_heap_guard`): while the process's first
+isolate is a snapshot creator that has not created its blob, `Isolate::new` and another
+`snapshot_creator` wait for it on other threads and panic on the creator's own thread (where
+waiting would never end). Once the first isolate is a regular one, or the creator is done, the
+heap is sealed for good and creation costs one atomic load. Snapshots are unchanged (the creator
+still extends read-only space). Test `test_snapshot_creator_concurrent_isolates` (its own binary,
+so the creator is the first isolate) failed 9 of 20 runs without the guard and 0 of 60 with it;
+`tests/slots.rs` 0 of 100.
+
+Deno is not exposed: it makes its snapshots in `build.rs` processes, and its workers are created
+from a sealed heap (9,600 concurrent `new Worker` on runtime 3.0.0-denext.6: no failure).
+
 ### bindgen
 
 The phase-0 spike's open blocker. Two separate causes:
