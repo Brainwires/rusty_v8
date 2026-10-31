@@ -6155,6 +6155,33 @@ fn snapshot_creator_multiple_contexts() {
   }
 }
 
+// A slot past a context's embedder data reads as null instead of aborting
+// in V8's checked getter ("Index too large").
+#[test]
+fn context_aligned_pointer_out_of_range_is_null() {
+  let _setup_guard = setup::parallel_test();
+  let isolate = &mut v8::Isolate::new(Default::default());
+  v8::scope!(let scope, isolate);
+  let context = v8::Context::new(scope, Default::default());
+
+  assert!(context.get_aligned_pointer_from_embedder_data(0).is_null());
+  assert!(context.get_aligned_pointer_from_embedder_data(4).is_null());
+  assert!(context.get_aligned_pointer_from_embedder_data(1000).is_null());
+
+  let mut value = 7u64;
+  unsafe {
+    context.set_aligned_pointer_in_embedder_data(
+      1,
+      &mut value as *mut u64 as *mut std::ffi::c_void,
+    );
+  }
+  assert_eq!(
+    context.get_aligned_pointer_from_embedder_data(1),
+    &mut value as *mut u64 as *mut std::ffi::c_void
+  );
+  assert!(context.get_aligned_pointer_from_embedder_data(4).is_null());
+}
+
 #[test]
 fn snapshot_creator_context_embedder_data() {
   let _setup_guard = setup::sequential_test();

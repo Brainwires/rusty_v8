@@ -73,6 +73,14 @@ Behaviour:
   above, the untagged `Context::{Get,Set}AlignedPointer…EmbedderData` are gone; the binding passes
   `v8::kEmbedderDataTypeTagDefault`, which is what the untagged forms used, and the Rust API stays
   untagged.
+- **Out-of-range embedder data reads.** V8 15.2's untagged `GetAlignedPointerFromEmbedderData`
+  was an inline read with no bounds check; the checked getter 15.6 leaves aborts the process
+  (`Fatal error in v8::Context::GetAlignedPointerFromEmbedderData(): Index too large`) for a slot
+  past the context's embedder data. The Deno fork's `node:vm` code reads such a slot on its main
+  context to tell vm contexts apart (its `specs::node::vm_wasm_streaming` aborted).
+  `Context::get_aligned_pointer_from_embedder_data` now returns null for a slot past the
+  context's embedder data (test `context_aligned_pointer_out_of_range_is_null`), which is how an
+  unset slot already reads.
 
 ### bindgen
 
@@ -100,9 +108,10 @@ Chromium's libclang package.
 ### Verified (biscuits, Linux x86_64)
 
 `V8_FROM_SOURCE=1 cargo build --release --lib` (2385 ninja steps, about 30 min at nice 10;
-`librusty_v8.a` 204 MB) and `cargo test --release`: every suite passes (384 tests, 14 ignored),
-including the updated `synthetic_module` and the new `object_set_accessor_setter_reports_failure`
-(a V2 setter's `rv.set_bool(false)` throws a `TypeError` in strict mode only).
+`librusty_v8.a` 204 MB) and `cargo test --release`: every suite passes (385 tests, 14 ignored),
+including the updated `synthetic_module`, the new `object_set_accessor_setter_reports_failure`
+(a V2 setter's `rv.set_bool(false)` throws a `TypeError` in strict mode only) and
+`context_aligned_pointer_out_of_range_is_null`.
 
 ## `v152.2.1-denext.1`: V8 15.2.124.45 (phase 0)
 

@@ -2222,9 +2222,17 @@ uint32_t v8__Context__GetNumberOfEmbedderDataFields(const v8::Context& self) {
 
 void* v8__Context__GetAlignedPointerFromEmbedderData(const v8::Context& self,
                                                      int index) {
+  // A slot past the context's embedder data reads as unset. V8 15.2's inline
+  // untagged getter read such a slot without a bounds check; the checked
+  // getter V8 15.6 leaves aborts the process ("Index too large") instead.
+  auto context = ptr_to_local(&self);
+  if (index < 0 || static_cast<uint32_t>(index) >=
+                       context->GetNumberOfEmbedderDataFields()) {
+    return nullptr;
+  }
   // V8 15.3 removed the untagged accessors; the Rust API stays untagged and
   // uses V8's default tag, which is what the untagged forms did.
-  return ptr_to_local(&self)->GetAlignedPointerFromEmbedderData(
+  return context->GetAlignedPointerFromEmbedderData(
       index, v8::kEmbedderDataTypeTagDefault);
 }
 

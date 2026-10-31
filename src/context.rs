@@ -380,6 +380,8 @@ impl Context {
     }
   }
 
+  /// The pointer stored in embedder data `slot`, or null when the slot was
+  /// never set, including a slot past the context's embedder data.
   #[inline(always)]
   pub fn get_aligned_pointer_from_embedder_data(
     &self,
