@@ -484,6 +484,18 @@ fn build_v8(is_asan: bool) {
     gn_args.push("v8_use_metagen_instance_types=false".to_string());
   }
 
+  // V8 15.6 runs API interrupt callbacks (Isolate::RequestInterrupt) under
+  // DisallowJavascriptExecution unless this is off, and aborts the process if
+  // one runs JavaScript. Embedders dispatch inspector messages from interrupts
+  // (Deno's inspector does), so turn the check off, as V8 does for Node.
+  if !env::var("GN_ARGS")
+    .unwrap_or_default()
+    .contains("v8_disallow_js_in_api_interrupts_is_checked")
+  {
+    gn_args
+      .push("v8_disallow_js_in_api_interrupts_is_checked=false".to_string());
+  }
+
   // Fix GN's host_cpu detection when using x86_64 bins on Apple Silicon
   if cfg!(target_os = "macos") && cfg!(target_arch = "aarch64") {
     gn_args.push("host_cpu=\"arm64\"".to_string());

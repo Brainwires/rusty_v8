@@ -62,6 +62,17 @@ Rust (public API):
 Behaviour:
 
 - `SyntheticModule` evaluation steps must return a Promise (V8 `CHECK`s it since 15.3).
+- **JavaScript in interrupt callbacks.** V8 15.6 builds with
+  `v8_disallow_js_in_api_interrupts_is_checked` on (except for Node), which runs every
+  `Isolate::RequestInterrupt` callback under `DisallowJavascriptExecution` and aborts the
+  process if one runs JavaScript ("Invoke in DisallowJavascriptExecutionScope"). Embedders
+  dispatch inspector messages from interrupts (the Deno fork's inspector does), and the fork's
+  `--trace-sigint` captured its stack there (`specs::node::trace_sigint::*_busy` aborted), so
+  `build.rs` passes `v8_disallow_js_in_api_interrupts_is_checked=false`, V8's configuration for
+  Node (test `request_interrupt_callback_runs_javascript`). `GN_ARGS` can override it.
+- **Live edit is gone** from V8: `Debugger.setScriptSource` always fails ("setScriptSource
+  functionality no longer available") and `--inspector-live-edit` is no longer a flag. Not a
+  binding change, but embedders that hot-replace modules must restart or reload instead.
 
 ### Build fixes
 
@@ -108,10 +119,10 @@ Chromium's libclang package.
 ### Verified (biscuits, Linux x86_64)
 
 `V8_FROM_SOURCE=1 cargo build --release --lib` (2385 ninja steps, about 30 min at nice 10;
-`librusty_v8.a` 204 MB) and `cargo test --release`: every suite passes (385 tests, 14 ignored),
+`librusty_v8.a` 204 MB) and `cargo test --release`: every suite passes (386 tests, 14 ignored),
 including the updated `synthetic_module`, the new `object_set_accessor_setter_reports_failure`
-(a V2 setter's `rv.set_bool(false)` throws a `TypeError` in strict mode only) and
-`context_aligned_pointer_out_of_range_is_null`.
+(a V2 setter's `rv.set_bool(false)` throws a `TypeError` in strict mode only),
+`context_aligned_pointer_out_of_range_is_null` and `request_interrupt_callback_runs_javascript`.
 
 ## `v152.2.1-denext.1`: V8 15.2.124.45 (phase 0)
 

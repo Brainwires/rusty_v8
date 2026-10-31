@@ -1341,6 +1341,45 @@ fn request_interrupt_small_scripts() {
   }
 }
 
+// V8 15.6 can run interrupt callbacks under DisallowJavascriptExecution and
+// abort if one runs JavaScript; build.rs turns that check off (as V8 does for
+// Node), because embedders dispatch inspector messages from interrupts.
+#[test]
+fn request_interrupt_callback_runs_javascript() {
+  let _setup_guard = setup::parallel_test();
+  let isolate = &mut v8::Isolate::new(Default::default());
+  let handle = isolate.thread_safe_handle();
+  v8::scope!(let scope, isolate);
+  let context = v8::Context::new(scope, Default::default());
+  let scope = &mut v8::ContextScope::new(scope, context);
+  let global_context = Box::new(v8::Global::new(scope, context));
+
+  static RESULT: AtomicUsize = AtomicUsize::new(0);
+  extern "C" fn callback(
+    isolate_ptr: v8::UnsafeRawIsolatePtr,
+    data: *mut std::ffi::c_void,
+  ) {
+    let mut raw = isolate_ptr;
+    let isolate =
+      unsafe { v8::Isolate::ref_from_raw_isolate_ptr_mut(&mut raw) };
+    let context = unsafe { &*(data as *const v8::Global<v8::Context>) };
+    v8::scope!(let scope, isolate);
+    let context = v8::Local::new(scope, context);
+    let scope = &mut v8::ContextScope::new(scope, context);
+    let value = eval(scope, "6 * 7").unwrap();
+    RESULT.store(
+      value.uint32_value(scope).unwrap() as usize,
+      Ordering::SeqCst,
+    );
+  }
+  handle.request_interrupt(
+    callback,
+    &*global_context as *const v8::Global<v8::Context> as *mut _,
+  );
+  eval(scope, "for (let i = 0; i < 1000; i++) {}");
+  assert_eq!(RESULT.load(Ordering::SeqCst), 42);
+}
+
 #[test]
 fn add_message_listener() {
   let _setup_guard = setup::parallel_test();
@@ -6166,7 +6205,11 @@ fn context_aligned_pointer_out_of_range_is_null() {
 
   assert!(context.get_aligned_pointer_from_embedder_data(0).is_null());
   assert!(context.get_aligned_pointer_from_embedder_data(4).is_null());
-  assert!(context.get_aligned_pointer_from_embedder_data(1000).is_null());
+  assert!(
+    context
+      .get_aligned_pointer_from_embedder_data(1000)
+      .is_null()
+  );
 
   let mut value = 7u64;
   unsafe {
