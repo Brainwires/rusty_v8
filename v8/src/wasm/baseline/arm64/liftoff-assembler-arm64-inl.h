@@ -314,22 +314,10 @@ void LiftoffAssembler::PrepareTailCall(int num_callee_stack_params,
 }
 
 void LiftoffAssembler::AlignFrameSize() {
-  // The frame_size includes the frame marker. The frame marker has already been
-  // pushed on the stack though, so we don't need to allocate memory for it
-  // anymore.
-  int frame_size = GetTotalFrameSize() - 2 * kSystemPointerSize;
-
-  static_assert(kStackSlotSize == kXRegSize,
-                "kStackSlotSize must equal kXRegSize");
-
   // The stack pointer is required to be quadword aligned.
   // Misalignment will cause a stack alignment fault.
-  int misalignment = frame_size % kQuadWordSizeInBytes;
-  if (misalignment) {
-    int padding = kQuadWordSizeInBytes - misalignment;
-    frame_size += padding;
-    max_used_spill_offset_ += padding;
-  }
+  max_used_spill_offset_ =
+      RoundUp(max_used_spill_offset_, kQuadWordSizeInBytes);
 }
 
 void LiftoffAssembler::PatchPrepareStackFrame(
@@ -1298,7 +1286,7 @@ void LiftoffAssembler::AtomicExchangeTaggedPointer(
       if (trapping_load_pc) *trapping_load_pc = pc_offset();
       if constexpr (COMPRESS_POINTERS_BOOL) {
         swpal(value.gp().W(), result.gp().W(), MemOperand(actual_addr));
-        add(result.gp().X(), result.gp().X(), kPtrComprCageBaseRegister);
+        orr(result.gp().X(), result.gp().X(), kPtrComprCageBaseRegister);
       } else {
         swpal(value.gp(), result.gp(), MemOperand(actual_addr));
       }
@@ -1318,7 +1306,7 @@ void LiftoffAssembler::AtomicExchangeTaggedPointer(
       }
       Cbnz(store_result.W(), &retry);
       if constexpr (COMPRESS_POINTERS_BOOL) {
-        add(result.gp().X(), result.gp().X(), kPtrComprCageBaseRegister);
+        orr(result.gp().X(), result.gp().X(), kPtrComprCageBaseRegister);
       }
     }
   }
@@ -1495,7 +1483,7 @@ void LiftoffAssembler::AtomicCompareExchangeTaggedPointer(
   Bind(&done);
 
   if constexpr (COMPRESS_POINTERS_BOOL) {
-    add(result.gp().X(), result.gp().X(), kPtrComprCageBaseRegister);
+    orr(result.gp().X(), result.gp().X(), kPtrComprCageBaseRegister);
   }
 }
 

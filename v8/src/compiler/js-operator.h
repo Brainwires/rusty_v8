@@ -41,8 +41,8 @@ class Operator;
 struct JSOperatorGlobalCache;
 
 // Macro lists.
-#define JS_UNOP_WITH_FEEDBACK(V) \
-  JS_BITWISE_UNOP_LIST(V)        \
+#define JS_UNOP_WITH_EMBEDDED_FEEDBACK(V) \
+  JS_BITWISE_UNOP_LIST(V)                 \
   JS_ARITH_UNOP_LIST(V)
 
 #define JS_BINOP_WITH_FEEDBACK(V) \
@@ -58,18 +58,6 @@ struct JSOperatorGlobalCache;
 // Predicates.
 class JSOperator final : public AllStatic {
  public:
-  static constexpr bool IsUnaryWithFeedback(Operator::Opcode opcode) {
-#define CASE(Name, ...)   \
-  case IrOpcode::k##Name: \
-    return true;
-    switch (opcode) {
-      JS_UNOP_WITH_FEEDBACK(CASE);
-      default:
-        return false;
-    }
-#undef CASE
-  }
-
   static constexpr bool IsBinaryWithFeedback(Operator::Opcode opcode) {
 #define CASE(Name, ...)   \
   case IrOpcode::k##Name: \
@@ -88,6 +76,18 @@ class JSOperator final : public AllStatic {
     return true;
     switch (opcode) {
       JS_BINOP_WITH_EMBEDDED_FEEDBACK(CASE);
+      default:
+        return false;
+    }
+#undef CASE
+  }
+
+  static constexpr bool IsUnaryWithEmbeddedFeedback(Operator::Opcode opcode) {
+#define CASE(Name, ...)   \
+  case IrOpcode::k##Name: \
+    return true;
+    switch (opcode) {
+      JS_UNOP_WITH_EMBEDDED_FEEDBACK(CASE);
       default:
         return false;
     }
@@ -418,13 +418,16 @@ CreateFunctionContextParameters const& CreateFunctionContextParametersOf(
 // Defines parameters for JSDefineNamedOwnProperty operator.
 class DefineNamedOwnPropertyParameters final {
  public:
-  DefineNamedOwnPropertyParameters(NameRef name, FeedbackSource const& feedback)
-      : name_(name), feedback_(feedback) {}
+  DefineNamedOwnPropertyParameters(bool in_literal, NameRef name,
+                                   FeedbackSource const& feedback)
+      : in_literal_(in_literal), name_(name), feedback_(feedback) {}
 
   NameRef name() const { return name_; }
   FeedbackSource const& feedback() const { return feedback_; }
+  bool in_literal() const { return in_literal_; }
 
  private:
+  bool in_literal_;
   const NameRef name_;
   FeedbackSource const feedback_;
 
@@ -958,7 +961,7 @@ std::ostream& operator<<(std::ostream&, ForInParameters const&);
 const ForInParameters& ForInParametersOf(const Operator* op);
 
 #if V8_ENABLE_WEBASSEMBLY
-class JSWasmCallParameters {
+class JSWasmCallParameters final {
  public:
   explicit JSWasmCallParameters(wasm::NativeModule* native_module,
                                 int function_index,
@@ -1044,10 +1047,10 @@ class V8_EXPORT_PRIVATE JSOperatorBuilder final
   const Operator* ShiftRight(BinaryOperationHint hint);
   const Operator* ShiftRightLogical(BinaryOperationHint hint);
 
-  const Operator* BitwiseNot(FeedbackSource const& feedback);
-  const Operator* Decrement(FeedbackSource const& feedback);
-  const Operator* Increment(FeedbackSource const& feedback);
-  const Operator* Negate(FeedbackSource const& feedback);
+  const Operator* BitwiseNot(BinaryOperationHint hint);
+  const Operator* Decrement(BinaryOperationHint hint);
+  const Operator* Increment(BinaryOperationHint hint);
+  const Operator* Negate(BinaryOperationHint hint);
 
   const Operator* ToLength();
   const Operator* ToName();
@@ -1157,7 +1160,7 @@ class V8_EXPORT_PRIVATE JSOperatorBuilder final
   const Operator* SetNamedProperty(LanguageMode language_mode, NameRef name,
                                    FeedbackSource const& feedback);
 
-  const Operator* DefineNamedOwnProperty(NameRef name,
+  const Operator* DefineNamedOwnProperty(bool in_literal, NameRef name,
                                          FeedbackSource const& feedback);
   const Operator* DefineKeyedOwnPropertyInLiteral(
       const FeedbackSource& feedback);
@@ -1287,23 +1290,6 @@ class JSNodeWrapperBase : public NodeWrapper {
     return TNode<Type>::UncheckedCast(                     \
         NodeProperties::GetValueInput(node(), TheIndex));  \
   }
-
-class JSUnaryOpNode final : public JSNodeWrapperBase {
- public:
-  explicit constexpr JSUnaryOpNode(Node* node) : JSNodeWrapperBase(node) {
-    DCHECK(JSOperator::IsUnaryWithFeedback(node->opcode()));
-  }
-
-#define INPUTS(V)            \
-  V(Value, value, 0, Object) \
-  V(FeedbackVector, feedback_vector, 1, HeapObject)
-  INPUTS(DEFINE_INPUT_ACCESSORS)
-#undef INPUTS
-};
-
-#define V(JSName, ...) using JSName##Node = JSUnaryOpNode;
-JS_UNOP_WITH_FEEDBACK(V)
-#undef V
 
 class JSBinaryOpNode final : public JSNodeWrapperBase {
  public:

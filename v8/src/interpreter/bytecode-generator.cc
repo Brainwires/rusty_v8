@@ -1697,14 +1697,15 @@ bool NeedsContextInitialization(DeclarationScope* scope) {
 
 void BytecodeGenerator::GenerateBytecode(uintptr_t stack_limit) {
   InitializeAstVisitor(stack_limit);
-  if (v8_flags.stress_lazy_compilation && local_isolate_->is_main_thread() &&
+  if (V8_UNLIKELY(v8_flags.stress_lazy_compilation) &&
+      local_isolate_->is_main_thread() &&
       !local_isolate_->AsIsolate()->bootstrapper()->IsActive()) {
     // Trigger stack overflow with 1/stress_lazy_compilation probability.
     // Do this only for the main thread compilations because querying random
     // numbers from background threads will make the random values dependent
     // on the thread scheduling and thus non-deterministic.
-    stack_overflow_ = local_isolate_->fuzzer_rng()->NextInt(
-                          v8_flags.stress_lazy_compilation) == 0;
+    stack_overflow_ = local_isolate_->fuzzer_rng()->NextDouble() <
+                      (1.0 / v8_flags.stress_lazy_compilation);
   }
 
   // Initialize the incoming context.
@@ -2040,7 +2041,7 @@ void BytecodeGenerator::GenerateBodyStatements(int start) {
 void BytecodeGenerator::GenerateBodyStatementsWithoutImplicitFinalReturn(
     int start) {
   ZonePtrList<Statement>* body = info()->literal()->body();
-  if (v8_flags.js_explicit_resource_management && closure_scope() != nullptr &&
+  if (closure_scope() != nullptr &&
       (closure_scope()->has_using_declaration() ||
        closure_scope()->has_await_using_declaration())) {
     BuildDisposeScope([&]() { VisitStatements(body, start); },
@@ -2106,7 +2107,7 @@ void BytecodeGenerator::VisitBlock(Block* stmt) {
 }
 
 void BytecodeGenerator::VisitBlockMaybeDispose(Block* stmt) {
-  if (v8_flags.js_explicit_resource_management && stmt->scope() != nullptr &&
+  if (stmt->scope() != nullptr &&
       (stmt->scope()->has_using_declaration() ||
        stmt->scope()->has_await_using_declaration())) {
     BuildDisposeScope([&]() { VisitBlockDeclarationsAndStatements(stmt); },
@@ -2147,13 +2148,13 @@ void BytecodeGenerator::VisitVariableDeclaration(VariableDeclaration* decl) {
     case VariableLocation::LOCAL:
       if (variable->binding_needs_init()) {
         Register destination(builder()->Local(variable->index()));
-        builder()->LoadTheHole().StoreAccumulatorInRegister(destination);
+        builder()->LoadTdzHole().StoreAccumulatorInRegister(destination);
       }
       break;
     case VariableLocation::PARAMETER:
       if (variable->binding_needs_init()) {
         Register destination(builder()->Parameter(variable->index()));
-        builder()->LoadTheHole().StoreAccumulatorInRegister(destination);
+        builder()->LoadTdzHole().StoreAccumulatorInRegister(destination);
       }
       break;
     case VariableLocation::REPL_GLOBAL:
@@ -2162,7 +2163,7 @@ void BytecodeGenerator::VisitVariableDeclaration(VariableDeclaration* decl) {
     case VariableLocation::CONTEXT:
       if (variable->binding_needs_init()) {
         DCHECK_EQ(0, execution_context()->ContextChainDepth(variable->scope()));
-        builder()->LoadTheHole().StoreContextSlot(execution_context()->reg(),
+        builder()->LoadTdzHole().StoreContextSlot(execution_context()->reg(),
                                                   variable, 0);
       }
       break;
@@ -3649,6 +3650,36 @@ void BytecodeGenerator::BuildClassLiteral(ClassLiteral* expr, Register name) {
     }
   }
 
+  // Define private accessors early, using only a single call to the runtime for
+  // each pair of corresponding getters and setters, in the order the first
+  // component is declared.
+  for (auto accessors : private_accessors.ordered_accessors()) {
+    RegisterAllocationScope inner_register_scope(this);
+    RegisterList accessors_reg = register_allocator()->NewRegisterList(2);
+    ClassLiteral::Property* getter = accessors.second->getter;
+    ClassLiteral::Property* setter = accessors.second->setter;
+    Variable* accessor_pair_var;
+    if (getter && getter->kind() == ClassLiteral::Property::AUTO_ACCESSOR) {
+      DCHECK_EQ(setter, getter);
+      AutoAccessorInfo* auto_accessor_info = getter->auto_accessor_info();
+      VisitForRegisterValue(auto_accessor_info->generated_getter(),
+                            accessors_reg[0]);
+      VisitForRegisterValue(auto_accessor_info->generated_setter(),
+                            accessors_reg[1]);
+      accessor_pair_var =
+          auto_accessor_info->property_private_name_proxy()->var();
+    } else {
+      VisitLiteralAccessor(getter, accessors_reg[0]);
+      VisitLiteralAccessor(setter, accessors_reg[1]);
+      accessor_pair_var = getter != nullptr ? getter->private_name_var()
+                                            : setter->private_name_var();
+    }
+    builder()->CallRuntime(Runtime::kCreatePrivateAccessors, accessors_reg);
+    DCHECK_NOT_NULL(accessor_pair_var);
+    BuildVariableAssignment(accessor_pair_var, Token::kInit,
+                            HoleCheckMode::kElided);
+  }
+
   {
     RegisterAllocationScope register_scope(this);
     RegisterList args = register_allocator()->NewGrowableRegisterList();
@@ -3766,36 +3797,6 @@ void BytecodeGenerator::BuildClassLiteral(ClassLiteral* expr, Register name) {
     DCHECK(class_variable->IsStackLocal() || class_variable->IsContextSlot());
     builder()->LoadAccumulatorWithRegister(class_constructor);
     BuildVariableAssignment(class_variable, Token::kInit,
-                            HoleCheckMode::kElided);
-  }
-
-  // Define private accessors, using only a single call to the runtime for
-  // each pair of corresponding getters and setters, in the order the first
-  // component is declared.
-  for (auto accessors : private_accessors.ordered_accessors()) {
-    RegisterAllocationScope inner_register_scope(this);
-    RegisterList accessors_reg = register_allocator()->NewRegisterList(2);
-    ClassLiteral::Property* getter = accessors.second->getter;
-    ClassLiteral::Property* setter = accessors.second->setter;
-    Variable* accessor_pair_var;
-    if (getter && getter->kind() == ClassLiteral::Property::AUTO_ACCESSOR) {
-      DCHECK_EQ(setter, getter);
-      AutoAccessorInfo* auto_accessor_info = getter->auto_accessor_info();
-      VisitForRegisterValue(auto_accessor_info->generated_getter(),
-                            accessors_reg[0]);
-      VisitForRegisterValue(auto_accessor_info->generated_setter(),
-                            accessors_reg[1]);
-      accessor_pair_var =
-          auto_accessor_info->property_private_name_proxy()->var();
-    } else {
-      VisitLiteralAccessor(getter, accessors_reg[0]);
-      VisitLiteralAccessor(setter, accessors_reg[1]);
-      accessor_pair_var = getter != nullptr ? getter->private_name_var()
-                                            : setter->private_name_var();
-    }
-    builder()->CallRuntime(Runtime::kCreatePrivateAccessors, accessors_reg);
-    DCHECK_NOT_NULL(accessor_pair_var);
-    BuildVariableAssignment(accessor_pair_var, Token::kInit,
                             HoleCheckMode::kElided);
   }
 
@@ -4285,8 +4286,13 @@ void BytecodeGenerator::VisitObjectLiteral(ObjectLiteral* expr) {
           VisitForAccumulatorValue(property->value());
           if (key->IsStringLiteral()) {
             FeedbackSlot slot = feedback_spec()->AddDefineNamedOwnICSlot();
-            builder()->DefineNamedOwnProperty(literal, key->AsRawPropertyName(),
-                                              feedback_index(slot));
+            if (clone_object_spread) {
+              builder()->DefineNamedOwnProperty(
+                  literal, key->AsRawPropertyName(), feedback_index(slot));
+            } else {
+              builder()->DefineNamedOwnPropertyInLiteral(
+                  literal, key->AsRawPropertyName(), feedback_index(slot));
+            }
           } else {
             FeedbackSlot slot = feedback_spec()->AddDefineKeyedOwnICSlot();
             builder()->DefineKeyedOwnProperty(
@@ -4481,7 +4487,7 @@ void BytecodeGenerator::VisitObjectLiteral(ObjectLiteral* expr) {
 void BytecodeGenerator::BuildFillArrayWithIterator(
     IteratorRecord iterator, Register array, Register index, Register value,
     FeedbackSlot next_value_slot, FeedbackSlot next_done_slot,
-    FeedbackSlot index_slot, FeedbackSlot element_slot) {
+    FeedbackSlot element_slot) {
   DCHECK(array.is_valid());
   DCHECK(index.is_valid());
   DCHECK(value.is_valid());
@@ -4507,7 +4513,7 @@ void BytecodeGenerator::BuildFillArrayWithIterator(
       .StoreInArrayLiteral(array, index, feedback_index(element_slot))
       // index++
       .LoadAccumulatorWithRegister(index)
-      .UnaryOperation(Token::kInc, feedback_index(index_slot))
+      .UnaryOperation(Token::kInc, kFeedbackIsEmbedded)
       .StoreAccumulatorInRegister(index);
   loop_builder.BindContinueTarget();
 }
@@ -4623,7 +4629,6 @@ void BytecodeGenerator::BuildCreateArrayLiteral(
   }
 
   // Now build insertions for the remaining elements from current to end.
-  SharedFeedbackSlot index_slot(feedback_spec(), FeedbackSlotKind::kBinaryOp);
   SharedFeedbackSlot length_slot(
       feedback_spec(), feedback_spec()->GetStoreICSlot(LanguageMode::kStrict));
   for (; current != end; ++current) {
@@ -4638,11 +4643,10 @@ void BytecodeGenerator::BuildCreateArrayLiteral(
       Register value = register_allocator()->NewRegister();
       FeedbackSlot next_value_load_slot = feedback_spec()->AddLoadICSlot();
       FeedbackSlot next_done_load_slot = feedback_spec()->AddLoadICSlot();
-      FeedbackSlot real_index_slot = index_slot.Get();
       FeedbackSlot real_element_slot = element_slot.Get();
       BuildFillArrayWithIterator(iterator, array, index, value,
                                  next_value_load_slot, next_done_load_slot,
-                                 real_index_slot, real_element_slot);
+                                 real_element_slot);
     } else if (!subexpr->IsTheHoleLiteral()) {
       // literal[index++] = subexpr
       VisitForAccumulatorValue(subexpr);
@@ -4653,7 +4657,7 @@ void BytecodeGenerator::BuildCreateArrayLiteral(
       // Only increase the index if we are not the last element.
       if (current + 1 != end) {
         builder()
-            ->UnaryOperation(Token::kInc, feedback_index(index_slot.Get()))
+            ->UnaryOperation(Token::kInc, kFeedbackIsEmbedded)
             .StoreAccumulatorInRegister(index);
       }
     } else {
@@ -4662,7 +4666,7 @@ void BytecodeGenerator::BuildCreateArrayLiteral(
       auto length = ast_string_constants()->length_string();
       builder()
           ->LoadAccumulatorWithRegister(index)
-          .UnaryOperation(Token::kInc, feedback_index(index_slot.Get()))
+          .UnaryOperation(Token::kInc, kFeedbackIsEmbedded)
           .StoreAccumulatorInRegister(index)
           .SetNamedProperty(array, length, feedback_index(length_slot.Get()),
                             LanguageMode::kStrict);
@@ -4716,7 +4720,7 @@ void BytecodeGenerator::BuildVariableLoad(Variable* variable,
       // subsequent expressions assign to the same variable.
       builder()->LoadAccumulatorWithRegister(source);
       if (VariableNeedsHoleCheckInCurrentBlock(variable, hole_check_mode)) {
-        BuildThrowIfHole(variable);
+        BuildThrowIfTdzHole(variable);
       }
       break;
     }
@@ -4732,7 +4736,7 @@ void BytecodeGenerator::BuildVariableLoad(Variable* variable,
       // subsequent expressions assign to the same variable.
       builder()->LoadAccumulatorWithRegister(source);
       if (VariableNeedsHoleCheckInCurrentBlock(variable, hole_check_mode)) {
-        BuildThrowIfHole(variable);
+        BuildThrowIfTdzHole(variable);
       }
       break;
     }
@@ -4768,7 +4772,7 @@ void BytecodeGenerator::BuildVariableLoad(Variable* variable,
 
       builder()->LoadContextSlot(context_reg, variable, depth);
       if (VariableNeedsHoleCheckInCurrentBlock(variable, hole_check_mode)) {
-        BuildThrowIfHole(variable);
+        BuildThrowIfTdzHole(variable);
       }
       if (is_immutable) {
         SetVariableInRegister(variable, acc);
@@ -4790,7 +4794,7 @@ void BytecodeGenerator::BuildVariableLoad(Variable* variable,
                                            local_variable->index(), depth);
           if (VariableNeedsHoleCheckInCurrentBlock(local_variable,
                                                    hole_check_mode)) {
-            BuildThrowIfHole(local_variable);
+            BuildThrowIfTdzHole(local_variable);
           }
           break;
         }
@@ -4820,7 +4824,7 @@ void BytecodeGenerator::BuildVariableLoad(Variable* variable,
       int depth = execution_context()->ContextChainDepth(variable->scope());
       builder()->LoadModuleVariable(variable->index(), depth);
       if (VariableNeedsHoleCheckInCurrentBlock(variable, hole_check_mode)) {
-        BuildThrowIfHole(variable);
+        BuildThrowIfTdzHole(variable);
       }
       break;
     }
@@ -4902,12 +4906,12 @@ void BytecodeGenerator::RememberHoleCheckInCurrentBlock(Variable* variable) {
                                       vars_in_hole_check_bitmap_);
 }
 
-void BytecodeGenerator::BuildThrowIfHole(Variable* variable) {
+void BytecodeGenerator::BuildThrowIfTdzHole(Variable* variable) {
   if (variable->is_this()) {
     DCHECK(variable->mode() == VariableMode::kConst);
-    builder()->ThrowSuperNotCalledIfHole();
+    builder()->ThrowSuperNotCalledIfTdzHole();
   } else {
-    builder()->ThrowReferenceErrorIfHole(variable->raw_name());
+    builder()->ThrowReferenceErrorIfTdzHole(variable->raw_name());
   }
   RememberHoleCheckInCurrentBlock(variable);
 }
@@ -4938,12 +4942,12 @@ void BytecodeGenerator::BuildHoleCheckForVariableAssignment(Variable* variable,
     //
     // Do not remember the hole check because this bytecode throws if 'this' is
     // *not* the hole, i.e. the opposite of the TDZ hole check.
-    builder()->ThrowSuperAlreadyCalledIfNotHole();
+    builder()->ThrowSuperAlreadyCalledIfNotTdzHole();
   } else {
     // Perform an initialization check for let/const declared variables.
     // E.g. let x = (x = 20); is not allowed.
     DCHECK(IsLexicalVariableMode(variable->mode()));
-    BuildThrowIfHole(variable);
+    BuildThrowIfTdzHole(variable);
   }
 }
 
@@ -5665,10 +5669,9 @@ void BytecodeGenerator::BuildDestructuringArrayAssignment(
           // Fill the array with the iterator.
           FeedbackSlot element_slot =
               feedback_spec()->AddStoreInArrayLiteralICSlot();
-          FeedbackSlot index_slot = feedback_spec()->AddBinaryOpICSlot();
           BuildFillArrayWithIterator(iterator, array, index, next_result,
                                      next_value_load_slot, next_done_load_slot,
-                                     index_slot, element_slot);
+                                     element_slot);
 
           builder()->Bind(&is_done);
           // Assign the array to the LHS.
@@ -5730,14 +5733,23 @@ void BytecodeGenerator::BuildDestructuringObjectAssignment(
   //
   // Since the first property access on null/undefined will also trigger a
   // TypeError, we can elide this check. The exception is when there are no
-  // properties and no rest property (this is an empty literal), or when the
-  // first property is a computed name and accessing it can have side effects.
+  // properties and no rest property (this is an empty literal), or when there
+  // is only a rest property (as it uses CloneObject, which does not throw on
+  // null/undefined), or when the first property is a computed name and
+  // accessing it can have side effects.
   //
   // TODO(leszeks): Also eliminate this check if the value is known to be
   // non-null (e.g. an object literal).
-  if (pattern->properties()->is_empty() ||
-      (pattern->properties()->at(0)->is_computed_name() &&
-       pattern->properties()->at(0)->kind() != ObjectLiteralProperty::SPREAD)) {
+  bool is_empty_pattern = pattern->properties()->is_empty();
+  bool is_only_rest_property =
+      pattern->properties()->length() == 1 &&
+      pattern->properties()->at(0)->kind() == ObjectLiteralProperty::SPREAD;
+  bool is_first_property_computed_name =
+      !is_empty_pattern && pattern->properties()->at(0)->is_computed_name() &&
+      pattern->properties()->at(0)->kind() != ObjectLiteralProperty::SPREAD;
+
+  if (is_empty_pattern || is_only_rest_property ||
+      is_first_property_computed_name) {
     BytecodeLabel is_null_or_undefined, not_null_or_undefined;
     builder()
         ->JumpIfUndefinedOrNull(&is_null_or_undefined)
@@ -5810,9 +5822,20 @@ void BytecodeGenerator::BuildDestructuringObjectAssignment(
       DCHECK_EQ(i, pattern->properties()->length() - 1);
       DCHECK(!value_key.is_valid());
       DCHECK_NULL(value_name);
-      builder()->CallRuntime(
-          Runtime::kInlineCopyDataPropertiesWithExcludedPropertiesOnStack,
-          rest_runtime_callargs);
+      if (pattern->properties()->length() == 1) {
+        // If there is only the rest property, we have no excluded properties.
+        // We can use the CloneObject bytecode instead of the more expensive
+        // CopyDataPropertiesWithExcludedPropertiesOnStack runtime call.
+        // E.g. for `let { ...rest } = obj;`.
+        DCHECK(pattern->builder()->has_rest_property());
+        int flags = CreateObjectLiteralFlags::Encode(0, false);
+        int clone_index = feedback_index(feedback_spec()->AddCloneObjectSlot());
+        builder()->CloneObject(value, flags, clone_index);
+      } else {
+        builder()->CallRuntime(
+            Runtime::kInlineCopyDataPropertiesWithExcludedPropertiesOnStack,
+            rest_runtime_callargs);
+      }
     } else if (value_name) {
       builder()->LoadNamedProperty(
           value, value_name, feedback_index(feedback_spec()->AddLoadICSlot()));
@@ -7410,12 +7433,16 @@ void BytecodeGenerator::VisitUnaryOperation(UnaryOperation* expr) {
       VisitDelete(expr);
       break;
     case Token::kAdd:
-    case Token::kSub:
-    case Token::kBitNot:
       VisitForAccumulatorValue(expr->expression());
       builder()->SetExpressionPosition(expr);
       builder()->UnaryOperation(
           expr->op(), feedback_index(feedback_spec()->AddBinaryOpICSlot()));
+      break;
+    case Token::kSub:
+    case Token::kBitNot:
+      VisitForAccumulatorValue(expr->expression());
+      builder()->SetExpressionPosition(expr);
+      builder()->UnaryOperation(expr->op(), kFeedbackIsEmbedded);
       break;
     default:
       UNREACHABLE();
@@ -7431,6 +7458,7 @@ void BytecodeGenerator::VisitDelete(UnaryOperation* unary) {
     DCHECK(!property->IsPrivateReference());
     if (property->IsSuperAccess()) {
       // Delete of super access is not allowed.
+      BuildThisVariableLoad();
       VisitForEffect(property->key());
       builder()->CallRuntime(Runtime::kThrowUnsupportedSuperError);
     } else {
@@ -7628,9 +7656,9 @@ void BytecodeGenerator::VisitCountOperation(CountOperation* expr) {
     }
   }
 
-  // Save result for postfix expressions.
-  FeedbackSlot count_slot = feedback_spec()->AddBinaryOpICSlot();
   if (is_postfix) {
+    // Save result for postfix expressions.
+    FeedbackSlot count_slot = feedback_spec()->AddBinaryOpICSlot();
     old_value = register_allocator()->NewRegister();
     // Convert old value into a number before saving it.
     // TODO(ignition): Think about adding proper PostInc/PostDec bytecodes
@@ -7641,7 +7669,7 @@ void BytecodeGenerator::VisitCountOperation(CountOperation* expr) {
   }
 
   // Perform +1/-1 operation.
-  builder()->UnaryOperation(expr->op(), feedback_index(count_slot));
+  builder()->UnaryOperation(expr->op(), kFeedbackIsEmbedded);
 
   // Store the value.
   builder()->SetExpressionPosition(expr);

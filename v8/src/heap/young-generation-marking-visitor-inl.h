@@ -24,18 +24,18 @@ namespace internal {
 template <YoungGenerationMarkingVisitationMode marking_mode>
 YoungGenerationMarkingVisitor<marking_mode>::YoungGenerationMarkingVisitor(
     Heap* heap,
-    PretenuringHandler::PretenuringFeedbackMap* local_pretenuring_feedback)
+    PretenuringHandler::PretenuringFeedbackMap* local_pretenuring_feedback,
+    YoungPendingAllocations::Snapshot* young_pending_allocations_snapshot)
     : Base(heap->isolate()),
       isolate_(heap->isolate()),
       marking_worklists_local_(
           heap->minor_mark_sweep_collector()->marking_worklists(),
-          heap->cpp_heap()
-              ? CppHeap::From(heap->cpp_heap())->CreateCppMarkingState()
-              : MarkingWorklists::Local::kNoCppMarkingState),
+          CppHeap::From(heap->cpp_heap())->CreateCppMarkingState()),
       ephemeron_table_list_local_(
           *heap->minor_mark_sweep_collector()->ephemeron_table_list()),
       pretenuring_handler_(heap->pretenuring_handler()),
       local_pretenuring_feedback_(local_pretenuring_feedback),
+      young_pending_allocations_snapshot_(young_pending_allocations_snapshot),
       shortcut_strings_(heap->CanShortcutStringsDuringGC(
           GarbageCollector::MINOR_MARK_SWEEPER)) {}
 
@@ -84,8 +84,12 @@ size_t YoungGenerationMarkingVisitor<marking_mode>::VisitJSObjectSubclass(
   const int object_size =
       static_cast<int>(Base::template VisitJSObjectSubclass<T, TBodyDescriptor>(
           map, object, maybe_object_size));
+  DCHECK_IMPLIES(
+      marking_mode == YoungGenerationMarkingVisitationMode::kConcurrent,
+      young_pending_allocations_snapshot_ != nullptr);
   PretenuringHandler::UpdateAllocationSite(
-      isolate_->heap(), map, object, object_size, local_pretenuring_feedback_);
+      isolate_->heap(), map, object, object_size, local_pretenuring_feedback_,
+      young_pending_allocations_snapshot_);
   return object_size;
 }
 
@@ -122,7 +126,7 @@ void YoungGenerationMarkingVisitor<marking_mode>::VisitExternalPointer(
   if (handle != kNullExternalPointerHandle) {
     ExternalPointerTable& table = isolate_->external_pointer_table();
     auto* space = isolate_->heap()->young_external_pointer_space();
-    table.Mark(space, handle, slot.address());
+    table.Mark(space, handle, slot.address(), slot.tag_range());
     if (slot.tag_range() == kArrayBufferExtensionTag) {
       maybe_extension = table.Get(handle, kArrayBufferExtensionTag);
     }

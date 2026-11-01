@@ -21,6 +21,7 @@
 #include "src/logging/local-logger.h"
 #include "src/logging/log.h"
 #include "src/objects/backing-store.h"
+#include "src/objects/bytecode-array-inl.h"
 #include "src/objects/heap-object-field-inl.h"
 #include "src/objects/heap-object-set-map-inl.h"
 #include "src/objects/js-array-buffer-inl.h"
@@ -29,7 +30,9 @@
 #include "src/objects/objects.h"
 #include "src/objects/slots.h"
 #include "src/objects/string.h"
+#include "src/objects/trusted-object-inl.h"
 #include "src/roots/roots.h"
+#include "src/sandbox/bytecode-verifier.h"
 #include "src/sandbox/js-dispatch-table-inl.h"
 #include "src/snapshot/embedded/embedded-data-inl.h"
 #include "src/snapshot/references.h"
@@ -37,6 +40,7 @@
 #include "src/snapshot/shared-heap-serializer.h"
 #include "src/snapshot/snapshot-data.h"
 #include "src/utils/memcopy.h"
+#include "src/zone/zone.h"
 
 // Has to be the last include (doesn't have include guards)
 #include "src/objects/object-macros.h"
@@ -334,6 +338,7 @@ Deserializer<IsolateT>::Deserializer(IsolateT* isolate,
       interceptor_infos_(isolate),
       function_template_infos_(isolate),
       new_scripts_(isolate),
+      new_exposed_trusted_objects_(isolate),
       deserializing_user_code_(deserializing_user_code),
       should_rehash_((v8_flags.rehash_snapshot && can_rehash) ||
                      deserializing_user_code),
@@ -438,6 +443,22 @@ void Deserializer<IsolateT>::LogScriptEvents(Tagged<Script> script) {
   LOG(isolate(), ScriptDetails(script));
 }
 
+template <typename IsolateT>
+void Deserializer<IsolateT>::PostProcessExposedTrustedObjects() {
+#ifdef V8_ENABLE_SANDBOX
+  Zone zone(isolate()->allocator(), ZONE_NAME);
+  for (DirectHandle<ExposedTrustedObject> obj : new_exposed_trusted_objects()) {
+    if (Is<BytecodeArray>(*obj)) {
+      DirectHandle<BytecodeArray> bytecode = TrustedCast<BytecodeArray>(obj);
+      BytecodeVerifier::Verify(isolate(), indirect_handle(bytecode, isolate()),
+                               &zone);
+    } else {
+      obj->Publish(isolate());
+    }
+  }
+#endif
+}
+
 namespace {
 template <typename IsolateT>
 uint32_t ComputeRawHashField(IsolateT* isolate, Tagged<String> string) {
@@ -491,19 +512,7 @@ void NoExternalReferencesCallback() {
 void PostProcessExternalString(Tagged<ExternalString> string,
                                Isolate* isolate) {
   DisallowGarbageCollection no_gc;
-  uint32_t index = string->GetResourceRefForDeserialization();
-  // Our (sandbox) fuzzers can sometimes get here by mutating an in-sandbox
-  // object after deserialization but before post-processing, and making it
-  // look like an ExternalString. In that case, the Isolate may not have any
-  // external references and this CHECK then avoids false-positive crashes.
-  // Technically we should probably also check that the index is in-bounds if
-  // we do have external references on the Isolate, but in our current fuzzer
-  // setup, this doesn't seem to be the case.
-  CHECK_NE(isolate->api_external_references(), nullptr);
-  Address address =
-      static_cast<Address>(isolate->api_external_references()[index]);
-  string->InitExternalPointerFields(isolate);
-  string->set_address_as_resource(isolate, address);
+  string->InitResourceDataAfterDeserialization(isolate);
   isolate->heap()->UpdateExternalString(string, 0,
                                         string->ExternalPayloadSize());
   isolate->heap()->RegisterExternalString(string);
@@ -536,20 +545,17 @@ void Deserializer<Isolate>::PostProcessNewJSReceiver(
     }
   } else if (InstanceTypeChecker::IsJSTypedArray(instance_type)) {
     auto typed_array = Cast<JSTypedArray>(*obj);
+    uint32_t store_index = source_.GetUint30();
     // Note: ByteArray objects must not be deferred s.t. they are
     // available here for is_on_heap(). See also: CanBeDeferred.
     // Fixup typed array pointers.
     if (typed_array->is_on_heap()) {
-      typed_array->AddExternalPointerCompensationForDeserialization(
-          main_thread_isolate());
+      typed_array->InitOnHeapDataPtrAfterDeserialization(main_thread_isolate());
     } else {
-      // Serializer writes backing store ref as a DataPtr() value.
-      uint32_t store_index =
-          typed_array->GetExternalBackingStoreRefForDeserialization();
-      auto backing_store = backing_stores_[store_index];
-      if (backing_store && backing_store->buffer_start()) {
+      auto bs = backing_store(store_index);
+      if (bs && bs->buffer_start()) {
         typed_array->SetOffHeapDataPtr(main_thread_isolate(),
-                                       backing_store->buffer_start(),
+                                       bs->buffer_start(),
                                        typed_array->byte_offset());
       } else {
         // Directly set the data pointer to point to the
@@ -562,7 +568,7 @@ void Deserializer<Isolate>::PostProcessNewJSReceiver(
     }
   } else if (InstanceTypeChecker::IsJSArrayBuffer(instance_type)) {
     auto buffer = Cast<JSArrayBuffer>(*obj);
-    uint32_t store_index = buffer->GetBackingStoreRefForDeserialization();
+    uint32_t store_index = source_.GetUint30();
     buffer->init_extension();
     if (store_index == kEmptyBackingStoreRefSentinel) {
       buffer->set_backing_store(main_thread_isolate(),
@@ -1494,7 +1500,9 @@ int Deserializer<IsolateT>::ReadInitializeSelfIndirectPointer(
 
   Tagged<ExposedTrustedObject> host =
       TrustedCast<ExposedTrustedObject>(*slot_accessor.object());
-  host->InitAndPublish(isolate());
+  host->InitDontPublish(isolate());
+  new_exposed_trusted_objects_.push_back(
+      TrustedCast<ExposedTrustedObject>(slot_accessor.object()));
 
   return 1;
 #else

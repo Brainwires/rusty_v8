@@ -1000,7 +1000,9 @@ impl Isolate {
     crate::V8::assert_initialized();
     let (raw_create_params, create_param_allocations) = params.finalize();
     let has_embedder_cpp_heap = !raw_create_params.cpp_heap.is_null();
+    let first_isolate = crate::snapshot::read_only_heap_guard::before_create();
     let cxx_isolate = unsafe { v8__Isolate__New(&raw_create_params) };
+    drop(first_isolate);
     let mut isolate = unsafe { Isolate::from_raw_ptr(cxx_isolate) };
     isolate.initialize(create_param_allocations);
     isolate.get_annex_mut().has_embedder_cpp_heap = has_embedder_cpp_heap;

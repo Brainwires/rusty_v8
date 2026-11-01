@@ -1341,6 +1341,45 @@ fn request_interrupt_small_scripts() {
   }
 }
 
+// V8 15.6 can run interrupt callbacks under DisallowJavascriptExecution and
+// abort if one runs JavaScript; build.rs turns that check off (as V8 does for
+// Node), because embedders dispatch inspector messages from interrupts.
+#[test]
+fn request_interrupt_callback_runs_javascript() {
+  let _setup_guard = setup::parallel_test();
+  let isolate = &mut v8::Isolate::new(Default::default());
+  let handle = isolate.thread_safe_handle();
+  v8::scope!(let scope, isolate);
+  let context = v8::Context::new(scope, Default::default());
+  let scope = &mut v8::ContextScope::new(scope, context);
+  let global_context = Box::new(v8::Global::new(scope, context));
+
+  static RESULT: AtomicUsize = AtomicUsize::new(0);
+  extern "C" fn callback(
+    isolate_ptr: v8::UnsafeRawIsolatePtr,
+    data: *mut std::ffi::c_void,
+  ) {
+    let mut raw = isolate_ptr;
+    let isolate =
+      unsafe { v8::Isolate::ref_from_raw_isolate_ptr_mut(&mut raw) };
+    let context = unsafe { &*(data as *const v8::Global<v8::Context>) };
+    v8::scope!(let scope, isolate);
+    let context = v8::Local::new(scope, context);
+    let scope = &mut v8::ContextScope::new(scope, context);
+    let value = eval(scope, "6 * 7").unwrap();
+    RESULT.store(
+      value.uint32_value(scope).unwrap() as usize,
+      Ordering::SeqCst,
+    );
+  }
+  handle.request_interrupt(
+    callback,
+    &*global_context as *const v8::Global<v8::Context> as *mut _,
+  );
+  eval(scope, "for (let i = 0; i < 1000; i++) {}");
+  assert_eq!(RESULT.load(Ordering::SeqCst), 42);
+}
+
 #[test]
 fn add_message_listener() {
   let _setup_guard = setup::parallel_test();
@@ -2139,7 +2178,7 @@ fn object_template_set_accessor() {
                   key: v8::Local<v8::Name>,
                   value: v8::Local<v8::Value>,
                   args: v8::PropertyCallbackArguments,
-                  _rv: v8::ReturnValue<()>| {
+                  _rv: v8::ReturnValue<v8::Boolean>| {
       let this = args.holder();
 
       assert!(args.data().is_undefined());
@@ -2179,7 +2218,7 @@ fn object_template_set_accessor() {
        key: v8::Local<v8::Name>,
        value: v8::Local<v8::Value>,
        args: v8::PropertyCallbackArguments,
-       _rv: v8::ReturnValue<()>| {
+       _rv: v8::ReturnValue<v8::Boolean>| {
         let this = args.holder();
 
         assert!(args.data().is_string());
@@ -3466,6 +3505,66 @@ fn object_set_accessor() {
   }
 }
 
+// V8 15.3 dropped the V1 accessor setter: an accessor setter now receives
+// `PropertyCallbackInfo<Boolean>`, and `rv.set_bool(false)` reports a failed
+// [[Set]], which throws a TypeError in strict mode (and not in sloppy mode).
+#[test]
+fn object_set_accessor_setter_reports_failure() {
+  let _setup_guard = setup::parallel_test();
+  let isolate = &mut v8::Isolate::new(Default::default());
+  v8::scope!(let scope, isolate);
+
+  let context = v8::Context::new(scope, Default::default());
+  let scope = &mut v8::ContextScope::new(scope, context);
+
+  static SETS: AtomicUsize = AtomicUsize::new(0);
+
+  let getter = |_scope: &mut v8::PinScope,
+                _key: v8::Local<v8::Name>,
+                _args: v8::PropertyCallbackArguments,
+                mut rv: v8::ReturnValue<v8::Value>| {
+    rv.set_int32(7);
+  };
+  let setter = |_scope: &mut v8::PinScope,
+                _key: v8::Local<v8::Name>,
+                value: v8::Local<v8::Value>,
+                args: v8::PropertyCallbackArguments,
+                mut rv: v8::ReturnValue<v8::Boolean>| {
+    SETS.fetch_add(1, Ordering::SeqCst);
+    // Reject odd numbers, accept everything else.
+    let reject = value.is_int32()
+      && v8::Local::<v8::Int32>::try_from(value).unwrap().value() % 2 != 0;
+    if reject {
+      rv.set_bool(false);
+    }
+    let _ = args.should_throw_on_error();
+  };
+
+  let obj = v8::Object::new(scope);
+  let key = v8::String::new(scope, "guarded").unwrap();
+  obj.set_accessor_with_setter(scope, key.into(), getter, setter);
+  let obj_name = v8::String::new(scope, "obj").unwrap();
+  context
+    .global(scope)
+    .set(scope, obj_name.into(), obj.into());
+
+  // Accepted, in either mode.
+  assert!(eval(scope, "obj.guarded = 2").is_some());
+  assert!(eval(scope, "'use strict'; obj.guarded = 4").is_some());
+
+  // Rejected: sloppy mode ignores it, strict mode throws a TypeError.
+  assert!(eval(scope, "obj.guarded = 3").is_some());
+  {
+    let tc = pin!(v8::TryCatch::new(scope));
+    let tc = &mut tc.init();
+    assert!(eval(tc, "'use strict'; obj.guarded = 5").is_none());
+    assert!(tc.has_caught());
+    let message = tc.exception().unwrap().to_rust_string_lossy(tc);
+    assert!(message.starts_with("TypeError"), "{message}");
+  }
+  assert_eq!(SETS.load(Ordering::SeqCst), 4);
+}
+
 #[test]
 fn object_set_accessor_with_setter() {
   let _setup_guard = setup::parallel_test();
@@ -3506,7 +3605,7 @@ fn object_set_accessor_with_setter() {
                   key: v8::Local<v8::Name>,
                   value: v8::Local<v8::Value>,
                   args: v8::PropertyCallbackArguments,
-                  _rv: v8::ReturnValue<()>| {
+                  _rv: v8::ReturnValue<v8::Boolean>| {
       println!("setter called");
 
       let this = args.holder();
@@ -3607,7 +3706,7 @@ fn object_set_accessor_with_setter_with_property() {
                   key: v8::Local<v8::Name>,
                   value: v8::Local<v8::Value>,
                   args: v8::PropertyCallbackArguments,
-                  _rv: v8::ReturnValue<()>| {
+                  _rv: v8::ReturnValue<v8::Boolean>| {
       println!("setter called");
 
       let this = args.holder();
@@ -3712,7 +3811,7 @@ fn object_set_accessor_with_data() {
                   key: v8::Local<v8::Name>,
                   value: v8::Local<v8::Value>,
                   args: v8::PropertyCallbackArguments,
-                  _rv: v8::ReturnValue<()>| {
+                  _rv: v8::ReturnValue<v8::Boolean>| {
       println!("setter called");
 
       let this = args.holder();
@@ -6093,6 +6192,37 @@ fn snapshot_creator_multiple_contexts() {
       }
     }
   }
+}
+
+// A slot past a context's embedder data reads as null instead of aborting
+// in V8's checked getter ("Index too large").
+#[test]
+fn context_aligned_pointer_out_of_range_is_null() {
+  let _setup_guard = setup::parallel_test();
+  let isolate = &mut v8::Isolate::new(Default::default());
+  v8::scope!(let scope, isolate);
+  let context = v8::Context::new(scope, Default::default());
+
+  assert!(context.get_aligned_pointer_from_embedder_data(0).is_null());
+  assert!(context.get_aligned_pointer_from_embedder_data(4).is_null());
+  assert!(
+    context
+      .get_aligned_pointer_from_embedder_data(1000)
+      .is_null()
+  );
+
+  let mut value = 7u64;
+  unsafe {
+    context.set_aligned_pointer_in_embedder_data(
+      1,
+      &mut value as *mut u64 as *mut std::ffi::c_void,
+    );
+  }
+  assert_eq!(
+    context.get_aligned_pointer_from_embedder_data(1),
+    &mut value as *mut u64 as *mut std::ffi::c_void
+  );
+  assert!(context.get_aligned_pointer_from_embedder_data(4).is_null());
 }
 
 #[test]
@@ -8879,7 +9009,11 @@ fn synthetic_evaluation_steps<'s>(
     scope.reset();
   }
 
-  Some(v8::undefined(scope).into())
+  // From V8 15.3 the evaluation steps must return a Promise (V8 CHECKs it).
+  let resolver = v8::PromiseResolver::new(scope).unwrap();
+  let undefined = v8::undefined(scope).into();
+  resolver.resolve(scope, undefined).unwrap();
+  Some(resolver.get_promise(scope).into())
 }
 
 #[test]

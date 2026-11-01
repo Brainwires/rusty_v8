@@ -93,9 +93,7 @@ v8::MaybeLocal<v8::Value> DebugStackTraceIterator::GetReceiver() const {
     // Arrow function defined in top level function without references to
     // variables may have NativeContext as context.
     if (!context->IsFunctionContext()) return v8::MaybeLocal<v8::Value>();
-    ScopeIterator scope_iterator(
-        isolate_, frame_inspector_.get(),
-        ScopeIterator::ReparseStrategy::kFunctionLiteral);
+    ScopeIterator scope_iterator(isolate_, frame_inspector_.get());
     // We lookup this variable in function context only when it is used in arrow
     // function otherwise V8 can optimize it out.
     if (!scope_iterator.ClosureScopeHasThisReference()) {
@@ -106,12 +104,15 @@ v8::MaybeLocal<v8::Value> DebugStackTraceIterator::GetReceiver() const {
         *isolate_->factory()->this_string());
     if (slot_index < 0) return v8::MaybeLocal<v8::Value>();
     DirectHandle<Object> value(context->GetNoCell(slot_index), isolate_);
-    if (IsTheHole(*value)) return v8::MaybeLocal<v8::Value>();
+    if (IsTdzHole(*value)) return v8::MaybeLocal<v8::Value>();
     return Utils::ToLocal(value);
   }
 
   DirectHandle<Object> value = frame_inspector_->GetReceiver();
-  if (value.is_null() || (IsSmi(*value) || !IsTheHole(*value))) {
+#ifdef V8_ENABLE_TDZ_HOLE
+  DCHECK(value.is_null() || !IsTheHole(*value));
+#endif
+  if (value.is_null() || (IsSmi(*value) || !IsTdzHole(*value))) {
     return Utils::ToLocal(value);
   }
   return v8::MaybeLocal<v8::Value>();
@@ -260,14 +261,14 @@ void DebugStackTraceIterator::UpdateInlineFrameIndexAndResumableFnOnStack() {
 }
 
 v8::MaybeLocal<v8::Value> DebugStackTraceIterator::Evaluate(
-    v8::Local<v8::String> source, bool throw_on_side_effect) {
+    v8::Local<v8::String> source, bool throw_on_side_effect, int scope_index) {
   DCHECK(!Done());
   DirectHandle<Object> value;
 
   i::SafeForInterruptsScope safe_for_interrupt_scope(isolate_);
   if (!DebugEvaluate::Local(
            isolate_, iterator_.frame()->id(), inlined_frame_index_,
-           Utils::OpenDirectHandle(*source), throw_on_side_effect)
+           Utils::OpenDirectHandle(*source), throw_on_side_effect, scope_index)
            .ToHandle(&value)) {
     return v8::MaybeLocal<v8::Value>();
   }

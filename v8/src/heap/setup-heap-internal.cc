@@ -39,6 +39,7 @@
 #include "src/objects/map.h"
 #include "src/objects/megadom-handler.h"
 #include "src/objects/microtask.h"
+#include "src/objects/object-conversions-inl.h"
 #include "src/objects/objects-inl.h"
 #include "src/objects/oddball-inl.h"
 #include "src/objects/ordered-hash-table.h"
@@ -87,8 +88,9 @@ bool IsMutableMap(InstanceType instance_type, ElementsKind elements_kind) {
       InstanceTypeChecker::IsAlwaysSharedSpaceJSObject(instance_type);
   bool is_wasm_object = false;
 #if V8_ENABLE_WEBASSEMBLY
-  is_wasm_object =
-      instance_type == WASM_STRUCT_TYPE || instance_type == WASM_ARRAY_TYPE;
+  is_wasm_object = instance_type == WASM_STRUCT_TYPE ||
+                   instance_type == WASM_CUSTOM_MAP_TYPE ||
+                   instance_type == WASM_ARRAY_TYPE;
 #endif  // V8_ENABLE_WEBASSEMBLY
   DCHECK_IMPLIES(is_js_object &&
                      !Map::CanHaveFastTransitionableElementsKind(instance_type),
@@ -904,6 +906,8 @@ bool Heap::CreateLateReadOnlyJSReceiverMaps() {
 
     ALLOCATE_MAP(CPP_HEAP_EXTERNAL_OBJECT_TYPE,
                  CppHeapExternalObject::kHeaderSize, cpp_heap_external)
+    ALLOCATE_MAP(CPP_GCMANAGED_BASE_TYPE, CppGCManagedBase::kHeaderSize,
+                 cpp_gc_managed_base)
   }
 
   // Shared space object maps are immutable and can be in RO space.
@@ -1360,11 +1364,9 @@ bool Heap::CreateReadOnlyObjects() {
 #ifdef V8_ENABLE_WEBASSEMBLY
   // Allocate the wasm-null object. It is a regular V8 heap object contained in
   // a V8 page.
-  // In static-roots builds, it is large enough so that its payload (other than
-  // its map word) can be mprotected on OS page granularity. We adjust the
-  // layout such that we have a filler object in the current OS page, and the
-  // wasm-null map word at the end of the current OS page. The payload then is
-  // contained on a separate OS page which can be protected.
+  // In static-roots builds, it is large enough so that it can be mprotected on
+  // OS page granularity, so we fill up the rest of the current OS page with
+  // a filler.
   // In non-static-roots builds, it is a regular object of size {kTaggedSize}
   // and does not need padding.
 #define V8_UNMAP_WASM_NULL_PAYLOAD \
@@ -1373,17 +1375,10 @@ bool Heap::CreateReadOnlyObjects() {
 #if V8_UNMAP_WASM_NULL_PAYLOAD
   // Allocate an unmappable WasmNull.
   {
-    static_assert(WasmNull::kSize ==
-                  WasmNull::kHeaderSize + WasmNull::kPayloadSize);
     Tagged<HeapObject> wasm_null_obj =
-        read_only_space_
-            ->AllocateRawUnmappableAllocation(WasmNull::kHeaderSize,
-                                              WasmNull::kPayloadSize)
+        read_only_space_->AllocateRawUnmappableAllocation(0, WasmNull::kSize)
             .ToObjectChecked();
-    wasm_null_obj->set_map_after_allocation(isolate(), roots.wasm_null_map(),
-                                            SKIP_WRITE_BARRIER);
-    // No need to initialize the payload since it's either empty or unmapped.
-    set_wasm_null(Cast<WasmNull>(wasm_null_obj));
+    set_wasm_null(UncheckedCast<WasmNull>(wasm_null_obj));
   }
 #else
   // Allocate the WasmNull.
@@ -1419,6 +1414,12 @@ bool Heap::CreateReadOnlyObjects() {
   set_property_cell_hole_value(UncheckedCast<PropertyCellHole>(make_hole()));
   set_hash_table_hole_value(UncheckedCast<HashTableHole>(make_hole()));
   set_promise_hole_value(UncheckedCast<PromiseHole>(make_hole()));
+#ifdef V8_ENABLE_TDZ_HOLE
+  set_tdz_hole_value(UncheckedCast<TdzHole>(make_hole()));
+#else
+  // TODO(leszeks): Remove DisabledTdzHole when v8_enable_tdz_hole is removed.
+  set_disabled_tdz_hole_value(UncheckedCast<DisabledTdzHole>(make_hole()));
+#endif
   set_uninitialized_value(UncheckedCast<UninitializedHole>(make_hole()));
   set_arguments_marker(UncheckedCast<ArgumentsMarker>(make_hole()));
   set_termination_exception(UncheckedCast<TerminationException>(make_hole()));
@@ -1487,6 +1488,8 @@ void Heap::CreateInitialMutableObjects() {
   // Allocate regexp caches.
   set_string_split_cache(*factory->NewFixedArray(
       regexp::ResultsCache::kRegExpResultsCacheSize, AllocationType::kOld));
+  // Allocated on first use, see EnsureRegExpSplitCache.
+  set_regexp_split_cache(roots.empty_fixed_array());
   set_regexp_multiple_cache(*factory->NewFixedArray(
       regexp::ResultsCache::kRegExpResultsCacheSize, AllocationType::kOld));
   set_regexp_match_global_atom_cache(*factory->NewFixedArray(
@@ -1501,6 +1504,7 @@ void Heap::CreateInitialMutableObjects() {
 #ifdef V8_ENABLE_WEBASSEMBLY
   set_js_to_wasm_wrappers(roots.empty_weak_fixed_array());
   set_wasm_canonical_rtts(roots.empty_weak_fixed_array());
+  set_wasm_shared_canonical_rtts(roots.empty_weak_fixed_array());
 #endif  // V8_ENABLE_WEBASSEMBLY
 
   set_script_list(roots.empty_weak_array_list());

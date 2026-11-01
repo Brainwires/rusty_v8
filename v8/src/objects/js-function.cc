@@ -10,7 +10,6 @@
 #include "src/codegen/compiler.h"
 #include "src/common/globals.h"
 #include "src/diagnostics/code-tracer.h"
-#include "src/debug/debug.h"
 #include "src/execution/frames-inl.h"
 #include "src/execution/isolate.h"
 #include "src/execution/tiering-manager.h"
@@ -22,8 +21,10 @@
 #include "src/objects/feedback-cell-inl.h"
 #include "src/objects/feedback-vector.h"
 #include "src/objects/instance-type-inl.h"
+#include "src/objects/object-conversions-inl.h"
 #include "src/objects/object-predicates-inl.h"
 #include "src/objects/objects.h"
+#include "src/objects/shared-function-info-inl.h"
 #include "src/roots/roots.h"
 #include "src/strings/string-builder-inl.h"
 
@@ -923,7 +924,7 @@ void JSFunction::SetInitialMap(Isolate* isolate,
     if (function->TryGetPrototypeOrInitialMap(&pomd) &&
         pomd.has_non_instance_prototype) {
       pomd.non_instance_prototype_tuple->set_value1(*initial_map,
-                                                    kRelaxedStore);
+                                                    kReleaseStore);
     } else {
       function->set_prototype_or_initial_map(*initial_map, kReleaseStore);
     }
@@ -990,8 +991,9 @@ void JSFunction::EnsureHasInitialMap(Isolate* isolate,
   // system.
   // TODO(leszeks): Figure out if this CHECK is needed.
   CHECK(IsJSReceiver(*prototype));
-  JSFunction::SetInitialMap(isolate, function, map, prototype);
+  // Initialize slack tracking before publishing the map to concurrent readers.
   map->StartInobjectSlackTracking();
+  JSFunction::SetInitialMap(isolate, function, map, prototype);
 }
 
 namespace {
@@ -1182,11 +1184,12 @@ bool FastInitializeDerivedMap(Isolate* isolate,
       Map::CopyInitialMap(isolate, constructor_initial_map, instance_size,
                           in_object_properties, unused_property_fields);
   map->set_new_target_is_base(false);
+  // Initialize slack tracking before publishing the map to concurrent readers.
+  map->set_construction_counter(Map::kNoSlackTracking);
+  map->StartInobjectSlackTracking();
   DirectHandle<JSReceiver> prototype(new_target->instance_prototype(), isolate);
   JSFunction::SetInitialMap(isolate, new_target, map, prototype, constructor);
   DCHECK(IsJSReceiver(new_target->instance_prototype()));
-  map->set_construction_counter(Map::kNoSlackTracking);
-  map->StartInobjectSlackTracking();
   return true;
 }
 
@@ -1414,7 +1417,7 @@ DirectHandle<String> JSFunction::GetDebugName(
     // that exact behavior and go with SharedFunctionInfo::DebugName()
     // in case of the fast-path.
     DirectHandle<Object> name = JSReceiver::GetDataProperty(
-        isolate, function, isolate->factory()->name_string());
+        isolate, function, isolate->factory()->name_string(), allow_allocation);
     if (IsString(*name)) return Cast<String>(name);
   }
   return SharedFunctionInfo::DebugName(
@@ -1591,11 +1594,21 @@ void JSFunction::ClearAllTypeFeedbackInfoForTesting(Isolate* isolate) {
               it.current_bytecode())) {
         continue;
       }
-      bytecode_array->set(
-          it.GetEmbeddedFeedbackOffset(kEmbeddedFeedbackOperandIndex) +
-              kHeapObjectTag - BytecodeArray::kHeaderSize,
-          kUninitializedEmbeddedFeedback);
+      int operand_index = interpreter::Bytecodes::IsUnaryOpWithEmbeddedFeedback(
+                              it.current_bytecode())
+                              ? kUnaryEmbeddedFeedbackOperandIndex
+                              : kEmbeddedFeedbackOperandIndex;
+      bytecode_array->set(it.GetEmbeddedFeedbackOffset(operand_index) +
+                              kHeapObjectTag - BytecodeArray::kHeaderSize,
+                          kUninitializedEmbeddedFeedback);
     }
+  }
+  if (shared()->HasBaselineCode()) {
+    shared()->FlushBaselineCode();
+  }
+  if (ActiveTierIsBaseline(isolate)) {
+    ResetTieringRequests(isolate);
+    UpdateCode(isolate, *BUILTIN_CODE(isolate, InterpreterEntryTrampoline));
   }
 }
 

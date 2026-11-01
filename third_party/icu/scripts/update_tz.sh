@@ -12,7 +12,7 @@
 
 tmp_dir=~/tmp/icu-tz
 repo_url="https://github.com/unicode-org/icu.git"
-treeroot="$(dirname "$0")/.."
+treeroot="$(cd "$(dirname "$0")/.." && pwd)"
 datapath="source/data/misc"
 
 echo "[*] Performing sparse clone from the upstream repository to tmp directory"

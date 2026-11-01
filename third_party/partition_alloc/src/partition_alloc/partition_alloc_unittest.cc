@@ -2,11 +2,13 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
-#include "partition_alloc/bucket_lookup.h"
-#include "partition_alloc/slot_start.h"
-#if !defined(MEMORY_TOOL_REPLACES_ALLOCATOR)
+#include "partition_alloc/buildflags.h"
+
+#if !PA_BUILDFLAG(MEMORY_TOOL_REPLACES_ALLOCATOR)
 
 #include <algorithm>
+#include <array>
+#include <bit>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
@@ -21,8 +23,8 @@
 
 #include "partition_alloc/address_space_randomization.h"
 #include "partition_alloc/bounds_checks.h"
+#include "partition_alloc/bucket_lookup.h"
 #include "partition_alloc/build_config.h"
-#include "partition_alloc/buildflags.h"
 #include "partition_alloc/dangling_raw_ptr_checks.h"
 #include "partition_alloc/in_slot_metadata.h"
 #include "partition_alloc/internal/partition_root_internal.h"
@@ -31,6 +33,7 @@
 #include "partition_alloc/partition_address_space.h"
 #include "partition_alloc/partition_alloc_base/bits.h"
 #include "partition_alloc/partition_alloc_base/compiler_specific.h"
+#include "partition_alloc/partition_alloc_base/containers/span.h"
 #include "partition_alloc/partition_alloc_base/cpu.h"
 #include "partition_alloc/partition_alloc_base/logging.h"
 #include "partition_alloc/partition_alloc_base/numerics/checked_math.h"
@@ -51,6 +54,7 @@
 #include "partition_alloc/reservation_offset_table.h"
 #include "partition_alloc/scheduler_loop_quarantine_support.h"
 #include "partition_alloc/slot_address_and_size.h"
+#include "partition_alloc/slot_start.h"
 #include "partition_alloc/tagging.h"
 #include "partition_alloc/thread_isolation/thread_isolation.h"
 #include "partition_alloc/use_death_tests.h"
@@ -196,7 +200,7 @@ bool ClearAddressSpaceLimit() {
 #endif
 }
 
-const size_t kTestSizes[] = {
+const auto kTestSizes = std::to_array<size_t>({
     1,
     17,
     100,
@@ -205,7 +209,7 @@ const size_t kTestSizes[] = {
     partition_alloc::PartitionRoot::GetDirectMapSlotSize(100),
     1 << 20,
     1 << 21,
-};
+});
 constexpr size_t kTestSizesCount = std::size(kTestSizes);
 // A lambda function for unit tests to try Free, FreeWithSize, and
 // FreeWithSizeAndAlignment. It always takes a size_t argument, but ignores it
@@ -440,6 +444,9 @@ class PartitionAllocTest
         ThreadCache::SwapForTesting(nullptr,
                                     root->settings_.thread_cache_index);
         root->settings_.with_thread_cache = false;
+        if (ThreadCache::IsTombstone()) {
+          ThreadCache::RemoveTombstoneForTesting();
+        }
       }
     }
   };
@@ -762,8 +769,7 @@ void FreeFullSlotSpan(PartitionRoot* root, const SlotSpan* slot_span) {
   uintptr_t address = SlotSpan::ToSlotSpanStart(slot_span, root).value();
   size_t i;
   for (i = 0; i < num_slots; ++i) {
-    root->Free(
-        internal::UntaggedSlotStart::Unchecked(address).Tag().ToObject());
+    root->Free(UntaggedSlotStart::Unchecked(address).Tag().ToObject());
     address += size;
   }
   EXPECT_TRUE(slot_span->is_empty());
@@ -1491,6 +1497,10 @@ TEST_P(PartitionAllocWithSizedFreeTest, AllocSizes) {
     // Do we correctly get a null for a failed allocation?
     EXPECT_EQ(nullptr, allocator.root()->Alloc<AllocFlags::kReturnNull>(
                            3u * 1024 * 1024 * 1024, type_name));
+    EXPECT_EQ(nullptr, allocator.root()->AlignedAlloc<AllocFlags::kReturnNull>(
+                           64, 3u * 1024 * 1024 * 1024));
+    EXPECT_EQ(nullptr, allocator.root()->Realloc<AllocFlags::kReturnNull>(
+                           nullptr, 3u * 1024 * 1024 * 1024, type_name));
   }
 }
 
@@ -1627,7 +1637,7 @@ TEST_P(PartitionAllocTest, AllocGetSizeAndStart) {
   }
 
   // Too large allocation.
-  requested_size = MaxDirectMapped() + 1;
+  requested_size = MaxAllocationSize() + 1;
   predicted_capacity =
       allocator.root()->AllocationCapacityFromRequestedSize(requested_size);
   EXPECT_EQ(requested_size, predicted_capacity);
@@ -1668,16 +1678,51 @@ TEST_P(PartitionAllocTest, MTEProtectsFreedPtr) {
   EXPECT_NE(ptr1, ptr2);
 
   // When we free again, we expect a new tag for that area that's different from
-  // ptr1 and ptr2.
+  // ptr2.
   allocator.root()->Free(ptr2);
   uint64_t* ptr3 =
       static_cast<uint64_t*>(allocator.root()->Alloc(alloc_size, type_name));
   PA_EXPECT_PTR_EQ(ptr2, ptr3);
-  EXPECT_NE(ptr1, ptr3);
   EXPECT_NE(ptr2, ptr3);
 
   // We don't check anything about ptr3, but we do clean it up to avoid DCHECKs.
   allocator.root()->Free(ptr3);
+}
+
+TEST_P(PartitionAllocTest, MTEProtectsFreedPtrViaSchedulerLoopQuarantine) {
+  base::CPU cpu;
+  if (!cpu.has_mte()) {
+    // This test won't pass on systems without MTE.
+    GTEST_SKIP();
+  }
+
+  ChangeMemoryTaggingModeForCurrentThread(
+      TagViolationReportingMode::kSynchronous);
+  ASSERT_TRUE(GetMemoryTaggingModeForCurrentThread() !=
+              TagViolationReportingMode::kDisabled)
+      << "Test was built with MTE enabled and the CPU supports it, but MTE is "
+         "currently disabled in the device.";
+
+  internal::ScopedSchedulerLoopQuarantineBranchAccessorForTesting branch(
+      allocator.root());
+
+  size_t alloc_size = 64 - ExtraAllocSize(allocator);
+  uint64_t* ptr1 =
+      static_cast<uint64_t*>(allocator.root()->Alloc(alloc_size, type_name));
+  EXPECT_TRUE(ptr1);
+
+  allocator.root()->Free<FreeFlags::kSchedulerLoopQuarantine>(ptr1);
+  EXPECT_TRUE(branch.IsQuarantined(ptr1));
+  branch.Purge();
+
+  // When we reallocate after purging from quarantine, we expect the same memory
+  // slot to be reused but with a different MTE tag.
+  uint64_t* ptr2 =
+      static_cast<uint64_t*>(allocator.root()->Alloc(alloc_size, type_name));
+  PA_EXPECT_PTR_EQ(ptr1, ptr2);
+  EXPECT_NE(ptr1, ptr2);
+
+  allocator.root()->Free(ptr2);
 }
 #endif  // PA_BUILDFLAG(HAS_MEMORY_TAGGING)
 
@@ -1848,9 +1893,10 @@ TEST_P(PartitionAllocTest, GetSlotStartMultiplePages) {
   // (2) The bucket is large enough that our requested size (see below) will be
   // non-zero.
   size_t real_size = 0;
-  for (const auto& bucket : root->buckets_) {
-    if ((PA_UNSAFE_TODO(root->buckets_ + SizeToIndex(bucket.slot_size)))
-            ->slot_size != bucket.slot_size) {
+  for (const auto& bucket :
+       base::span(root->buckets_).first<BucketIndexLookup::kNumBuckets>()) {
+    if (root->buckets_[SizeToIndex(bucket.slot_size)].slot_size !=
+        bucket.slot_size) {
       continue;
     }
     if (bucket.slot_size <= ExtraAllocSize(allocator)) {
@@ -1870,8 +1916,7 @@ TEST_P(PartitionAllocTest, GetSlotStartMultiplePages) {
   // Double check we don't end up with 0 or negative size.
   EXPECT_GT(requested_size, 0u);
   EXPECT_LE(requested_size, real_size);
-  const auto* bucket =
-      PA_UNSAFE_TODO(allocator.root()->buckets_ + SizeToIndex(real_size));
+  const auto* bucket = &allocator.root()->buckets_[SizeToIndex(real_size)];
   EXPECT_EQ(bucket->slot_size, real_size);
   // Make sure the test is testing multiple partition pages case.
   EXPECT_GT(bucket->num_system_pages_per_slot_span,
@@ -1915,6 +1960,10 @@ TEST_P(PartitionAllocTest, Realloc) {
   size_t size = SystemPageSize() - ExtraAllocSize(allocator);
   // Confirm size fills the entire slot.
   ASSERT_EQ(size, allocator.root()->AllocationCapacityFromRequestedSize(size));
+  // `size + 1` should bump the allocation up into the next slot size.
+  ASSERT_NE(SizeToIndex(size + ExtraAllocSize(allocator)),
+            SizeToIndex(size + ExtraAllocSize(allocator) + 1));
+
   ptr = allocator.root()->Alloc(size, type_name);
   PA_UNSAFE_TODO(memset(ptr, 'A', size));
   ptr2 = allocator.root()->Realloc(ptr, size + 1, type_name);
@@ -1922,6 +1971,22 @@ TEST_P(PartitionAllocTest, Realloc) {
   char* char_ptr2 = static_cast<char*>(ptr2);
   EXPECT_EQ('A', char_ptr2[0]);
   EXPECT_EQ('A', PA_UNSAFE_TODO(char_ptr2[size - 1]));
+
+#if PA_BUILDFLAG(CHECKED_SPAN_HAS_METADATA_SUPPORT)
+  if (allocator.root()->brp_enabled()) [[likely]] {
+    slot_span = SlotSpanMetadata::FromObjectInnerPtr(ptr2, allocator.root());
+
+    // At the new slot size forced by `size + 1`, there is ample
+    // headroom to smuggle the size.
+    EXPECT_TRUE(allocator.root()
+                    ->InSlotMetadataPointerFromObjectForTesting(ptr2)
+                    ->IsSmuggledSizeAvailable());
+    EXPECT_EQ(internal::GetSmuggledSize(
+                  ptr2, allocator.root()->GetSlotUsableSize(slot_span)),
+              size + 1);
+  }
+#endif  // PA_BUILDFLAG(CHECKED_SPAN_HAS_METADATA_SUPPORT)
+
 #if PA_BUILDFLAG(EXPENSIVE_DCHECKS_ARE_ON)
   EXPECT_EQ(kUninitializedByte,
             static_cast<unsigned char>(PA_UNSAFE_TODO(char_ptr2[size])));
@@ -1935,8 +2000,33 @@ TEST_P(PartitionAllocTest, Realloc) {
   char* char_ptr = static_cast<char*>(ptr);
   EXPECT_EQ('A', char_ptr[0]);
   EXPECT_EQ('A', PA_UNSAFE_TODO(char_ptr[size - 2]));
+#if PA_BUILDFLAG(CHECKED_SPAN_HAS_METADATA_SUPPORT)
+  if (allocator.root()->brp_enabled()) [[likely]] {
+    // `size` has 0 headroom (fills the slot) and can't smuggle the
+    // size. `size - 1` has 1 byte of headroom and also can't smuggle
+    // the size.
+    EXPECT_FALSE(allocator.root()
+                     ->InSlotMetadataPointerFromObjectForTesting(ptr)
+                     ->IsSmuggledSizeAvailable());
+  }
+#endif  // PA_BUILDFLAG(CHECKED_SPAN_HAS_METADATA_SUPPORT)
+
 #if PA_BUILDFLAG(EXPENSIVE_DCHECKS_ARE_ON)
-  EXPECT_EQ(kUninitializedByte,
+  unsigned char expected_byte = kUninitializedByte;
+#if PA_BUILDFLAG(CHECKED_SPAN_HAS_METADATA_SUPPORT)
+  // Gory implementation detail: the size was smuggled regardless,
+  // replacing the last few bytes of the newly allocated slot with the
+  // bytes that spell out the value of `size - 1`. The `memcpy()` that
+  // moves the object into place then fills the slot with 1 byte to
+  // spare. Therefore, we will see the last byte of `size - 1`
+  // immediately before the cookie, and not `kUninitializedByte`.
+  if (allocator.root()->brp_enabled()) [[likely]] {
+    // truncate deliberately.
+    expected_byte = internal::base::byte_span_from_ref(size - 1).last<1>()[0];
+  }
+#endif  // PA_BUILDFLAG(CHECKED_SPAN_HAS_METADATA_SUPPORT)
+
+  EXPECT_EQ(expected_byte,
             static_cast<unsigned char>(PA_UNSAFE_TODO(char_ptr[size - 1])));
 #endif
 
@@ -1958,6 +2048,14 @@ TEST_P(PartitionAllocTest, Realloc) {
   char_ptr2 = static_cast<char*>(ptr2);
   EXPECT_EQ('A', char_ptr2[0]);
   EXPECT_EQ('A', PA_UNSAFE_TODO(char_ptr2[size - 1]));
+#if PA_BUILDFLAG(CHECKED_SPAN_HAS_METADATA_SUPPORT)
+  if (allocator.root()->brp_enabled()) [[likely]] {
+    // Single-slot spans do not smuggle sizes.
+    EXPECT_FALSE(allocator.root()
+                     ->InSlotMetadataPointerFromObjectForTesting(ptr2)
+                     ->IsSmuggledSizeAvailable());
+  }
+#endif  // Not exclusive against the check below.
 #if PA_BUILDFLAG(EXPENSIVE_DCHECKS_ARE_ON)
   EXPECT_EQ(kUninitializedByte,
             static_cast<unsigned char>(PA_UNSAFE_TODO(char_ptr2[size])));
@@ -2283,7 +2381,7 @@ TEST_P(PartitionAllocTest, PartialPageFreelists) {
   slot_span = SlotSpan::FromSlotStart(SlotStart::Unchecked(ptr).Untag(),
                                       allocator.root());
   EXPECT_EQ(1u, slot_span->num_allocated_slots);
-  size_t very_small_actual_size = PartitionRoot::GetUsableSize(ptr);
+  size_t very_small_actual_size = PartitionRoot::GetExternalUsableSize(ptr);
   total_slots =
       (slot_span->bucket->num_system_pages_per_slot_span * SystemPageSize()) /
       (very_small_actual_size + ExtraAllocSize(allocator));
@@ -2388,7 +2486,7 @@ TEST_P(PartitionAllocTest, PartialPages) {
   constexpr size_t kMaxSize = 4000u;
   while (size < kMaxSize) {
     bucket_index = SizeToIndex(size + ExtraAllocSize(allocator));
-    bucket = PA_UNSAFE_TODO(&allocator.root()->buckets_[bucket_index]);
+    bucket = &allocator.root()->buckets_[bucket_index];
     if (bucket->num_system_pages_per_slot_span %
         NumSystemPagesPerPartitionPage()) {
       break;
@@ -2522,8 +2620,7 @@ TEST_P(PartitionAllocTest, FreeCache) {
 
   size_t big_size = 1000 - ExtraAllocSize(allocator);
   size_t bucket_index = SizeToIndex(big_size + ExtraAllocSize(allocator));
-  PartitionBucket* bucket =
-      PA_UNSAFE_TODO(&allocator.root()->buckets_[bucket_index]);
+  PartitionBucket* bucket = &allocator.root()->buckets_[bucket_index];
 
   void* ptr = allocator.root()->Alloc(big_size, type_name);
   EXPECT_TRUE(ptr);
@@ -2636,31 +2733,6 @@ TEST_P(PartitionAllocTest, LostFreeSlotSpansBug) {
   EXPECT_TRUE(bucket->is_valid());
   EXPECT_TRUE(bucket->empty_slot_spans_head);
   EXPECT_TRUE(bucket->decommitted_slot_spans_head);
-}
-
-TEST_P(PartitionAllocTest, CheckMetadataIntegrityPass) {
-  char* const small_ptr =
-      static_cast<char*>(allocator.root()->Alloc(kTestAllocSize));
-  ASSERT_TRUE(small_ptr);
-
-  // Should not crash.
-  PartitionRoot::CheckMetadataIntegrity(small_ptr);
-  PartitionRoot::CheckMetadataIntegrity(
-      PA_UNSAFE_TODO(small_ptr + kTestAllocSize - 1));
-
-  allocator.root()->Free(small_ptr);
-
-  constexpr size_t kDirectMapSize = BucketIndexLookup::kMaxBucketSize + 1;
-  char* const large_ptr =
-      static_cast<char*>(allocator.root()->Alloc(kDirectMapSize));
-  ASSERT_TRUE(large_ptr);
-
-  // Should not crash.
-  PartitionRoot::CheckMetadataIntegrity(large_ptr);
-  PartitionRoot::CheckMetadataIntegrity(
-      PA_UNSAFE_TODO(large_ptr + kDirectMapSize - 1));
-
-  allocator.root()->Free(large_ptr);
 }
 
 #if PA_USE_DEATH_TESTS()
@@ -2832,9 +2904,23 @@ TEST_P(PartitionAllocDeathTest, SuspendTagCheckingScope) {
 TEST_P(PartitionAllocDeathTest, LargeAllocs) {
   // Largest alloc.
   EXPECT_DEATH(allocator.root()->Alloc(static_cast<size_t>(-1), type_name), "");
+  EXPECT_DEATH(allocator.root()->AlignedAlloc(64, static_cast<size_t>(-1)), "");
+  void* ptr = allocator.root()->Alloc(16, type_name);
+  EXPECT_DEATH(
+      allocator.root()->Realloc(ptr, static_cast<size_t>(-1), type_name), "");
+  EXPECT_DEATH(
+      allocator.root()->Realloc(nullptr, static_cast<size_t>(-1), type_name),
+      "");
   // And the smallest allocation we expect to die.
   // TODO(bartekn): Separate into its own test, as it wouldn't run (same below).
-  EXPECT_DEATH(allocator.root()->Alloc(MaxDirectMapped() + 1, type_name), "");
+  EXPECT_DEATH(allocator.root()->Alloc(MaxAllocationSize() + 1, type_name), "");
+  EXPECT_DEATH(allocator.root()->AlignedAlloc(64, MaxAllocationSize() + 1), "");
+  EXPECT_DEATH(
+      allocator.root()->Realloc(ptr, MaxAllocationSize() + 1, type_name), "");
+  EXPECT_DEATH(
+      allocator.root()->Realloc(nullptr, MaxAllocationSize() + 1, type_name),
+      "");
+  allocator.root()->Free(ptr);
 }
 
 // These tests don't work deterministically when BRP is enabled on certain
@@ -2855,13 +2941,6 @@ TEST_P(PartitionAllocDeathTest, ImmediateDoubleFree) {
   EXPECT_TRUE(ptr);
   allocator.root()->Free(ptr);
   EXPECT_DEATH(allocator.root()->Free(ptr), "");
-  if (
-#if PA_BUILDFLAG(ENABLE_BACKUP_REF_PTR_SUPPORT)
-      allocator.root()->brp_enabled() ||
-#endif  // PA_BUILDFLAG(ENABLE_BACKUP_REF_PTR_SUPPORT)
-      allocator.root()->settings_.use_cookie) {
-    EXPECT_DEATH(allocator.root()->CheckMetadataIntegrity(ptr), "");
-  }
 }
 
 // As above, but when this isn't the only slot in the span.
@@ -2872,13 +2951,6 @@ TEST_P(PartitionAllocDeathTest, ImmediateDoubleFree2ndSlot) {
   EXPECT_TRUE(ptr);
   allocator.root()->Free(ptr);
   EXPECT_DEATH(allocator.root()->Free(ptr), "");
-  if (
-#if PA_BUILDFLAG(ENABLE_BACKUP_REF_PTR_SUPPORT)
-      allocator.root()->brp_enabled() ||
-#endif  // PA_BUILDFLAG(ENABLE_BACKUP_REF_PTR_SUPPORT)
-      allocator.root()->settings_.use_cookie) {
-    EXPECT_DEATH(allocator.root()->CheckMetadataIntegrity(ptr), "");
-  }
   allocator.root()->Free(ptr0);
 }
 
@@ -3040,8 +3112,6 @@ TEST_P(PartitionAllocDeathTest, OffByOneDetectionByCookie) {
   // Crash at `free()`, either by cookie check failure or InSlotMetadata
   // corruption.
   EXPECT_DEATH(allocator.root()->Free(array), "");
-  // It should also crash with `CheckMetadataIntegrity()`.
-  EXPECT_DEATH(allocator.root()->CheckMetadataIntegrity(array), "");
   // Restore integrity, otherwise the process will crash in TearDown().
   PA_UNSAFE_TODO(array[usable_size] = previous_value);
   allocator.root()->Free(array);
@@ -3066,8 +3136,6 @@ TEST_P(PartitionAllocDeathTest, OffByOneDetectionByCookieWithRealisticData) {
   // Crash at `free()`, either by cookie check failure or InSlotMetadata
   // corruption.
   EXPECT_DEATH(allocator.root()->Free(array), "");
-  // It should also crash with `CheckMetadataIntegrity()`.
-  EXPECT_DEATH(allocator.root()->CheckMetadataIntegrity(array), "");
   // Restore integrity, otherwise the process will crash in TearDown().
   PA_UNSAFE_TODO(array[usable_size] = previous_value);
   allocator.root()->Free(array);
@@ -4106,6 +4174,12 @@ TEST_P(PartitionAllocTest, IntendedLeak) {
   void* ptr_to_keep_slot_span = root->Alloc(kTestAllocSize, type_name);
   void* ptr = root->Alloc(kTestAllocSize, type_name);
 
+  // Fill the memory region with any different value from kTypeId or
+  // kFreedBytes to see what code zaps the memory region. E.g. kFreedBytes means
+  // DebugMemset() with EXPENSIVE_DCHECKS_ARE_ON.
+  constexpr const uint8_t kAnyDummyValue = 0x12u;
+  PA_UNSAFE_TODO(memset(ptr, kAnyDummyValue, kTestAllocSize));
+
   // Remember `total_intended_leak_bytes` of the custom root.
   SimplePartitionStatsDumper dumper;
   root->DumpStats("CustomTestRoot", true, false, &dumper);
@@ -4113,11 +4187,21 @@ TEST_P(PartitionAllocTest, IntendedLeak) {
 
   auto* slot_span =
       SlotSpan::FromSlotStart(SlotStart::Unchecked(ptr).Untag(), root.get());
-  root->Free<FreeFlags::kIntendedLeak>(ptr);
+
+  constexpr const uint64_t kTypeId = 0xDEADBEAFu;
+  root->Free<FreeFlags::kIntendedLeak | FreeFlags::kWithTypeIdHint>(
+      ptr, {.type_id = kTypeId});
 
   // Leaked objects will be never found in the freelist of the `slot_span`.
   EXPECT_NE(SlotStart::Unchecked(ptr).Untag().value(),
             UntagPtr(slot_span->get_freelist_head()));
+
+  // The `ptr` must be zapped.
+  uint64_t value_after_intended_leaked = *reinterpret_cast<uint64_t*>(ptr);
+  EXPECT_EQ(value_after_intended_leaked & kIntendedLeakQuarantineMask,
+            kIntendedLeakQuarantineMarker);
+  EXPECT_EQ((value_after_intended_leaked & ~kIntendedLeakQuarantineMask) >> 8u,
+            kTypeId);
 
   // Compare `total_intended_leak_bytes` between before and after
   // `Free<kIntendedLeak>`.
@@ -4131,6 +4215,82 @@ TEST_P(PartitionAllocTest, IntendedLeak) {
   // never be equal to 0, the page will not be decommitted.
   EXPECT_EQ(SlotStart::Unchecked(ptr_to_keep_slot_span).Untag().value(),
             UntagPtr(slot_span->get_freelist_head()));
+}
+
+TEST_P(PartitionAllocTest, IntendedLeakWithoutTypeIdHint) {
+  PartitionOptions opts = GetCommonPartitionOptions();
+  opts.thread_cache = PartitionOptions::kDisabled;
+  opts.backup_ref_ptr = PartitionOptions::kDisabled;
+  std::unique_ptr<PartitionRoot> root = CreateCustomTestRoot(opts, {});
+
+  void* ptr_to_keep_slot_span = root->Alloc(kTestAllocSize, type_name);
+  void* ptr = root->Alloc(kTestAllocSize, type_name);
+
+  constexpr const uint8_t kAnyDummyValue = 0x12u;
+  PA_UNSAFE_TODO(memset(ptr, kAnyDummyValue, kTestAllocSize));
+
+  auto* slot_span =
+      SlotSpan::FromSlotStart(SlotStart::Unchecked(ptr).Untag(), root.get());
+
+  root->Free<FreeFlags::kIntendedLeak>(ptr);
+
+  EXPECT_NE(SlotStart::Unchecked(ptr).Untag().value(),
+            UntagPtr(slot_span->get_freelist_head()));
+
+  uint64_t value_after_intended_leaked = *reinterpret_cast<uint64_t*>(ptr);
+  EXPECT_EQ(value_after_intended_leaked & internal::kIntendedLeakQuarantineMask,
+            internal::kIntendedLeakQuarantineMarker);
+  EXPECT_EQ((value_after_intended_leaked & ~internal::kIntendedLeakQuarantineMask) >> 8u,
+            internal::kIntendedLeakUnknownTypeId);
+
+  root->Free(ptr_to_keep_slot_span);
+}
+
+TEST_P(PartitionAllocTest, IntendedLeakFromOwningRoot) {
+  PartitionOptions leak_opts = GetCommonPartitionOptions();
+  leak_opts.thread_cache = PartitionOptions::kDisabled;
+  leak_opts.backup_ref_ptr = PartitionOptions::kDisabled;
+  leak_opts.intended_leak = PartitionOptions::kEnabled;
+  std::unique_ptr<PartitionRoot> leak_root =
+      CreateCustomTestRoot(leak_opts, {});
+
+  void* leak_ptr_to_keep = leak_root->Alloc(kTestAllocSize, type_name);
+  void* leak_ptr = leak_root->Alloc(kTestAllocSize, type_name);
+
+  constexpr const uint8_t kAnyDummyValue = 0x12u;
+  PA_UNSAFE_TODO(memset(leak_ptr, kAnyDummyValue, kTestAllocSize));
+
+  // Flagless FreeInUnknownRoot should retire the slot because leak_root has
+  // intended_leak enabled.
+  PartitionRoot::FreeInUnknownRoot(leak_ptr);
+
+  uint64_t value_after_leak = *reinterpret_cast<uint64_t*>(leak_ptr);
+  EXPECT_EQ(value_after_leak & internal::kIntendedLeakQuarantineMask,
+            internal::kIntendedLeakQuarantineMarker);
+  EXPECT_EQ((value_after_leak & ~internal::kIntendedLeakQuarantineMask) >> 8u,
+            internal::kIntendedLeakUnknownTypeId);
+
+  // The retired slot must not be returned to the freelist.
+  auto* slot_span = SlotSpan::FromSlotStart(
+      SlotStart::Unchecked(leak_ptr).Untag(), leak_root.get());
+  EXPECT_NE(SlotStart::Unchecked(leak_ptr).Untag().value(),
+            UntagPtr(slot_span->get_freelist_head()));
+
+  // Ordinary root recycles freed slots.
+  PartitionOptions normal_opts = GetCommonPartitionOptions();
+  normal_opts.thread_cache = PartitionOptions::kDisabled;
+  normal_opts.backup_ref_ptr = PartitionOptions::kDisabled;
+  normal_opts.intended_leak = PartitionOptions::kDisabled;
+  std::unique_ptr<PartitionRoot> normal_root =
+      CreateCustomTestRoot(normal_opts, {});
+
+  void* normal_ptr = normal_root->Alloc(kTestAllocSize, type_name);
+  PartitionRoot::FreeInUnknownRoot(normal_ptr);
+  void* recycled_ptr = normal_root->Alloc(kTestAllocSize, type_name);
+  EXPECT_EQ(UntagPtr(recycled_ptr), UntagPtr(normal_ptr));
+
+  leak_root->Free(leak_ptr_to_keep);
+  normal_root->Free(recycled_ptr);
 }
 
 TEST_P(PartitionAllocTest, ZapOnFree) {
@@ -4367,8 +4527,8 @@ TEST_P(PartitionAllocTest, OverrideHooks) {
       memset(overridden_allocation, kOverriddenChar, kOverriddenSize));
 
   PartitionAllocHooks::SetOverrideHooks(
-      [](void** out, AllocFlags flags, size_t size,
-         const char* type_name) -> bool {
+      [](void** out, AllocFlags flags, size_t size, const char* type_name,
+         std::optional<size_t> alignment) -> bool {
         if (size == kOverriddenSize && type_name == kOverriddenType) {
           *out = overridden_allocation;
           return true;
@@ -4464,7 +4624,7 @@ TEST_P(PartitionAllocTest, FundamentalAlignment) {
     // C % kAlignment == (slot_size - ExtraAllocSize(allocator)) % kAlignment.
     // C % kAlignment == (-ExtraAllocSize(allocator)) % kAlignment.
     EXPECT_EQ(allocator.root()->AllocationCapacityFromSlotStart(
-                  internal::UntaggedSlotStart::Unchecked(slot_start)) %
+                  UntaggedSlotStart::Unchecked(slot_start)) %
                   fundamental_alignment,
               -ExtraAllocSize(allocator) % fundamental_alignment);
 
@@ -4518,6 +4678,117 @@ TEST_P(PartitionAllocWithFreeWithSizeAndAlignmentTest, AlignedAlloc) {
   }
 }
 
+TEST_P(PartitionAllocWithFreeWithSizeAndAlignmentTest,
+       AlignedAllocWastedBytesTracking) {
+  SimplePartitionStatsDumper dumper_before;
+  allocator.root()->DumpStats("test", true, false, &dumper_before);
+  uint64_t wasted_before =
+      dumper_before.stats().total_aligned_alloc_wasted_bytes;
+
+  // Use a non-power-of-two requested size (60,000) below the alignment boundary
+  // so that wasted_bytes > 0 is guaranteed regardless of extras_size (0, 8, 16,
+  // etc).
+  constexpr size_t kSize = 60000;
+  constexpr size_t kReqAlignment = 16384;
+  ASSERT_NE(allocator.root()->AdjustSizeForExtrasAdd(kSize) % kReqAlignment,
+            0u);
+  void* ptr = allocator.root()->AlignedAlloc(kReqAlignment, kSize);
+  ASSERT_TRUE(ptr);
+
+  SimplePartitionStatsDumper dumper_after;
+  allocator.root()->DumpStats("test", true, false, &dumper_after);
+  uint64_t wasted_after = dumper_after.stats().total_aligned_alloc_wasted_bytes;
+
+  EXPECT_GT(wasted_after, wasted_before);
+
+  GetParam().free_func(allocator.root(), ptr, kSize, kReqAlignment);
+}
+
+TEST_P(PartitionAllocWithFreeWithSizeAndAlignmentTest,
+       AlignedAllocPowerOfTwoDoesNotAllocate2PageSize) {
+  allocator.root()->SetUseTighterAlignedAllocBoundForTesting(true);
+  // Test power-of-two requested sizes with alignments <= PartitionPageSize().
+  const struct {
+    size_t requested_size;
+    size_t alignment;
+  } kTestCases[] = {
+      {512, 64}, {512, 128}, {1024, 64}, {1024, 256}, {2048, 128}, {4096, 512},
+  };
+
+  for (const auto& test_case : kTestCases) {
+    // Allocate multiple pointers to ensure that subsequent slots in the slot
+    // span (at non-zero slot offsets) also guarantee alignment.
+    std::vector<void*> allocated_ptrs;
+    for (int i = 0; i < 3; ++i) {
+      void* ptr = allocator.root()->AlignedAlloc(test_case.alignment,
+                                                 test_case.requested_size);
+      ASSERT_TRUE(ptr);
+      allocated_ptrs.push_back(ptr);
+
+      // 1. Verify strict pointer alignment.
+      EXPECT_EQ(0u, UntagPtr(ptr) & (test_case.alignment - 1))
+          << i << "-th allocation of size=" << test_case.requested_size
+          << ", alignment=" << test_case.alignment;
+
+      // 2. Verify that the assigned bucket slot size is strictly smaller than
+      // double the requested size (which was the old power-of-two behavior when
+      // extras were added).
+      auto* slot_span =
+          SlotSpanMetadata::FromObjectInnerPtr(ptr, allocator.root());
+      size_t actual_slot_size = slot_span->bucket->slot_size;
+      EXPECT_LT(actual_slot_size, test_case.requested_size * 2)
+          << "Failed savings check for size=" << test_case.requested_size
+          << ", alignment=" << test_case.alignment;
+
+      // 3. Verify exact expected slot size based on AlignUp.
+      size_t raw_size =
+          allocator.root()->AdjustSizeForExtrasAdd(test_case.requested_size);
+      size_t aligned_raw_size =
+          internal::base::bits::AlignUp(raw_size, test_case.alignment);
+      size_t expected_bucket_size = SizeToBucketSize(aligned_raw_size);
+      EXPECT_EQ(expected_bucket_size, actual_slot_size);
+    }
+
+    // 4. Verify clean deallocation (tests both standard Free and Free with
+    // size/alignment hints via test parameterization).
+    for (void* ptr : allocated_ptrs) {
+      GetParam().free_func(allocator.root(), ptr, test_case.requested_size,
+                           test_case.alignment);
+    }
+  }
+}
+
+TEST_P(PartitionAllocWithFreeWithSizeAndAlignmentTest,
+       AlignedAllocTighterBound) {
+  // requested_size = 70,000, alignment = 16,384.
+  // Legacy power-of-two mode rounds 70,000 + extras to 131,072 (128 KiB).
+  // Tighter bound mode rounds 70,000 + extras to AlignUp(70,000 + extras,
+  // 16,384) = 81,920 (80 KiB). This holds true for all possible extras_size
+  // values (0, 8, 16, 32).
+  constexpr size_t kSize = 70000;
+  constexpr size_t kReqAlignment = 16384;
+
+  // 1. Legacy behavior (Power-of-two rounding)
+  allocator.root()->SetUseTighterAlignedAllocBoundForTesting(false);
+  void* ptr_legacy = allocator.root()->AlignedAlloc(kReqAlignment, kSize);
+  ASSERT_TRUE(ptr_legacy);
+  size_t slot_size_legacy = PartitionRoot::GetExternalUsableSize(ptr_legacy);
+  GetParam().free_func(allocator.root(), ptr_legacy, kSize, kReqAlignment);
+
+  // 2. Tighter bound behavior (AlignUp)
+  allocator.root()->SetUseTighterAlignedAllocBoundForTesting(true);
+  void* ptr_tighter = allocator.root()->AlignedAlloc(kReqAlignment, kSize);
+  ASSERT_TRUE(ptr_tighter);
+  size_t slot_size_tighter = PartitionRoot::GetExternalUsableSize(ptr_tighter);
+  GetParam().free_func(allocator.root(), ptr_tighter, kSize, kReqAlignment);
+
+  // Tighter bound allocation capacity must be strictly smaller than legacy
+  // power-of-two rounding.
+  EXPECT_LT(slot_size_tighter, slot_size_legacy);
+  EXPECT_EQ(slot_size_tighter,
+            allocator.root()->AdjustSizeForExtrasSubtract(81920u));
+}
+
 // Test that the optimized `GetSlotNumber` implementation produces valid
 // results.
 TEST_P(PartitionAllocTest, OptimizedGetSlotNumber) {
@@ -4535,16 +4806,16 @@ TEST_P(PartitionAllocTest, OptimizedGetSlotNumber) {
   }
 }
 
-TEST_P(PartitionAllocTest, GetUsableSizeNull) {
-  EXPECT_EQ(0ULL, PartitionRoot::GetUsableSize(nullptr));
+TEST_P(PartitionAllocTest, GetExternalUsableSizeNull) {
+  EXPECT_EQ(0ULL, PartitionRoot::GetExternalUsableSize(nullptr));
 }
 
-TEST_P(PartitionAllocTest, GetUsableSize) {
+TEST_P(PartitionAllocTest, GetExternalUsableSize) {
   size_t delta = 31;
   for (size_t size = 1; size <= kMinDirectMappedDownsize; size += delta) {
     void* ptr = allocator.root()->Alloc(size);
     EXPECT_TRUE(ptr);
-    size_t usable_size = PartitionRoot::GetUsableSize(ptr);
+    size_t usable_size = PartitionRoot::GetExternalUsableSize(ptr);
     EXPECT_LE(size, usable_size);
     PA_UNSAFE_TODO(memset(ptr, 0xDE, usable_size));
     // Should not crash when free the ptr.
@@ -4854,8 +5125,7 @@ TEST_P(PartitionAllocTest, RefCountBasic) {
   EXPECT_TRUE(in_slot_metadata->ReleaseFromUnprotectedPtr());
   auto slot_info = partition_alloc::SlotAddressAndSize::FromBRPPool(
       reinterpret_cast<uintptr_t>(ptr1));
-  PartitionRoot::FreeAfterBRPQuarantine(
-      internal::UntaggedSlotStart(slot_info.slot_start), slot_info.size);
+  PartitionRoot::FreeAfterBRPQuarantine(slot_info);
   uint64_t* ptr3 =
       static_cast<uint64_t*>(allocator.root()->Alloc(alloc_size, type_name));
   PA_EXPECT_PTR_EQ(ptr1, ptr3);
@@ -4904,8 +5174,7 @@ void PartitionAllocTest::RunRefCountReallocSubtest(size_t orig_size,
 
     auto slot_info = partition_alloc::SlotAddressAndSize::FromBRPPool(
         reinterpret_cast<uintptr_t>(ptr1));
-    PartitionRoot::FreeAfterBRPQuarantine(
-        internal::UntaggedSlotStart(slot_info.slot_start), slot_info.size);
+    PartitionRoot::FreeAfterBRPQuarantine(slot_info);
   }
 
   allocator.root()->Free(ptr2);
@@ -4985,7 +5254,7 @@ TEST_P(PartitionAllocTest, ExtraExtrasNullfyOffByOneDetection) {
       {});
 
   // `ptr1` can be located at page start hence lacks in-slot style
-  // `InSlotMetadata`. See `InSlotMetadataPointer`.
+  // `InSlotMetadata`. See `InSlotMetadata::From`.
   int64_t* ptr1 = static_cast<int64_t*>(root_no_extra->Alloc(8));
   int64_t* ptr2 = static_cast<int64_t*>(root_no_extra->Alloc(8));
 
@@ -5091,7 +5360,7 @@ TEST_P(UnretainedDanglingRawPtrTest, UnretainedDanglingPtrShouldReport) {
 
   auto slot_info = partition_alloc::SlotAddressAndSize::FromBRPPool(
       reinterpret_cast<uintptr_t>(ptr));
-  PartitionRoot::FreeAfterBRPQuarantine(slot_info.slot_start, slot_info.size);
+  PartitionRoot::FreeAfterBRPQuarantine(slot_info);
 }
 
 #if !PA_BUILDFLAG(HAS_64_BIT_POINTERS)
@@ -5119,6 +5388,32 @@ TEST_P(PartitionAllocTest, BackupRefPtrGuardRegion) {
   }
 }
 #endif  // !PA_BUILDFLAG(HAS_64_BIT_POINTERS)
+
+#if PA_USE_DEATH_TESTS()
+TEST_P(PartitionAllocDeathTest, AcquireAfterQuarantined) {
+  if (!UseBRPPool()) {
+    return;
+  }
+
+  // Allocate memory. The object will be held by allocator and its refcount is
+  // equal to zero.
+  uint64_t* ptr = static_cast<uint64_t*>(
+      allocator.root()->Alloc(64 - ExtraAllocSize(allocator), type_name));
+  auto* in_slot_metadata =
+      allocator.root()->InSlotMetadataPointerFromObjectForTesting(ptr);
+  EXPECT_TRUE(in_slot_metadata->IsAliveWithNoKnownRefs());
+
+  // Make the object in-freelist or MO-quarantined.
+  allocator.root()->Free(ptr);
+  EXPECT_FALSE(in_slot_metadata->IsAlive());
+  EXPECT_FALSE(in_slot_metadata->HasNonZeroRefs());
+
+  // Because of PA_CHECK, expect Acquire() always crash if death test is
+  // supported.
+  EXPECT_DEATH(in_slot_metadata->Acquire(), "");
+}
+#endif  // PA_USE_DEATH_TESTS()
+
 #endif  // PA_BUILDFLAG(ENABLE_BACKUP_REF_PTR_SUPPORT)
 
 #if PA_BUILDFLAG(ENABLE_DANGLING_RAW_PTR_CHECKS)
@@ -5167,7 +5462,7 @@ TEST_P(PartitionAllocTest, DanglingPtr) {
 
   auto slot_info = partition_alloc::SlotAddressAndSize::FromBRPPool(
       reinterpret_cast<uintptr_t>(ptr));
-  PartitionRoot::FreeAfterBRPQuarantine(slot_info.slot_start, slot_info.size);
+  PartitionRoot::FreeAfterBRPQuarantine(slot_info);
 }
 
 // Allocate memory, and reference it from 3
@@ -5215,7 +5510,7 @@ TEST_P(PartitionAllocTest, DanglingDanglingPtr) {
 
   auto slot_info = partition_alloc::SlotAddressAndSize::FromBRPPool(
       reinterpret_cast<uintptr_t>(ptr));
-  PartitionRoot::FreeAfterBRPQuarantine(slot_info.slot_start, slot_info.size);
+  PartitionRoot::FreeAfterBRPQuarantine(slot_info);
 }
 
 // When 'free' is called, it remain one raw_ptr<> and one
@@ -5254,7 +5549,7 @@ TEST_P(PartitionAllocTest, DanglingMixedReleaseRawPtrFirst) {
 
   auto slot_info = partition_alloc::SlotAddressAndSize::FromBRPPool(
       reinterpret_cast<uintptr_t>(ptr));
-  PartitionRoot::FreeAfterBRPQuarantine(slot_info.slot_start, slot_info.size);
+  PartitionRoot::FreeAfterBRPQuarantine(slot_info);
 }
 
 // When 'free' is called, it remain one raw_ptr<> and one
@@ -5295,7 +5590,7 @@ TEST_P(PartitionAllocTest, DanglingMixedReleaseDanglingPtrFirst) {
 
   auto slot_info = partition_alloc::SlotAddressAndSize::FromBRPPool(
       reinterpret_cast<uintptr_t>(ptr));
-  PartitionRoot::FreeAfterBRPQuarantine(slot_info.slot_start, slot_info.size);
+  PartitionRoot::FreeAfterBRPQuarantine(slot_info);
 }
 
 // When 'free' is called, it remains one
@@ -5339,7 +5634,7 @@ TEST_P(PartitionAllocTest, DanglingPtrUsedToAcquireNewRawPtr) {
 
   auto slot_info = partition_alloc::SlotAddressAndSize::FromBRPPool(
       reinterpret_cast<uintptr_t>(ptr));
-  PartitionRoot::FreeAfterBRPQuarantine(slot_info.slot_start, slot_info.size);
+  PartitionRoot::FreeAfterBRPQuarantine(slot_info);
 }
 
 // Same as 'DanglingPtrUsedToAcquireNewRawPtr', but release the
@@ -5382,7 +5677,7 @@ TEST_P(PartitionAllocTest, DanglingPtrUsedToAcquireNewRawPtrVariant) {
 
   auto slot_info = partition_alloc::SlotAddressAndSize::FromBRPPool(
       reinterpret_cast<uintptr_t>(ptr));
-  PartitionRoot::FreeAfterBRPQuarantine(slot_info.slot_start, slot_info.size);
+  PartitionRoot::FreeAfterBRPQuarantine(slot_info);
 }
 
 // Acquire a raw_ptr<T>, and release it before freeing memory. In the
@@ -5422,7 +5717,7 @@ TEST_P(PartitionAllocTest, RawPtrReleasedBeforeFree) {
 
   auto slot_info = partition_alloc::SlotAddressAndSize::FromBRPPool(
       reinterpret_cast<uintptr_t>(ptr));
-  PartitionRoot::FreeAfterBRPQuarantine(slot_info.slot_start, slot_info.size);
+  PartitionRoot::FreeAfterBRPQuarantine(slot_info);
 }
 
 // Similar to `PartitionAllocTest.DanglingPtr`, but using
@@ -5483,7 +5778,7 @@ TEST_P(PartitionAllocTest, DanglingPtrReleaseToSchedulerLoopQuarantine) {
 
   auto slot_info = partition_alloc::SlotAddressAndSize::FromBRPPool(
       reinterpret_cast<uintptr_t>(ptr));
-  PartitionRoot::FreeAfterBRPQuarantine(slot_info.slot_start, slot_info.size);
+  PartitionRoot::FreeAfterBRPQuarantine(slot_info);
 
   EXPECT_TRUE(branch.IsQuarantined(ptr));
   branch.Purge();
@@ -5492,7 +5787,7 @@ TEST_P(PartitionAllocTest, DanglingPtrReleaseToSchedulerLoopQuarantine) {
 #if PA_USE_DEATH_TESTS()
 // DCHECK message are stripped in official build. It causes death tests with
 // matchers to fail.
-#if !defined(OFFICIAL_BUILD) || PA_BUILDFLAG(IS_DEBUG)
+#if !PA_BUILDFLAG(OFFICIAL) || PA_BUILDFLAG(IS_DEBUG)
 
 // Acquire() once, Release() twice => CRASH
 TEST_P(PartitionAllocDeathTest, ReleaseUnderflowRawPtr) {
@@ -5526,7 +5821,30 @@ TEST_P(PartitionAllocDeathTest, ReleaseUnderflowDanglingPtr) {
   allocator.root()->Free(ptr);
 }
 
-#endif  //! defined(OFFICIAL_BUILD) || PA_BUILDFLAG(IS_DEBUG)
+#endif  //! PA_BUILDFLAG(OFFICIAL) || PA_BUILDFLAG(IS_DEBUG)
+
+TEST_P(PartitionAllocDeathTest, AcquireUnprotectedAfterQuarantined) {
+  if (!UseBRPPool()) {
+    return;
+  }
+
+  // Allocate memory. The object will be held by allocator and its refcount is
+  // equal to zero.
+  uint64_t* ptr = static_cast<uint64_t*>(
+      allocator.root()->Alloc(64 - ExtraAllocSize(allocator), type_name));
+  auto* in_slot_metadata =
+      allocator.root()->InSlotMetadataPointerFromObjectForTesting(ptr);
+  EXPECT_TRUE(in_slot_metadata->IsAliveWithNoKnownRefs());
+
+  // Make the object in-freelist or MO-quarantined.
+  allocator.root()->Free(ptr);
+  EXPECT_FALSE(in_slot_metadata->IsAlive());
+  EXPECT_FALSE(in_slot_metadata->HasNonZeroRefs());
+
+  // Because of PA_CHECK, expect AcquireFromProtectedPtr() always crash
+  // if death test is supported.
+  EXPECT_DEATH(in_slot_metadata->AcquireFromUnprotectedPtr(), "");
+}
 #endif  // PA_USE_DEATH_TESTS()
 #endif  // PA_BUILDFLAG(ENABLE_DANGLING_RAW_PTR_CHECKS)
 
@@ -5718,12 +6036,11 @@ TEST_P(PartitionAllocTest, CheckReservationType) {
 
   // DCHECKs don't work with EXPECT_DEATH on official builds.
 #if PA_BUILDFLAG(DCHECKS_ARE_ON) && \
-    (!defined(OFFICIAL_BUILD) || PA_BUILDFLAG(IS_DEBUG))
+    (!PA_BUILDFLAG(OFFICIAL) || PA_BUILDFLAG(IS_DEBUG))
   // Expect to DCHECK on unallocated region.
   EXPECT_DEATH_IF_SUPPORTED(table.IsReservationStart(address_to_check), "");
-#endif  //  PA_BUILDFLAG(DCHECKS_ARE_ON) && (!defined(OFFICIAL_BUILD) ||
-        //  PA_BUILDFLAG(IS_DEBUG))
-
+#endif  //  PA_BUILDFLAG(DCHECKS_ARE_ON) && (!PA_BUILDFLAG(OFFICIAL)
+        //  || PA_BUILDFLAG(IS_DEBUG))
 }
 
 // Test for crash http://crbug.com/1169003.
@@ -5785,23 +6102,45 @@ TEST_P(PartitionAllocTest, FastPathOrReturnNull) {
 }
 
 #if PA_USE_DEATH_TESTS()
+
+#if PA_CONFIG(THREAD_CACHE_SUPPORTED)
+TEST_P(PartitionAllocDeathTest, IntendedLeakCannotCoexistWithThreadCache) {
+  PartitionOptions opts = GetCommonPartitionOptions();
+  opts.thread_cache = PartitionOptions::kEnabled;
+  opts.intended_leak = PartitionOptions::kEnabled;
+  PA_EXPECT_CHECK_DEATH_WITH(
+      CreateCustomTestRoot(opts, {}),
+      "Check failed.*opts\\.thread_cache == PartitionOptions::kDisabled");
+}
+#endif  // PA_CONFIG(THREAD_CACHE_SUPPORTED)
+
+#if PA_BUILDFLAG(ENABLE_BACKUP_REF_PTR_SUPPORT)
+TEST_P(PartitionAllocDeathTest, IntendedLeakCannotCoexistWithBRP) {
+  PartitionOptions opts = GetCommonPartitionOptions();
+  opts.thread_cache = PartitionOptions::kDisabled;
+  opts.backup_ref_ptr = PartitionOptions::kEnabled;
+  opts.intended_leak = PartitionOptions::kEnabled;
+  PA_EXPECT_CHECK_DEATH_WITH(CreateCustomTestRoot(opts, {}),
+                             "Check failed.*!brp_enabled\\(\\)");
+}
+#endif  // PA_BUILDFLAG(ENABLE_BACKUP_REF_PTR_SUPPORT)
+
 // DCHECK message are stripped in official build. It causes death tests with
 // matchers to fail.
-#if !defined(OFFICIAL_BUILD) || PA_BUILDFLAG(IS_DEBUG)
+#if !PA_BUILDFLAG(OFFICIAL) || PA_BUILDFLAG(IS_DEBUG)
 
 TEST_P(PartitionAllocDeathTest, CheckTriggered) {
   PA_EXPECT_DCHECK_DEATH_WITH(PA_CHECK(5 == 7), "Check failed.*5 == 7");
   EXPECT_DEATH(PA_CHECK(5 == 7), "Check failed.*5 == 7");
 }
 
-#endif  // !defined(OFFICIAL_BUILD) && PA_BUILDFLAG(IS_DEBUG)
+#endif  // !PA_BUILDFLAG(OFFICIAL) && PA_BUILDFLAG(IS_DEBUG)
 #endif  // PA_USE_DEATH_TESTS()
 
 // Not on chromecast, since gtest considers extra output from itself as a test
 // failure:
 // https://ci.chromium.org/ui/p/chromium/builders/ci/Cast%20Audio%20Linux/98492/overview
-#if PA_BUILDFLAG(USE_PARTITION_ALLOC_AS_MALLOC) && PA_USE_DEATH_TESTS() && \
-    !PA_BUILDFLAG(IS_CASTOS)
+#if PA_BUILDFLAG(USE_PARTITION_ALLOC_AS_MALLOC) && PA_USE_DEATH_TESTS()
 
 namespace {
 
@@ -5878,7 +6217,7 @@ TEST_P(PartitionAllocTest, DISABLED_PreforkHandler) {
 }
 
 #endif  // PA_BUILDFLAG(USE_PARTITION_ALLOC_AS_MALLOC) &&
-        // PA_USE_DEATH_TESTS() && !PA_BUILDFLAG(IS_CASTOS)
+        // PA_USE_DEATH_TESTS()
 
 // Checks the bucket index logic.
 TEST_P(PartitionAllocTest, GetIndex) {
@@ -5946,7 +6285,7 @@ TEST_P(PartitionAllocTest, ConfigurablePool) {
   const size_t min_pool_size = PartitionAddressSpace::ConfigurablePoolMinSize();
   for (size_t pool_size = max_pool_size; pool_size >= min_pool_size;
        pool_size /= 2) {
-    PA_DCHECK(base::bits::HasSingleBit(pool_size));
+    PA_DCHECK(std::has_single_bit(pool_size));
     EXPECT_FALSE(IsConfigurablePoolAvailable());
     uintptr_t pool_base =
         AllocPages(pool_size, pool_size,
@@ -6299,7 +6638,10 @@ TEST_P(PartitionAllocTest, OpenCL) {
         // PA_BUILDFLAG(IS_MAC)
 
 TEST_P(PartitionAllocTest, SmallSlotSpanWaste) {
-  for (PartitionRoot::Bucket& bucket : allocator.root()->buckets_) {
+  for (PartitionRoot::Bucket& bucket :
+       base::span(allocator.root()->buckets_)
+           // exclude the sentinel bucket
+           .first<BucketIndexLookup::kNumBuckets>()) {
     const size_t slot_size = bucket.slot_size;
 
     size_t small_system_page_count =
@@ -6557,13 +6899,154 @@ TEST_P(PartitionAllocTest, MultipleThreadCachePerThread) {
   size_t bucket_index =
       SizeToIndex(kTestAllocSize + kExtraAllocSizeWithoutMetadata);
   size_t pos1, pos2;
-  EXPECT_TRUE(tcache1->IsInFreelist(
-      internal::SlotStart::Unchecked(ptr1).Untag(), bucket_index, pos1));
+  EXPECT_TRUE(tcache1->IsInFreelist(SlotStart::Unchecked(ptr1).Untag(),
+                                    bucket_index, pos1));
   EXPECT_EQ(pos1, 0u);
-  EXPECT_TRUE(tcache2->IsInFreelist(
-      internal::SlotStart::Unchecked(ptr2).Untag(), bucket_index, pos2));
+  EXPECT_TRUE(tcache2->IsInFreelist(SlotStart::Unchecked(ptr2).Untag(),
+                                    bucket_index, pos2));
   EXPECT_EQ(pos2, 0u);
 }
+
+// Documentation tests demonstrating the behavior of `IsExtentOutOfBounds()`.
+// This test passes if it doesn't crash.
+TEST_P(PartitionAllocTest, BoundsChecksDontCrash) {
+  EXPECT_FALSE(IsExtentOutOfBounds(static_cast<const void*>(nullptr), 1024u,
+                                   sizeof(char)));
+
+  void* object = allocator.root()->Alloc(32u);
+  EXPECT_FALSE(IsExtentOutOfBounds(object, 0u, sizeof(char)));
+  allocator.root()->Free(object);
+}
+
+#if PA_CONFIG(IN_SLOT_METADATA_STORE_REQUESTED_SIZE)
+
+TEST_P(PartitionAllocTest, RequestedSizeChangesOnReallocForNormalBuckets) {
+  // The requested size is stored inside the `InSlotMetadata`, which is
+  // not present if BackupRefPtr is not enabled.
+  if (!allocator.root()->brp_enabled()) {
+    return;
+  }
+
+  // 2049 and 2050 are chosen since powers of two (e.g. 2048) are
+  // usually also slot sizes.
+  //
+  // Note that without PartitionAlloc extras, 2048 and 2049 would lie in
+  // different buckets.
+  ASSERT_EQ(SizeToBucketSize(2049u), SizeToBucketSize(2050u));
+
+  void* object = allocator.root()->Alloc(2049u);
+
+  auto* in_slot_metadata =
+      allocator.root()->InSlotMetadataPointerFromObjectForTesting(object);
+  EXPECT_EQ(in_slot_metadata->requested_size(), 2049u);
+
+  void* new_object = allocator.root()->Realloc(object, 2050u, type_name);
+  ASSERT_EQ(new_object, object);
+
+  in_slot_metadata =
+      allocator.root()->InSlotMetadataPointerFromObjectForTesting(object);
+  EXPECT_EQ(in_slot_metadata->requested_size(), 2050u);
+
+  allocator.root()->Free(object);
+}
+
+TEST_P(PartitionAllocTest, RequestedSizeChangesOnReallocForDirectMap) {
+  // The requested size is stored inside the `InSlotMetadata`, which is
+  // not present if BackupRefPtr is not enabled.
+  if (!allocator.root()->brp_enabled()) {
+    return;
+  }
+
+  const size_t kArbitraryDirectMapSize = kMinDirectMappedDownsize + 5u;
+  void* object = allocator.root()->Alloc(kArbitraryDirectMapSize);
+
+  auto* in_slot_metadata =
+      allocator.root()->InSlotMetadataPointerFromObjectForTesting(object);
+  EXPECT_EQ(in_slot_metadata->requested_size(), kArbitraryDirectMapSize);
+
+  void* new_object =
+      allocator.root()->Realloc(object, kArbitraryDirectMapSize - 1, type_name);
+  ASSERT_EQ(new_object, object);
+
+  in_slot_metadata =
+      allocator.root()->InSlotMetadataPointerFromObjectForTesting(object);
+  EXPECT_EQ(in_slot_metadata->requested_size(), kArbitraryDirectMapSize - 1);
+
+  allocator.root()->Free(object);
+}
+
+#endif  // PA_CONFIG(IN_SLOT_METADATA_STORE_REQUESTED_SIZE)
+
+#if PA_BUILDFLAG(CHECKED_SPAN_HAS_METADATA_SUPPORT)
+
+TEST_P(PartitionAllocTest, SlotHasOrHasntSmuggledSize) {
+  // The bit denoting smuggled size presence is stored inside the
+  // `InSlotMetadata`, which is not present if BackupRefPtr is not
+  // enabled.
+  if (!allocator.root()->brp_enabled()) {
+    GTEST_SKIP();
+  }
+
+  // Arbitrarily target slot size 320. This won't fit Checked Span's
+  // smuggled size.
+  const size_t slot_size_320 = 320u - ExtraAllocSize(allocator);
+
+  // If the usable size fills the slot, by definition we cannot smuggle
+  // the size.
+  ASSERT_EQ(
+      slot_size_320,
+      allocator.root()->AllocationCapacityFromRequestedSize(slot_size_320));
+
+  // This should also target slot size 320 (see `buckets.md`). This
+  // _will_ fit Checked Span's smuggled size.
+  const size_t also_slot_size_320 =
+      slot_size_320 - sizeof(internal::CheckedSpanSmuggledRequestedSize);
+  ASSERT_EQ(SizeToIndex(slot_size_320), SizeToIndex(also_slot_size_320));
+
+  void* hasnt_smuggled_size = allocator.root()->Alloc(slot_size_320);
+  EXPECT_FALSE(
+      allocator.root()
+          ->InSlotMetadataPointerFromObjectForTesting(hasnt_smuggled_size)
+          ->IsSmuggledSizeAvailable());
+
+  void* has_smuggled_size = allocator.root()->Alloc(also_slot_size_320);
+  EXPECT_TRUE(allocator.root()
+                  ->InSlotMetadataPointerFromObjectForTesting(has_smuggled_size)
+                  ->IsSmuggledSizeAvailable());
+
+  // The external-friendly `GetUsableSize()` will show a usable size
+  // discrepancy, despite both allocations targeting the same slot size.
+  EXPECT_EQ(PartitionRoot::GetExternalUsableSize(hasnt_smuggled_size),
+            PartitionRoot::GetExternalUsableSize(has_smuggled_size) +
+                sizeof(internal::CheckedSpanSmuggledRequestedSize));
+
+  const auto* slot_span_without_smuggled_size =
+      SlotSpanMetadata::FromObjectInnerPtr(hasnt_smuggled_size,
+                                           allocator.root());
+  const auto* slot_span_with_smuggled_size =
+      SlotSpanMetadata::FromObjectInnerPtr(has_smuggled_size, allocator.root());
+  // The internal `GetSlotUsableSize()`s must report the same size,
+  // ignoring the smuggled size.
+  EXPECT_EQ(
+      allocator.root()->GetSlotUsableSize(slot_span_without_smuggled_size),
+      allocator.root()->GetSlotUsableSize(slot_span_with_smuggled_size));
+
+  // As above, but calling the overrides with `BucketSizeDetails`.
+  EXPECT_EQ(allocator.root()->GetSlotUsableSize(
+                allocator.root()->SizeToBucketSizeDetails(
+                    slot_size_320, slot_span_without_smuggled_size),
+                slot_span_without_smuggled_size),
+            allocator.root()->GetSlotUsableSize(
+                allocator.root()->SizeToBucketSizeDetails(
+                    also_slot_size_320, slot_span_with_smuggled_size),
+                slot_span_with_smuggled_size));
+
+  allocator.root()->Free(hasnt_smuggled_size);
+  allocator.root()->Free(has_smuggled_size);
+}
+
+#endif  // PA_BUILDFLAG(CHECKED_SPAN_HAS_METADATA_SUPPORT)
+
 }  // namespace partition_alloc::internal
 
-#endif  // !defined(MEMORY_TOOL_REPLACES_ALLOCATOR)
+#endif  // !PA_BUILDFLAG(MEMORY_TOOL_REPLACES_ALLOCATOR)

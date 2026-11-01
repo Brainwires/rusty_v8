@@ -223,6 +223,11 @@ using SandboxedPointer_t = Address;
 // virtual address space for userspace. As such, limit the sandbox to 128GB (a
 // quarter of the total available address space).
 constexpr size_t kSandboxSizeLog2 = 37;  // 128 GB
+#elif defined(V8_TARGET_ARCH_ARM64) && defined(V8_TARGET_OS_CHROMEOS)
+// On ARM64 ChromeOS, kernel config is 39 bits of virtual address space for
+// userspace, limit the sandbox to 128GB (a quarter of the total available
+// address space).
+constexpr size_t kSandboxSizeLog2 = 37;  // 128 GB
 #elif defined(V8_TARGET_OS_IOS)
 // On iOS, we only get 64 GB of usable virtual address space even with the
 // "jumbo" extended virtual addressing entitlement. Limit the sandbox size to
@@ -305,6 +310,9 @@ static_assert(kMaxSafeBufferSizeForSandbox <= kSandboxGuardRegionSize,
 
 #if defined(V8_TARGET_OS_ANDROID)
 // On Android, we often won't have sufficient virtual address space available.
+constexpr size_t kAdditionalTrailingGuardRegionSize = 0;
+#elif defined(V8_TARGET_ARCH_ARM64) && defined(V8_TARGET_OS_CHROMEOS)
+// On ARM64 ChromeOS, kernel configs 39 bits of virtual address space.
 constexpr size_t kAdditionalTrailingGuardRegionSize = 0;
 #elif defined(V8_TARGET_ARCH_LOONG64)
 // Some hardwares like 2K3000 does not have sufficient virtual address space
@@ -575,16 +583,33 @@ struct TagRange {
   Tag last;
 };
 
+enum class ManagedTypeId : uint32_t {
+  kBackingStore,
+  kTestDeleteCounter,
+  kTestDeleteNative,
+  kWasmStreaming,
+  kWasmFuncData,
+  kWasmManagedData,
+  kWasmNativeModule,
+  kIcuBreakIteratorWithText,
+  kTemporalDuration,
+  kTemporalInstant,
+  kTemporalPlainDate,
+  kTemporalPlainTime,
+  kTemporalPlainDateTime,
+  kTemporalPlainYearMonth,
+  kTemporalPlainMonthDay,
+  kTemporalZonedDateTime,
+  kDisplayNamesInternal,
+  kD8Worker,
+  kD8ModuleEmbedderData,
+  kD8AsyncHooksWrap,
+};
+
 #define SHARED_MANAGED_TAG_LIST(V) V(WasmFutexManagedObjectWaitListTag)
 
 #define MANAGED_TAG_LIST(V)          \
   SHARED_MANAGED_TAG_LIST(V)         \
-  V(GenericManagedTag)               \
-  V(WasmWasmStreamingTag)            \
-  V(WasmFuncDataTag)                 \
-  V(WasmManagedDataTag)              \
-  V(WasmNativeModuleTag)             \
-  V(BackingStoreTag)                 \
   V(IcuBreakIteratorTag)             \
   V(IcuListFormatterTag)             \
   V(IcuLocaleTag)                    \
@@ -593,19 +618,7 @@ struct TagRange {
   V(IcuRelativeDateTimeFormatterTag) \
   V(IcuLocalizedNumberFormatterTag)  \
   V(IcuPluralRulesTag)               \
-  V(IcuCollatorTag)                  \
-  V(IcuBreakIteratorWithTextTag)     \
-  V(TemporalDurationTag)             \
-  V(TemporalInstantTag)              \
-  V(TemporalPlainDateTag)            \
-  V(TemporalPlainTimeTag)            \
-  V(TemporalPlainDateTimeTag)        \
-  V(TemporalPlainYearMonthTag)       \
-  V(TemporalPlainMonthDayTag)        \
-  V(TemporalZonedDateTimeTag)        \
-  V(DisplayNamesInternalTag)         \
-  V(D8WorkerTag)                     \
-  V(D8ModuleEmbedderDataTag)
+  V(IcuCollatorTag)
 
 #define FOREIGN_TAG_LIST(V)                               \
   V(GenericForeignTag)                                    \
@@ -998,12 +1011,8 @@ class Internals {
 #endif  // !V8_COMPRESS_POINTERS
   static const int kFixedArrayHeaderSize = 2 * kApiTaggedSize;
   static const int kEmbedderDataArrayHeaderSize = 2 * kApiTaggedSize;
-  static const int kEmbedderDataSlotSize = kApiSystemPointerSize;
-#ifdef V8_ENABLE_SANDBOX
-  static const int kEmbedderDataSlotExternalPointerOffset = kApiTaggedSize;
-#else
-  static const int kEmbedderDataSlotExternalPointerOffset = 0;
-#endif
+  static const int kEmbedderDataSlotSize = 2 * kApiTaggedSize;
+  static const int kEmbedderDataSlotCppHeapPointerOffset = kApiTaggedSize;
   static const int kNativeContextEmbedderDataOffset = 6 * kApiTaggedSize;
   static const int kStringRepresentationAndEncodingMask = 0x0f;
   static const int kStringEncodingMask = 0x8;
@@ -1031,10 +1040,7 @@ class Internals {
   // ExternalPointerTable, CppHeapPointerTable and TrustedPointerTable layout
   // guarantees.
   static const int kExternalEntityTableBasePointerOffset = 0;
-  static const int kSegmentedTableSegmentPoolSize = 4;
-  static const int kExternalEntityTableSize =
-      4 * kApiSystemPointerSize +
-      kSegmentedTableSegmentPoolSize * sizeof(uint32_t);
+  static const int kExternalEntityTableSize = 4 * kApiSystemPointerSize;
 
   // IsolateData layout guarantees.
   static const int kIsolateCageBaseOffset = 0;

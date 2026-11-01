@@ -56,6 +56,9 @@ int MacroAssembler::RequiredStackSizeForCallerSaved(SaveFPRegsMode fp_mode,
 
   if (fp_mode == SaveFPRegsMode::kSave) {
     bytes += kCallerSavedFPU.Count() * kDoubleSize;
+#if V8_ENABLE_SIMD128
+    bytes += kCallerSavedVR.Count() * kSimd128Size;
+#endif
   }
 
   return bytes;
@@ -73,6 +76,14 @@ int MacroAssembler::PushCallerSaved(SaveFPRegsMode fp_mode, Register exclusion1,
   if (fp_mode == SaveFPRegsMode::kSave) {
     MultiPushFPU(kCallerSavedFPU);
     bytes += kCallerSavedFPU.Count() * kDoubleSize;
+#if V8_ENABLE_SIMD128
+    // The vector registers are a separate register file from the FPU
+    // registers, so they must be saved independently. SaveVectorRegisters
+    // takes care of only accessing vector registers if the hardware supports
+    // SIMD, reserving the same amount of stack space in either case.
+    SaveVectorRegisters(kCallerSavedVR);
+    bytes += kCallerSavedVR.Count() * kSimd128Size;
+#endif
   }
 
   return bytes;
@@ -82,6 +93,10 @@ int MacroAssembler::PopCallerSaved(SaveFPRegsMode fp_mode, Register exclusion1,
                                    Register exclusion2, Register exclusion3) {
   int bytes = 0;
   if (fp_mode == SaveFPRegsMode::kSave) {
+#if V8_ENABLE_SIMD128
+    RestoreVectorRegisters(kCallerSavedVR);
+    bytes += kCallerSavedVR.Count() * kSimd128Size;
+#endif
     MultiPopFPU(kCallerSavedFPU);
     bytes += kCallerSavedFPU.Count() * kDoubleSize;
   }
@@ -141,21 +156,17 @@ void MacroAssembler::GenerateTailCallToReturnedCode(
     Push(kJavaScriptCallTargetRegister, kJavaScriptCallNewTargetRegister,
          kJavaScriptCallArgCountRegister);
 #ifdef V8_JS_LINKAGE_INCLUDES_DISPATCH_HANDLE
-    // No need to SmiTag since dispatch handles always look like Smis.
-    static_assert(kJSDispatchHandleShift > 0);
-    AssertSmi(kJavaScriptCallDispatchHandleRegister);
-    Push(kJavaScriptCallDispatchHandleRegister);
+    PushDispatchHandle(kJavaScriptCallDispatchHandleRegister, a5, a6);
 #endif
     // Function is also the parameter to the runtime call.
     Push(kJavaScriptCallTargetRegister);
 
     CallRuntime(function_id, 1);
-    LoadCodeInstructionStart(a2, a0, kJSEntrypointTag);
 
     // Restore target function, new target, actual argument count and dispatch
     // handle.
 #ifdef V8_JS_LINKAGE_INCLUDES_DISPATCH_HANDLE
-    Pop(kJavaScriptCallDispatchHandleRegister);
+    PopDispatchHandle(kJavaScriptCallDispatchHandleRegister, a5, a6);
 #endif
     Pop(kJavaScriptCallTargetRegister, kJavaScriptCallNewTargetRegister,
         kJavaScriptCallArgCountRegister);
@@ -163,6 +174,13 @@ void MacroAssembler::GenerateTailCallToReturnedCode(
   }
 
   static_assert(kJavaScriptCallCodeStartRegister == a2, "ABI mismatch");
+#ifndef V8_JS_LINKAGE_INCLUDES_DISPATCH_HANDLE
+  Lwu(kJavaScriptCallDispatchHandleRegister,
+      FieldMemOperand(kJavaScriptCallTargetRegister,
+                      offsetof(JSFunction, dispatch_handle_)));
+#endif
+  LoadEntrypointFromJSDispatchTable(a2, kJavaScriptCallDispatchHandleRegister,
+                                    a5);
   Jump(a2);
 }
 
@@ -194,6 +212,13 @@ void MacroAssembler::LoadTaggedRoot(Register destination, RootIndex index) {
   }
   LoadWord(destination,
            MemOperand(kRootRegister, RootRegisterOffsetForRootIndex(index)));
+}
+void MacroAssembler::StoreTaggedRoot(const MemOperand& destination,
+                                     RootIndex index) {
+  UseScratchRegisterScope temps(this);
+  Register scratch = temps.Acquire();
+  LoadTaggedRoot(scratch, index);
+  StoreTaggedField(scratch, destination);
 }
 void MacroAssembler::LoadCompressedTaggedRoot(Register destination,
                                               RootIndex index) {
@@ -786,23 +811,14 @@ void MacroAssembler::RecordWrite(Register object, Operand offset,
 // ---------------------------------------------------------------------------
 // Instruction macros.
 #if V8_TARGET_ARCH_RISCV64
-void MacroAssembler::DecodeSandboxedPointer(Register value) {
-  ASM_CODE_COMMENT(this);
-#ifdef V8_ENABLE_SANDBOX
-  SrlWord(value, value, kSandboxedPointerShift);
-  AddWord(value, value, kPtrComprCageBaseRegister);
-#else
-  UNREACHABLE();
-#endif
-}
-
 void MacroAssembler::LoadSandboxedPointerField(Register destination,
                                                const MemOperand& field_operand,
                                                Trapper&& trapper) {
 #ifdef V8_ENABLE_SANDBOX
   ASM_CODE_COMMENT(this);
   LoadWord(destination, field_operand, std::forward<Trapper>(trapper));
-  DecodeSandboxedPointer(destination);
+  SrlWord(destination, destination, kSandboxedPointerShift);
+  AddWord(destination, kPtrComprCageBaseRegister, destination);
 #else
   UNREACHABLE();
 #endif
@@ -825,8 +841,7 @@ void MacroAssembler::StoreSandboxedPointerField(
 void MacroAssembler::Add32(Register rd, Register rs, const Operand& rt) {
   if (rt.is_reg()) {
     if (CpuFeatures::IsSupported(RVC) && (rd.code() == rs.code()) &&
-        ((rd.code() & 0b11000) == 0b01000) &&
-        ((rt.rm().code() & 0b11000) == 0b01000)) {
+        IsRvcReg(rd) && IsRvcReg(rt.rm())) {
       c_addw(rd, rt.rm());
     } else {
       addw(rd, rs, rt.rm());
@@ -855,8 +870,7 @@ void MacroAssembler::Add32(Register rd, Register rs, const Operand& rt) {
 void MacroAssembler::Sub32(Register rd, Register rs, const Operand& rt) {
   if (rt.is_reg()) {
     if (CpuFeatures::IsSupported(RVC) && (rd.code() == rs.code()) &&
-        ((rd.code() & 0b11000) == 0b01000) &&
-        ((rt.rm().code() & 0b11000) == 0b01000)) {
+        IsRvcReg(rd) && IsRvcReg(rt.rm())) {
       c_subw(rd, rt.rm());
     } else {
       subw(rd, rs, rt.rm());
@@ -905,8 +919,7 @@ void MacroAssembler::SubWord(Register rd, Register rs, const Operand& rt) {
 void MacroAssembler::Sub64(Register rd, Register rs, const Operand& rt) {
   if (rt.is_reg()) {
     if (CpuFeatures::IsSupported(RVC) && (rd.code() == rs.code()) &&
-        ((rd.code() & 0b11000) == 0b01000) &&
-        ((rt.rm().code() & 0b11000) == 0b01000)) {
+        IsRvcReg(rd) && IsRvcReg(rt.rm())) {
       c_sub(rd, rt.rm());
     } else {
       sub(rd, rs, rt.rm());
@@ -969,8 +982,7 @@ void MacroAssembler::Add64(Register rd, Register rs, const Operand& rt) {
                (rd.code() == rs.code()) && (rd == sp) &&
                !MustUseReg(rt.rmode())) {
       c_addi16sp(static_cast<int16_t>(rt.immediate()));
-    } else if (CpuFeatures::IsSupported(RVC) &&
-               ((rd.code() & 0b11000) == 0b01000) && (rs == sp) &&
+    } else if (CpuFeatures::IsSupported(RVC) && IsRvcReg(rd) && (rs == sp) &&
                is_uint10(rt.immediate()) && (rt.immediate() != 0) &&
                !MustUseReg(rt.rmode())) {
       c_addi4spn(rd, static_cast<uint16_t>(rt.immediate()));
@@ -1182,8 +1194,7 @@ void MacroAssembler::Add32(Register rd, Register rs, const Operand& rt) {
                (rd.code() == rs.code()) && (rd == sp) &&
                !MustUseReg(rt.rmode())) {
       c_addi16sp(static_cast<int16_t>(rt.immediate()));
-    } else if (CpuFeatures::IsSupported(RVC) &&
-               ((rd.code() & 0b11000) == 0b01000) && (rs == sp) &&
+    } else if (CpuFeatures::IsSupported(RVC) && IsRvcReg(rd) && (rs == sp) &&
                is_uint10(rt.immediate()) && (rt.immediate() != 0) &&
                !MustUseReg(rt.rmode())) {
       c_addi4spn(rd, static_cast<uint16_t>(rt.immediate()));
@@ -1211,8 +1222,7 @@ void MacroAssembler::SubWord(Register rd, Register rs, const Operand& rt) {
 void MacroAssembler::Sub32(Register rd, Register rs, const Operand& rt) {
   if (rt.is_reg()) {
     if (CpuFeatures::IsSupported(RVC) && (rd.code() == rs.code()) &&
-        ((rd.code() & 0b11000) == 0b01000) &&
-        ((rt.rm().code() & 0b11000) == 0b01000)) {
+        IsRvcReg(rd) && IsRvcReg(rt.rm())) {
       c_sub(rd, rt.rm());
     } else {
       sub(rd, rs, rt.rm());
@@ -1352,16 +1362,14 @@ void MacroAssembler::Divu(Register res, Register rs, const Operand& rt) {
 void MacroAssembler::And(Register rd, Register rs, const Operand& rt) {
   if (rt.is_reg()) {
     if (CpuFeatures::IsSupported(RVC) && (rd.code() == rs.code()) &&
-        ((rd.code() & 0b11000) == 0b01000) &&
-        ((rt.rm().code() & 0b11000) == 0b01000)) {
+        IsRvcReg(rd) && IsRvcReg(rt.rm())) {
       c_and(rd, rt.rm());
     } else {
       and_(rd, rs, rt.rm());
     }
   } else {
     if (CpuFeatures::IsSupported(RVC) && is_int6(rt.immediate()) &&
-        !MustUseReg(rt.rmode()) && (rd.code() == rs.code()) &&
-        ((rd.code() & 0b11000) == 0b01000)) {
+        !MustUseReg(rt.rmode()) && (rd.code() == rs.code()) && IsRvcReg(rd)) {
       c_andi(rd, static_cast<int8_t>(rt.immediate()));
     } else if (is_int12(rt.immediate()) && !MustUseReg(rt.rmode())) {
       andi(rd, rs, static_cast<int32_t>(rt.immediate()));
@@ -1378,8 +1386,7 @@ void MacroAssembler::And(Register rd, Register rs, const Operand& rt) {
 void MacroAssembler::Or(Register rd, Register rs, const Operand& rt) {
   if (rt.is_reg()) {
     if (CpuFeatures::IsSupported(RVC) && (rd.code() == rs.code()) &&
-        ((rd.code() & 0b11000) == 0b01000) &&
-        ((rt.rm().code() & 0b11000) == 0b01000)) {
+        IsRvcReg(rd) && IsRvcReg(rt.rm())) {
       c_or(rd, rt.rm());
     } else {
       or_(rd, rs, rt.rm());
@@ -1400,8 +1407,7 @@ void MacroAssembler::Or(Register rd, Register rs, const Operand& rt) {
 void MacroAssembler::Xor(Register rd, Register rs, const Operand& rt) {
   if (rt.is_reg()) {
     if (CpuFeatures::IsSupported(RVC) && (rd.code() == rs.code()) &&
-        ((rd.code() & 0b11000) == 0b01000) &&
-        ((rt.rm().code() & 0b11000) == 0b01000)) {
+        IsRvcReg(rd) && IsRvcReg(rt.rm())) {
       c_xor(rd, rt.rm());
     } else {
       xor_(rd, rs, rt.rm());
@@ -1606,7 +1612,7 @@ void MacroAssembler::Sra64(Register rd, Register rs, const Operand& rt) {
   if (rt.is_reg()) {
     sra(rd, rs, rt.rm());
   } else if (CpuFeatures::IsSupported(RVC) && (rd.code() == rs.code()) &&
-             ((rd.code() & 0b11000) == 0b01000) && is_int6(rt.immediate())) {
+             IsRvcReg(rd) && is_int6(rt.immediate())) {
     uint8_t shamt = static_cast<uint8_t>(rt.immediate());
     c_srai(rd, shamt);
   } else {
@@ -1623,7 +1629,7 @@ void MacroAssembler::Srl64(Register rd, Register rs, const Operand& rt) {
   if (rt.is_reg()) {
     srl(rd, rs, rt.rm());
   } else if (CpuFeatures::IsSupported(RVC) && (rd.code() == rs.code()) &&
-             ((rd.code() & 0b11000) == 0b01000) && is_int6(rt.immediate())) {
+             IsRvcReg(rd) && is_int6(rt.immediate())) {
     uint8_t shamt = static_cast<uint8_t>(rt.immediate());
     c_srli(rd, shamt);
   } else {
@@ -2250,7 +2256,12 @@ void MacroAssembler::Lb(Register rd, const MemOperand& rs, Trapper&& trapper) {
 void MacroAssembler::Lbu(Register rd, const MemOperand& rs, Trapper&& trapper) {
   auto fn = [&](Register target, const MemOperand& source) {
     trapper(pc_offset());
-    lbu(target, source.rm(), source.offset());
+    if (CpuFeatures::IsSupported(ZCB) && IsRvcReg(source.rm()) &&
+        IsRvcReg(rd) && is_uint2(source.offset())) {
+      c_lbu(rd, source.rm(), source.offset());
+    } else {
+      lbu(target, source.rm(), source.offset());
+    }
   };
   AlignedLoadHelper(rd, rs, fn);
 }
@@ -2266,7 +2277,13 @@ void MacroAssembler::Sb(Register rd, const MemOperand& rs, Trapper&& trapper) {
 void MacroAssembler::Lh(Register rd, const MemOperand& rs, Trapper&& trapper) {
   auto fn = [&](Register target, const MemOperand& source) {
     trapper(pc_offset());
-    lh(target, source.rm(), source.offset());
+    if (CpuFeatures::IsSupported(ZCB) && IsRvcReg(source.rm()) &&
+        IsRvcReg(rd) && is_uint2(source.offset()) &&
+        ((source.offset() & 1) == 0)) {
+      c_lh(rd, source.rm(), source.offset());
+    } else {
+      lh(target, source.rm(), source.offset());
+    }
   };
   AlignedLoadHelper(rd, rs, fn);
 }
@@ -2274,7 +2291,13 @@ void MacroAssembler::Lh(Register rd, const MemOperand& rs, Trapper&& trapper) {
 void MacroAssembler::Lhu(Register rd, const MemOperand& rs, Trapper&& trapper) {
   auto fn = [&](Register target, const MemOperand& source) {
     trapper(pc_offset());
-    lhu(target, source.rm(), source.offset());
+    if (CpuFeatures::IsSupported(ZCB) && IsRvcReg(source.rm()) &&
+        IsRvcReg(rd) && is_uint2(source.offset()) &&
+        ((source.offset() & 1) == 0)) {
+      c_lhu(rd, source.rm(), source.offset());
+    } else {
+      lhu(target, source.rm(), source.offset());
+    }
   };
   AlignedLoadHelper(rd, rs, fn);
 }
@@ -2290,10 +2313,9 @@ void MacroAssembler::Sh(Register rd, const MemOperand& rs, Trapper&& trapper) {
 void MacroAssembler::Lw(Register rd, const MemOperand& rs, Trapper&& trapper) {
   auto fn = [&](Register target, const MemOperand& source) {
     trapper(pc_offset());
-    if (CpuFeatures::IsSupported(RVC) &&
-        ((target.code() & 0b11000) == 0b01000) &&
-        ((source.rm().code() & 0b11000) == 0b01000) &&
-        is_uint7(source.offset()) && ((source.offset() & 0x3) == 0)) {
+    if (CpuFeatures::IsSupported(RVC) && IsRvcReg(target) &&
+        IsRvcReg(source.rm()) && is_uint7(source.offset()) &&
+        ((source.offset() & 0x3) == 0)) {
       c_lw(target, source.rm(), source.offset());
     } else if (CpuFeatures::IsSupported(RVC) && (target != zero_reg) &&
                is_uint8(source.offset()) && (source.rm() == sp) &&
@@ -2319,10 +2341,9 @@ void MacroAssembler::Lwu(Register rd, const MemOperand& rs, Trapper&& trapper) {
 void MacroAssembler::Sw(Register rd, const MemOperand& rs, Trapper&& trapper) {
   auto fn = [&](Register value, const MemOperand& source) {
     trapper(pc_offset());
-    if (CpuFeatures::IsSupported(RVC) &&
-        ((value.code() & 0b11000) == 0b01000) &&
-        ((source.rm().code() & 0b11000) == 0b01000) &&
-        is_uint7(source.offset()) && ((source.offset() & 0x3) == 0)) {
+    if (CpuFeatures::IsSupported(RVC) && IsRvcReg(value) &&
+        IsRvcReg(source.rm()) && is_uint7(source.offset()) &&
+        ((source.offset() & 0x3) == 0)) {
       c_sw(value, source.rm(), source.offset());
     } else if (CpuFeatures::IsSupported(RVC) && (source.rm() == sp) &&
                is_uint8(source.offset()) && (((source.offset() & 0x3) == 0))) {
@@ -2338,10 +2359,9 @@ void MacroAssembler::Sw(Register rd, const MemOperand& rs, Trapper&& trapper) {
 void MacroAssembler::Ld(Register rd, const MemOperand& rs, Trapper&& trapper) {
   auto fn = [&](Register target, const MemOperand& source) {
     trapper(pc_offset());
-    if (CpuFeatures::IsSupported(RVC) &&
-        ((target.code() & 0b11000) == 0b01000) &&
-        ((source.rm().code() & 0b11000) == 0b01000) &&
-        is_uint8(source.offset()) && ((source.offset() & 0x7) == 0)) {
+    if (CpuFeatures::IsSupported(RVC) && IsRvcReg(target) &&
+        IsRvcReg(source.rm()) && is_uint8(source.offset()) &&
+        ((source.offset() & 0x7) == 0)) {
       c_ld(target, source.rm(), source.offset());
     } else if (CpuFeatures::IsSupported(RVC) && (target != zero_reg) &&
                is_uint9(source.offset()) && (source.rm() == sp) &&
@@ -2357,10 +2377,9 @@ void MacroAssembler::Ld(Register rd, const MemOperand& rs, Trapper&& trapper) {
 void MacroAssembler::Sd(Register rd, const MemOperand& rs, Trapper&& trapper) {
   auto fn = [&](Register value, const MemOperand& source) {
     trapper(pc_offset());
-    if (CpuFeatures::IsSupported(RVC) &&
-        ((value.code() & 0b11000) == 0b01000) &&
-        ((source.rm().code() & 0b11000) == 0b01000) &&
-        is_uint8(source.offset()) && ((source.offset() & 0x7) == 0)) {
+    if (CpuFeatures::IsSupported(RVC) && IsRvcReg(value) &&
+        IsRvcReg(source.rm()) && is_uint8(source.offset()) &&
+        ((source.offset() & 0x7) == 0)) {
       c_sd(value, source.rm(), source.offset());
     } else if (CpuFeatures::IsSupported(RVC) && (source.rm() == sp) &&
                is_uint9(source.offset()) && ((source.offset() & 0x7) == 0)) {
@@ -2413,10 +2432,9 @@ void MacroAssembler::LoadDouble(FPURegister fd, const MemOperand& src,
                                 Trapper&& trapper) {
   auto fn = [&](FPURegister target, const MemOperand& source) {
     trapper(pc_offset());
-    if (CpuFeatures::IsSupported(RVC) &&
-        ((target.code() & 0b11000) == 0b01000) &&
-        ((source.rm().code() & 0b11000) == 0b01000) &&
-        is_uint8(source.offset()) && ((source.offset() & 0x7) == 0)) {
+    if (CpuFeatures::IsSupported(RVC) && IsRvcReg(target) &&
+        IsRvcReg(source.rm()) && is_uint8(source.offset()) &&
+        ((source.offset() & 0x7) == 0)) {
       c_fld(target, source.rm(), source.offset());
     } else if (CpuFeatures::IsSupported(RVC) && (source.rm() == sp) &&
                is_uint9(source.offset()) && ((source.offset() & 0x7) == 0)) {
@@ -2432,10 +2450,9 @@ void MacroAssembler::StoreDouble(FPURegister fs, const MemOperand& src,
                                  Trapper&& trapper) {
   auto fn = [&](FPURegister value, const MemOperand& source) {
     trapper(pc_offset());
-    if (CpuFeatures::IsSupported(RVC) &&
-        ((value.code() & 0b11000) == 0b01000) &&
-        ((source.rm().code() & 0b11000) == 0b01000) &&
-        is_uint8(source.offset()) && ((source.offset() & 0x7) == 0)) {
+    if (CpuFeatures::IsSupported(RVC) && IsRvcReg(value) &&
+        IsRvcReg(source.rm()) && is_uint8(source.offset()) &&
+        ((source.offset() & 0x7) == 0)) {
       c_fsd(value, source.rm(), source.offset());
     } else if (CpuFeatures::IsSupported(RVC) && (source.rm() == sp) &&
                is_uint9(source.offset()) && ((source.offset() & 0x7) == 0)) {
@@ -2810,7 +2827,7 @@ void MacroAssembler::SaveVectorRegisters(const Simd128RegList& reg_list) {
       }
     } else {
       SubWord(sp, sp,
-              Operand(-static_cast<int32_t>(reg_list.Count()) * kSimd128Size));
+              Operand(static_cast<int32_t>(reg_list.Count()) * kSimd128Size));
     }
   }
 }
@@ -4594,20 +4611,38 @@ void MacroAssembler::CompareTaggedAndBranch(Label* label, Condition cond,
 #if V8_TARGET_ARCH_RISCV64
     UseScratchRegisterScope temps(this);
     Register scratch0 = temps.Acquire();
-    SignExtendWord(scratch0, r1);
-    if (IsZero(r2)) {
+    if (cond == eq || cond == ne) {
+      // Equality only depends on the low 32 bits, and a 32-bit subtraction
+      // sign-extends its result, so it is zero exactly when those low 32 bits
+      // match. This avoids sign-extending both operands first.
+      if (r2.is_reg()) {
+        Sub32(scratch0, r1, r2);
+      } else if (MustUseReg(r2.rmode())) {
+        // A relocatable immediate (e.g. a Handle<HeapObject>) is a handle
+        // location, not the value to compare against; materialize it first
+        // so the relocation is recorded and the real value is compared.
+        li(scratch0, r2);
+        Sub32(scratch0, r1, scratch0);
+      } else {
+        Sub32(scratch0, r1, Operand(static_cast<int32_t>(r2.immediate())));
+      }
       Branch(label, cond, scratch0, Operand(zero_reg));
     } else {
-      Register scratch1 = temps.Acquire();
-      if (r2.is_reg()) {
-        SignExtendWord(scratch1, r2.rm());
+      SignExtendWord(scratch0, r1);
+      if (IsZero(r2)) {
+        Branch(label, cond, scratch0, Operand(zero_reg));
       } else {
-        li(scratch1, r2);
-        if (!base::IsInRange(r2.immediate(), 0, 0x7FFFFFFF)) {
-          SignExtendWord(scratch1, scratch1);
+        Register scratch1 = temps.Acquire();
+        if (r2.is_reg()) {
+          SignExtendWord(scratch1, r2.rm());
+        } else {
+          li(scratch1, r2);
+          if (!base::IsInRange(r2.immediate(), 0, 0x7FFFFFFF)) {
+            SignExtendWord(scratch1, scratch1);
+          }
         }
+        Branch(label, cond, scratch0, Operand(scratch1));
       }
-      Branch(label, cond, scratch0, Operand(scratch1));
     }
 #else
     UNREACHABLE();
@@ -5863,8 +5898,8 @@ void MacroAssembler::InvokeFunctionCode(
   DCHECK_IMPLIES(new_target.is_valid(), new_target == a3);
 
   Register dispatch_handle = kJavaScriptCallDispatchHandleRegister;
-  Lw(dispatch_handle,
-     FieldMemOperand(function, offsetof(JSFunction, dispatch_handle_)));
+  Load32U(dispatch_handle,
+          FieldMemOperand(function, offsetof(JSFunction, dispatch_handle_)));
 
   // On function call, call into the debugger if necessary.
   Label debug_hook, continue_after_hook;
@@ -7611,8 +7646,8 @@ void MacroAssembler::CallJSFunction(Register function_object,
   Register parameter_count = s1;
   UseScratchRegisterScope temps(this);
   Register scratch = temps.Acquire();
-  Lw(dispatch_handle,
-     FieldMemOperand(function_object, offsetof(JSFunction, dispatch_handle_)));
+  Lwu(dispatch_handle,
+      FieldMemOperand(function_object, offsetof(JSFunction, dispatch_handle_)));
   LoadEntrypointAndParameterCountFromJSDispatchTable(code, parameter_count,
                                                      dispatch_handle, scratch);
   // Force a safe crash if the parameter count doesn't match.
@@ -7640,6 +7675,10 @@ void MacroAssembler::CallJSDispatchEntry(JSDispatchHandle dispatch_handle,
   Register scratch = s1;
   li(kJavaScriptCallDispatchHandleRegister,
      Operand(dispatch_handle.value(), RelocInfo::JS_DISPATCH_HANDLE));
+#ifdef V8_TARGET_ARCH_RISCV64
+  ZeroExtendWord(kJavaScriptCallDispatchHandleRegister,
+                 kJavaScriptCallDispatchHandleRegister);
+#endif
   LoadEntrypointFromJSDispatchTable(code, kJavaScriptCallDispatchHandleRegister,
                                     scratch);
   CHECK_EQ(argument_count,
@@ -7752,7 +7791,8 @@ void MacroAssembler::LoadEntrypointFromJSDispatchTable(Register destination,
   static_assert(kJSDispatchHandleShift == 0);
   SllWord(index, dispatch_handle, kJSDispatchTableEntrySizeLog2);
 #else
-  SrlWord(index, dispatch_handle, kJSDispatchHandleShift);
+  ZeroExtendWord(index, dispatch_handle);
+  SrlWord(index, index, kJSDispatchHandleShift);
   SllWord(index, index, kJSDispatchTableEntrySizeLog2);
 #endif
   AddWord(scratch, scratch, index);
@@ -7844,7 +7884,8 @@ void MacroAssembler::LoadParameterCountFromJSDispatchTable(
   DCHECK(!AreAliased(destination, scratch));
   ASM_CODE_COMMENT(this);
   Register index = destination;
-  SrlWord(index, dispatch_handle, kJSDispatchHandleShift);
+  ZeroExtendWord(index, dispatch_handle);
+  SrlWord(index, index, kJSDispatchHandleShift);
   SllWord(index, index, kJSDispatchTableEntrySizeLog2);
   Ld(scratch, ExternalReferenceAsOperand(IsolateFieldId::kJSDispatchTable));
   AddWord(scratch, scratch, index);
@@ -7859,12 +7900,41 @@ void MacroAssembler::LoadEntrypointAndParameterCountFromJSDispatchTable(
   ASM_CODE_COMMENT(this);
   Register index = parameter_count;
   Ld(scratch, ExternalReferenceAsOperand(IsolateFieldId::kJSDispatchTable));
-  SrlWord(index, dispatch_handle, kJSDispatchHandleShift);
+  ZeroExtendWord(index, dispatch_handle);
+  SrlWord(index, index, kJSDispatchHandleShift);
   SllWord(index, index, kJSDispatchTableEntrySizeLog2);
   AddWord(scratch, scratch, index);
   LoadWord(entrypoint, MemOperand(scratch, JSDispatchEntry::kEntrypointOffset));
   static_assert(JSDispatchEntry::kParameterCountMask == 0xffff);
   Lhu(parameter_count, MemOperand(scratch, JSDispatchEntry::kCodeObjectOffset));
+}
+
+void MacroAssembler::PushDispatchHandle(Register dispatch_handle,
+                                        Register scratch1, Register scratch2) {
+  DCHECK(!AreAliased(dispatch_handle, scratch1, scratch2));
+#ifdef V8_ENABLE_SANDBOX
+  AssertZeroExtended(dispatch_handle);
+  LoadParameterCountFromJSDispatchTable(scratch1, dispatch_handle, scratch2);
+  ZeroExtendWord(dispatch_handle, dispatch_handle);
+  slli(scratch1, scratch1, 32);
+  or_(dispatch_handle, dispatch_handle, scratch1);
+#endif
+  Push(dispatch_handle);
+  // No need to SmiTag since dispatch handles always look like Smis.
+  static_assert(kJSDispatchHandleShift > 0);
+  AssertSmi(dispatch_handle);
+}
+
+void MacroAssembler::PopDispatchHandle(Register dispatch_handle,
+                                       Register scratch1, Register scratch2) {
+  DCHECK(!AreAliased(dispatch_handle, scratch1, scratch2));
+  Pop(dispatch_handle);
+#ifdef V8_ENABLE_SANDBOX
+  LoadParameterCountFromJSDispatchTable(scratch1, dispatch_handle, scratch2);
+  srli(scratch2, dispatch_handle, 32);
+  ZeroExtendWord(dispatch_handle, dispatch_handle);
+  SbxCheck(eq, AbortReason::kJSSignatureMismatch, scratch1, Operand(scratch2));
+#endif
 }
 
 void MacroAssembler::LoadTaggedField(const Register& destination,
@@ -7941,23 +8011,19 @@ void MacroAssembler::DecompressTagged(const Register& destination,
                                       Trapper&& trapper) {
   ASM_CODE_COMMENT(this);
   Lwu(destination, field_operand, std::forward<Trapper>(trapper));
-  AddWord(destination, kPtrComprCageBaseRegister, destination);
+  Or(destination, kPtrComprCageBaseRegister, destination);
 }
 
 void MacroAssembler::DecompressTagged(const Register& destination,
                                       const Register& source) {
   ASM_CODE_COMMENT(this);
-  if (CpuFeatures::IsSupported(ZBA)) {
-    adduw(destination, source, kPtrComprCageBaseRegister);
-  } else {
-    ZeroExtendWord(destination, source);
-    AddWord(destination, kPtrComprCageBaseRegister, Operand(destination));
-  }
+  ZeroExtendWord(destination, source);
+  Or(destination, kPtrComprCageBaseRegister, destination);
 }
 
 void MacroAssembler::DecompressTagged(Register dst, Tagged_t immediate) {
   ASM_CODE_COMMENT(this);
-  AddWord(dst, kPtrComprCageBaseRegister, static_cast<int32_t>(immediate));
+  Or(dst, kPtrComprCageBaseRegister, Operand(static_cast<uint32_t>(immediate)));
 }
 
 void MacroAssembler::DecompressProtected(const Register& destination,
@@ -7997,7 +8063,7 @@ void MacroAssembler::AtomicDecompressTagged(Register dst, const MemOperand& src,
   ASM_CODE_COMMENT(this);
   Lwu(dst, src, std::forward<Trapper>(trapper));
   sync();
-  AddWord(dst, kPtrComprCageBaseRegister, dst);
+  Or(dst, kPtrComprCageBaseRegister, dst);
 }
 
 #endif
@@ -8275,7 +8341,7 @@ void MacroAssembler::BranchRange(Label* L, Condition cond, Register value,
     SubWord(scratch, value, Operand(lower_limit));
     Branch(L, cond, scratch, Operand(higher_limit - lower_limit), distance);
   } else {
-    Branch(L, cond, scratch, Operand(higher_limit - lower_limit), distance);
+    Branch(L, cond, value, Operand(higher_limit), distance);
   }
 }
 

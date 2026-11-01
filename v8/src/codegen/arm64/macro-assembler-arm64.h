@@ -698,33 +698,6 @@ class V8_EXPORT_PRIVATE MacroAssembler : public MacroAssemblerBase {
   // Print a message to stderr and abort execution.
   void Abort(AbortReason reason);
 
-  // Like printf, but print at run-time from generated code.
-  //
-  // The caller must ensure that arguments for floating-point placeholders
-  // (such as %e, %f or %g) are VRegisters, and that arguments for integer
-  // placeholders are Registers.
-  //
-  // Format placeholders that refer to more than one argument, or to a specific
-  // argument, are not supported. This includes formats like "%1$d" or "%.*d".
-  //
-  // This function automatically preserves caller-saved registers so that
-  // calling code can use Printf at any point without having to worry about
-  // corruption. The preservation mechanism generates a lot of code. If this is
-  // a problem, preserve the important registers manually and then call
-  // PrintfNoPreserve. Callee-saved registers are not used by Printf, and are
-  // implicitly preserved.
-  void Printf(const char* format, CPURegister arg0 = NoCPUReg,
-              CPURegister arg1 = NoCPUReg, CPURegister arg2 = NoCPUReg,
-              CPURegister arg3 = NoCPUReg);
-
-  // Like Printf, but don't preserve any caller-saved registers, not even 'lr'.
-  //
-  // The return code from the system printf call will be returned in x0.
-  void PrintfNoPreserve(const char* format, const CPURegister& arg0 = NoCPUReg,
-                        const CPURegister& arg1 = NoCPUReg,
-                        const CPURegister& arg2 = NoCPUReg,
-                        const CPURegister& arg3 = NoCPUReg);
-
   // Remaining instructions are simple pass-through calls to the assembler.
   inline void Asr(const Register& rd, const Register& rn, unsigned shift);
   inline void Asr(const Register& rd, const Register& rn, const Register& rm);
@@ -1541,6 +1514,7 @@ class V8_EXPORT_PRIVATE MacroAssembler : public MacroAssemblerBase {
   // Load an object from the root table.
   void LoadRoot(Register destination, RootIndex index) final;
   void LoadTaggedRoot(Register destination, RootIndex index);
+  void StoreTaggedRoot(const MemOperand& destination, RootIndex index);
   void PushRoot(RootIndex index);
 
   inline void Ret(const Register& xn = lr);
@@ -1687,7 +1661,6 @@ class V8_EXPORT_PRIVATE MacroAssembler : public MacroAssemblerBase {
   // Transform a SandboxedPointer from/to its encoded form, which is used when
   // the pointer is stored on the heap and ensures that the pointer will always
   // point into the sandbox.
-  void DecodeSandboxedPointer(Register value);
   void LoadSandboxedPointerField(Register destination,
                                  MemOperand field_operand);
   void StoreSandboxedPointerField(Register value, MemOperand dst_field_operand);
@@ -1757,6 +1730,10 @@ class V8_EXPORT_PRIVATE MacroAssembler : public MacroAssemblerBase {
   void LoadEntrypointAndParameterCountFromJSDispatchTable(
       Register entrypoint, Register parameter_count, Register dispatch_handle,
       Register scratch);
+  void PushDispatchHandle(Register dispatch_handle, Register other,
+                          Register scratch1, Register scratch2);
+  void PopDispatchHandle(Register dispatch_handle, Register other,
+                         Register scratch1, Register scratch2);
 
   // Load a protected pointer field.
   void LoadProtectedPointerField(Register destination,
@@ -2077,9 +2054,20 @@ class V8_EXPORT_PRIVATE MacroAssembler : public MacroAssemblerBase {
 
   template <typename Field>
   void DecodeField(Register dst, Register src) {
-    static const int shift = Field::kShift;
-    static const int setbits = CountSetBits(Field::kMask, 32);
-    Ubfx(dst, src, shift, setbits);
+    static constexpr int shift = Field::kShift;
+    static constexpr uint64_t mask =
+        static_cast<uint64_t>(Field::kMask) >> shift;
+    if constexpr ((mask & (mask + 1)) == 0) {
+      static const int setbits = CountSetBits(Field::kMask, 32);
+      Ubfx(dst, src, shift, setbits);
+    } else {
+      if constexpr (shift != 0) {
+        Lsr(dst, src, shift);
+        And(dst, dst, mask);
+      } else {
+        And(dst, src, mask);
+      }
+    }
   }
 
   template <typename Field>
@@ -2410,16 +2398,6 @@ class V8_EXPORT_PRIVATE MacroAssembler : public MacroAssemblerBase {
   void AddSubWithCarryMacro(const Register& rd, const Register& rn,
                             const Operand& operand, FlagsUpdate S,
                             AddSubWithCarryOp op);
-
-  // Call Printf. On a native build, a simple call will be generated, but if the
-  // simulator is being used then a suitable pseudo-instruction is used. The
-  // arguments and stack must be prepared by the caller as for a normal AAPCS64
-  // call to 'printf'.
-  //
-  // The 'args' argument should point to an array of variable arguments in their
-  // proper PCS registers (and in calling order). The argument registers can
-  // have mixed types. The format string (x0) should not be included.
-  void CallPrintf(int arg_count = 0, const CPURegister* args = nullptr);
 
  private:
 #if DEBUG

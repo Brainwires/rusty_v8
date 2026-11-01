@@ -266,7 +266,6 @@ template("write_build_config") {
     _deps_configs = []
     if (defined(invoker.config_deps)) {
       foreach(_dep, invoker.config_deps) {
-        _dep_label = get_label_info(_dep, "label_no_toolchain")
         _dep_gen_dir = get_label_info(_dep, "target_gen_dir")
         _dep_name = get_label_info(_dep, "name")
         _dep_config = "$_dep_gen_dir/$_dep_name.params.json"
@@ -457,6 +456,7 @@ template("write_build_config") {
                                "requires_android",
                                "requires_robolectric",
                                "secondary_native_lib_placeholders",
+                               "suffix_apk_assets_string",
                                "supports_android",
                                "use_interface_jars",
                                "uses_split",
@@ -707,6 +707,7 @@ template("test_runner_script") {
     _runtime_deps_file =
         "$root_out_dir/gen.runtime/$_target_dir_name/$target_name.runtime_deps"
     _runtime_deps_target = "${target_name}__write_deps"
+
     group(_runtime_deps_target) {
       forward_variables_from(invoker,
                              [
@@ -738,6 +739,7 @@ template("test_runner_script") {
     _install_artifacts_json =
         "${target_gen_dir}/${target_name}.install_artifacts"
     _install_artifacts_target_name = "${target_name}__install_artifacts"
+
     generated_file(_install_artifacts_target_name) {
       deps = [ invoker.apk_under_test ]
       output_conversion = "json"
@@ -1443,6 +1445,7 @@ if (enable_java_templates) {
     if (defined(invoker.expected_proguard_config)) {
       _expectations_target =
           "${invoker.top_target_name}_validate_proguard_config"
+
       action_with_pydeps(_expectations_target) {
         script = _script
 
@@ -1494,11 +1497,13 @@ if (enable_java_templates) {
       _tracerefs_json = "$target_gen_dir/$target_name.tracerefs.json"
       _tracerefs_target_name = "${target_name}__tracerefs"
       _main_target_name = target_name
+
       trace_references(_tracerefs_target_name) {
         tracerefs_json = _tracerefs_json
         deps = [ ":$_main_target_name" ]
       }
     }
+
     action_with_pydeps(target_name) {
       forward_variables_from(invoker,
                              [
@@ -2481,6 +2486,7 @@ if (enable_java_templates) {
     if (defined(invoker.expected_android_manifest)) {
       _expectations_target =
           "${invoker.top_target_name}_validate_android_manifest"
+
       action_with_pydeps(_expectations_target) {
         _actual_file = "${invoker.android_manifest}.normalized"
         _failure_file =
@@ -2563,6 +2569,7 @@ if (enable_java_templates) {
   #       shortened resource paths.
   template("optimize_resources") {
     forward_variables_from(invoker, TESTONLY_AND_VISIBILITY)
+
     action_with_pydeps(target_name) {
       forward_variables_from(invoker, [ "deps" ])
       script = "//build/android/gyp/optimize_resources.py"
@@ -2863,6 +2870,7 @@ if (enable_java_templates) {
     if (defined(invoker.expected_libs_and_assets)) {
       _expectations_target =
           "${invoker.top_target_name}_validate_libs_and_assets"
+
       action_with_pydeps(_expectations_target) {
         _actual_file = "$target_gen_dir/$target_name.libs_and_assets"
         _failure_file =
@@ -2900,6 +2908,7 @@ if (enable_java_templates) {
       }
       _deps += [ ":$_expectations_target" ]
     }
+
     action_with_pydeps(target_name) {
       depfile = "$target_gen_dir/$target_name.d"
       inputs = java_paths_for_inputs + _inputs
@@ -3806,6 +3815,7 @@ if (enable_java_templates) {
                                "proguard_mapping_path",
                                "public_target_label",
                                "rtxt_path",
+                               "suffix_apk_assets_string",
                                "suffix_apk_assets_used_by",
                                "type",
                                "use_interface_jars",
@@ -3977,6 +3987,7 @@ if (enable_java_templates) {
         # Serves double purpose: Generating R.java, as well as being the
         #__assetres target (instead of using a separate group).
         _fake_rjava_target = "${target_name}__assetres"
+
         generate_r_java(_fake_rjava_target) {
           deps = [ ":$_build_config_target_name" ] + _java_assetres_deps +
                  _non_java_deps
@@ -4004,8 +4015,8 @@ if (enable_java_templates) {
         _kt_allowlist = [
           "*/AsyncTabParamsManagerImpl.kt",
           "//third_party/androidx/*",
-          "*/webengine_shell_apk/*",
           "//chrome/browser/ui/android/bricks/internal/*",
+          "//android_webview/javatests/*",
         ]
         _found_kt = filter_exclude(_abs_kt_files, _kt_allowlist)
         assert(
@@ -4017,6 +4028,7 @@ if (enable_java_templates) {
             "$target_out_dir/$_output_name.kt-jvm-abi.jar"
         assert(filter_include(_lib_deps, [ _kotlin_stdlib_dep ]) != [],
                "${_main_target_name} is missing dep: $_kotlin_stdlib_dep")
+
         compile_kt(_compile_kt_target_name) {
           deps = _header_classpath_deps
           output_jar_path = _kotlinc_jar_path
@@ -4038,10 +4050,12 @@ if (enable_java_templates) {
       template("compile_java_helper") {
         _enable_errorprone =
             defined(invoker.enable_errorprone) && invoker.enable_errorprone
+
         compile_java(target_name) {
           forward_variables_from(invoker,
                                  "*",
                                  TESTONLY_AND_VISIBILITY + [ "deps" ])
+          forward_variables_from(invoker, [ "visibility" ])
           deps = _header_classpath_deps
           if (defined(invoker.deps)) {
             deps += invoker.deps
@@ -4060,7 +4074,12 @@ if (enable_java_templates) {
           }
 
           if (_enable_errorprone) {
-            source_files = _errorprone_source_files
+            # Sharded ErrorProne targets pass their own subset of
+            # `source_files`. Fall back to `_errorprone_source_files` for
+            # non-sharded targets.
+            if (!defined(source_files)) {
+              source_files = _errorprone_source_files
+            }
           } else {
             source_files = _source_files
             srcjar_deps = _srcjar_deps
@@ -4068,7 +4087,12 @@ if (enable_java_templates) {
           }
 
           if (source_files != []) {
-            target_sources_file = _target_sources_file
+            # Sharded ErrorProne targets pass a shard-specific
+            # `target_sources_file`. Fall back to `_target_sources_file` for
+            # non-sharded targets.
+            if (!defined(target_sources_file)) {
+              target_sources_file = _target_sources_file
+            }
           }
           if (!use_turbine) {
             chromium_code = _chromium_code
@@ -4122,6 +4146,7 @@ if (enable_java_templates) {
       }
 
       _compile_java_target = "${_main_target_name}__compile_java"
+
       compile_java_helper(_compile_java_target) {
         forward_variables_from(invoker,
                                _compile_java_forward_variables + [
@@ -4152,21 +4177,84 @@ if (enable_java_templates) {
       }
 
       if (_enable_errorprone) {
-        compile_java_helper(_errorprone_target_name) {
-          forward_variables_from(invoker, _compile_java_forward_variables)
-          enable_errorprone = true
-          if (defined(invoker.errorprone_args)) {
-            if (!defined(xep_args)) {
-              xep_args = []
+        # Large Java targets (e.g. chrome_java with ~1,750 files) take over
+        # 150 seconds of CPU time when ErrorProne runs as a single monolithic
+        # action. To allow Ninja/Siso to schedule ErrorProne checks with fine-
+        # grained parallelism (and distribute them across remote RBE workers)
+        # while keeping enough files per shard to amortize JVM startup overhead,
+        # dynamically scale the shard count based on target size.
+        # `!_skip_header_jar` is required so each shard can resolve intra-target
+        # symbols compiled in other shards via the turbine header jar.
+        _num_ep_shards = 1
+        if (!_skip_header_jar) {
+          _num_ep_files = len(_errorprone_source_files)
+          if (_num_ep_files > 1600) {
+            _num_ep_shards = 8
+          } else if (_num_ep_files > 800) {
+            _num_ep_shards = 4
+          } else if (_num_ep_files > 200) {
+            _num_ep_shards = 2
+          }
+        }
+        _ep_use_sharding = _num_ep_shards > 1
+        if (_ep_use_sharding) {
+          # Generate independent compile_java_helper targets
+          # (__errorprone_shard0..N), each writing its own .sources file and
+          # running as a single-process javac action. Note that srcjar_deps are
+          # intentionally omitted for ErrorProne (generated types are resolved
+          # via header_jar_path/turbine, and warnings in generated code are
+          # disabled via -XepDisableWarningsInGeneratedCode), so sharding does
+          # not duplicate any srcjar extraction or compilation.
+          _ep_shards = split_list(_errorprone_source_files, _num_ep_shards)
+          _ep_shard_targets = []
+        } else {
+          _ep_shards = [ _errorprone_source_files ]
+        }
+
+        _s_idx = 0
+        foreach(_s_files, _ep_shards) {
+          if (_ep_use_sharding) {
+            _s_target = "${_errorprone_target_name}_shard${_s_idx}"
+            _ep_shard_targets += [ ":$_s_target" ]
+            _s_sources_file = "$target_gen_dir/${_s_target}.sources"
+            write_file(_s_sources_file, rebase_path(_s_files, root_build_dir))
+          } else {
+            not_needed([ "_s_files" ])
+            _s_target = _errorprone_target_name
+          }
+
+          compile_java_helper(_s_target) {
+            forward_variables_from(invoker, _compile_java_forward_variables)
+            enable_errorprone = true
+            if (_ep_use_sharding) {
+              visibility = [ ":$_errorprone_target_name" ]
+              source_files = _s_files
+              target_sources_file = _s_sources_file
             }
-            xep_args += invoker.errorprone_args
+            if (defined(invoker.errorprone_args)) {
+              if (!defined(xep_args)) {
+                xep_args = []
+              }
+              xep_args += invoker.errorprone_args
+            }
+            if (_kt_files != []) {
+              kotlin_jar_path = _kotlinc_jar_path
+            }
+            if (!_skip_header_jar) {
+              deps = [ ":$_header_target_name" ]
+              header_jar_path = _header_jar_path
+            }
           }
-          if (_kt_files != []) {
-            kotlin_jar_path = _kotlinc_jar_path
-          }
-          if (!_skip_header_jar) {
-            deps = [ ":$_header_target_name" ]
-            header_jar_path = _header_jar_path
+          _s_idx += 1
+        }
+
+        if (_ep_use_sharding) {
+          # Keep a group target under the original
+          # `${_main_target_name}__errorprone` name so Ninja validation edges
+          # transitively depend on all shards and external dependents continue
+          # to work.
+          group(_errorprone_target_name) {
+            deps = _ep_shard_targets
           }
         }
       }
@@ -4190,6 +4278,7 @@ if (enable_java_templates) {
       _rewriter_path = root_build_dir + "/bin/helper/" +
                        get_label_info(invoker.bytecode_rewriter_target, "name")
       _rebased_build_config = rebase_path(_build_config, root_build_dir)
+
       action_with_pydeps(_rewritten_jar_target_name) {
         script = "//build/android/gyp/bytecode_rewriter.py"
         inputs = java_paths_for_inputs + [
@@ -4267,6 +4356,7 @@ if (enable_java_templates) {
 
       if (_filter_jar && _is_prebuilt) {
         _filter_jar_target_name = "${target_name}__filter_jar"
+
         filter_jar(_filter_jar_target_name) {
           forward_variables_from(invoker,
                                  [
@@ -4285,6 +4375,7 @@ if (enable_java_templates) {
         # javaagent as the desired coverage data was not being generated.
         # See crbug.com/1097815.
         _process_jar_target_name = "${target_name}__jacoco"
+
         jacoco_instr(_process_jar_target_name) {
           source_files = _source_files
           target_sources_file = _target_sources_file
@@ -4318,6 +4409,7 @@ if (enable_java_templates) {
         }
 
         _dex_target_name = "${target_name}__dex"
+
         dex(_dex_target_name) {
           forward_variables_from(invoker,
                                  [
@@ -4367,6 +4459,7 @@ if (enable_java_templates) {
       # Targets might use the generated script while building, so make it a dep
       # rather than a data_dep.
       _java_binary_script_target_name = "${target_name}__java_binary_script"
+
       java_binary_script(_java_binary_script_target_name) {
         forward_variables_from(invoker,
                                [
@@ -4646,6 +4739,7 @@ template("create_android_app_bundle_module") {
 
   if (defined(invoker.expected_libs_and_assets)) {
     _expectations_target = "${invoker.top_target_name}_validate_libs_and_assets"
+
     action_with_pydeps(_expectations_target) {
       _actual_file = "$target_gen_dir/$target_name.libs_and_assets"
       _failure_file = "$expectations_failure_dir/" +

@@ -133,18 +133,15 @@ void JSGenericLowering::ReplaceWithRuntimeCall(Node* node,
   NodeProperties::ChangeOp(node, common()->Call(call_descriptor));
 }
 
-void JSGenericLowering::ReplaceUnaryOpWithBuiltinCall(
-    Node* node, Builtin builtin_without_feedback,
-    Builtin builtin_with_feedback) {
-  DCHECK(JSOperator::IsUnaryWithFeedback(node->opcode()));
-  node->RemoveInput(JSUnaryOpNode::FeedbackVectorIndex());
-  ReplaceWithBuiltinCall(node, builtin_without_feedback);
+void JSGenericLowering::ReplaceUnaryOpWithBuiltinCall(Node* node,
+                                                      Builtin builtin) {
+  DCHECK(JSOperator::IsUnaryWithEmbeddedFeedback(node->opcode()));
+  ReplaceWithBuiltinCall(node, builtin);
 }
 
-#define DEF_UNARY_LOWERING(Name)                                    \
-  void JSGenericLowering::LowerJS##Name(Node* node) {               \
-    ReplaceUnaryOpWithBuiltinCall(node, Builtin::k##Name,           \
-                                  Builtin::k##Name##_WithFeedback); \
+#define DEF_UNARY_LOWERING(Name)                           \
+  void JSGenericLowering::LowerJS##Name(Node* node) {      \
+    ReplaceUnaryOpWithBuiltinCall(node, Builtin::k##Name); \
   }
 DEF_UNARY_LOWERING(BitwiseNot)
 DEF_UNARY_LOWERING(Decrement)
@@ -713,7 +710,6 @@ void JSGenericLowering::LowerJSCreateFunctionContext(Node* node) {
 }
 
 void JSGenericLowering::LowerJSCreateGeneratorObject(Node* node) {
-  node->RemoveInput(4);  // control
   ReplaceWithBuiltinCall(node, Builtin::kCreateGeneratorObject);
 }
 
@@ -762,9 +758,6 @@ void JSGenericLowering::LowerJSGetTemplateObject(Node* node) {
   GetTemplateObjectParameters const& p = n.Parameters();
   SharedFunctionInfoRef shared = p.shared();
   TemplateObjectDescriptionRef description = p.description();
-
-  DCHECK_EQ(node->op()->ControlInputCount(), 1);
-  node->RemoveInput(NodeProperties::FirstControlIndex(node));
 
   static_assert(JSGetTemplateObjectNode::FeedbackVectorIndex() == 0);
   node->InsertInput(zone(), 0, jsgraph()->ConstantNoHole(shared, broker()));

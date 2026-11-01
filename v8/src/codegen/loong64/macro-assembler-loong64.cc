@@ -212,6 +212,15 @@ void MacroAssembler::LoadTaggedRoot(Register destination, RootIndex index) {
   }
 }
 
+void MacroAssembler::StoreTaggedRoot(const MemOperand& destination,
+                                     RootIndex index) {
+  ASM_CODE_COMMENT(this);
+  UseScratchRegisterScope temps(this);
+  Register scratch = temps.Acquire();
+  LoadTaggedRoot(scratch, index);
+  StoreTaggedField(scratch, destination);
+}
+
 void MacroAssembler::LoadCompressedRoot(Register destination, RootIndex index) {
   if (V8_STATIC_ROOTS_BOOL && RootsTable::IsReadOnly(index)) {
     li(destination, (int32_t)ReadOnlyRootPtr(index));
@@ -358,23 +367,14 @@ void MacroAssembler::RecordWriteField(Register object, int offset,
   bind(&done);
 }
 
-void MacroAssembler::DecodeSandboxedPointer(Register value) {
-  ASM_CODE_COMMENT(this);
-#ifdef V8_ENABLE_SANDBOX
-  srli_d(value, value, kSandboxedPointerShift);
-  Add_d(value, value, kPtrComprCageBaseRegister);
-#else
-  UNREACHABLE();
-#endif
-}
-
 void MacroAssembler::LoadSandboxedPointerField(Register destination,
                                                MemOperand field_operand,
                                                int* trap_pc) {
 #ifdef V8_ENABLE_SANDBOX
   ASM_CODE_COMMENT(this);
   Ld_d(destination, field_operand, trap_pc);
-  DecodeSandboxedPointer(destination);
+  srli_d(destination, destination, kSandboxedPointerShift);
+  Add_d(destination, kPtrComprCageBaseRegister, destination);
 #else
   UNREACHABLE();
 #endif
@@ -591,7 +591,11 @@ void MacroAssembler::LoadEntrypointFromJSDispatchTable(Register destination,
 
   Register index = destination;
   Ld_d(scratch, ExternalReferenceAsOperand(IsolateFieldId::kJSDispatchTable));
-  srli_d(index, dispatch_handle, kJSDispatchHandleShift);
+  // JSDispatchHandle is an unsigned 32-bit value. bstrpick.d extracts bits
+  // [31:kJSDispatchHandleShift], zero-extending and shifting right in a single
+  // instruction, so handles with bit 31 set don't produce a negative table
+  // offset.
+  bstrpick_d(index, dispatch_handle, 31, kJSDispatchHandleShift);
   slli_d(destination, index, kJSDispatchTableEntrySizeLog2);
   Add_d(scratch, scratch, destination);
   Ld_d(destination, MemOperand(scratch, JSDispatchEntry::kEntrypointOffset));
@@ -604,7 +608,11 @@ void MacroAssembler::LoadParameterCountFromJSDispatchTable(
 
   Register index = destination;
   Ld_d(scratch, ExternalReferenceAsOperand(IsolateFieldId::kJSDispatchTable));
-  srli_d(index, dispatch_handle, kJSDispatchHandleShift);
+  // JSDispatchHandle is an unsigned 32-bit value. bstrpick.d extracts bits
+  // [31:kJSDispatchHandleShift], zero-extending and shifting right in a single
+  // instruction, so handles with bit 31 set don't produce a negative table
+  // offset.
+  bstrpick_d(index, dispatch_handle, 31, kJSDispatchHandleShift);
   slli_d(destination, index, kJSDispatchTableEntrySizeLog2);
   Add_d(scratch, scratch, destination);
   static_assert(JSDispatchEntry::kParameterCountMask == 0xffff);
@@ -619,13 +627,43 @@ void MacroAssembler::LoadEntrypointAndParameterCountFromJSDispatchTable(
 
   Register index = parameter_count;
   Ld_d(scratch, ExternalReferenceAsOperand(IsolateFieldId::kJSDispatchTable));
-  srli_d(index, dispatch_handle, kJSDispatchHandleShift);
+  // JSDispatchHandle is an unsigned 32-bit value. bstrpick.d extracts bits
+  // [31:kJSDispatchHandleShift], zero-extending and shifting right in a single
+  // instruction, so handles with bit 31 set don't produce a negative table
+  // offset.
+  bstrpick_d(index, dispatch_handle, 31, kJSDispatchHandleShift);
   slli_d(parameter_count, index, kJSDispatchTableEntrySizeLog2);
   Add_d(scratch, scratch, parameter_count);
   Ld_d(entrypoint, MemOperand(scratch, JSDispatchEntry::kEntrypointOffset));
   static_assert(JSDispatchEntry::kParameterCountMask == 0xffff);
   Ld_hu(parameter_count,
         MemOperand(scratch, JSDispatchEntry::kCodeObjectOffset));
+}
+
+void MacroAssembler::PushDispatchHandle(Register dispatch_handle,
+                                        Register scratch1, Register scratch2) {
+  DCHECK(!AreAliased(dispatch_handle, scratch1, scratch2));
+#ifdef V8_ENABLE_SANDBOX
+  AssertZeroExtended(dispatch_handle);
+  LoadParameterCountFromJSDispatchTable(scratch1, dispatch_handle, scratch2);
+  bstrins_d(dispatch_handle, scratch1, 63, 32);
+#endif
+  Push(dispatch_handle);
+  // No need to SmiTag since dispatch handles always look like Smis.
+  static_assert(kJSDispatchHandleShift > 0);
+  AssertSmi(dispatch_handle);
+}
+
+void MacroAssembler::PopDispatchHandle(Register dispatch_handle,
+                                       Register scratch1, Register scratch2) {
+  DCHECK(!AreAliased(dispatch_handle, scratch1, scratch2));
+  Pop(dispatch_handle);
+#ifdef V8_ENABLE_SANDBOX
+  LoadParameterCountFromJSDispatchTable(scratch1, dispatch_handle, scratch2);
+  bstrpick_d(scratch2, dispatch_handle, 63, 32);
+  bstrpick_d(dispatch_handle, dispatch_handle, 31, 0);
+  SbxCheck(eq, AbortReason::kJSSignatureMismatch, scratch1, Operand(scratch2));
+#endif
 }
 
 void MacroAssembler::LoadProtectedPointerField(Register destination,
@@ -914,7 +952,6 @@ void MacroAssembler::Sub_w(Register rd, Register rj, const Operand& rk) {
   if (rk.is_reg()) {
     sub_w(rd, rj, rk.rm());
   } else {
-    DCHECK(is_int32(rk.immediate()));
     if (is_int12(-rk.immediate()) && !MustUseReg(rk.rmode())) {
       // No subi_w instr, use addi_w(x, y, -imm).
       addi_w(rd, rj, static_cast<int32_t>(-rk.immediate()));
@@ -926,7 +963,12 @@ void MacroAssembler::Sub_w(Register rd, Register rj, const Operand& rk) {
         // Use load -imm and addu when loading -imm generates one instruction.
         li(scratch, -rk.immediate());
         add_w(rd, rj, scratch);
+      } else if (RelocInfo::IsFullEmbeddedObject(rk.rmode())) {
+        li(scratch,
+           Operand(rk.immediate(), RelocInfo::COMPRESSED_EMBEDDED_OBJECT));
+        sub_w(rd, rj, scratch);
       } else {
+        DCHECK(is_int32(rk.immediate()));
         // li handles the relocation.
         li(scratch, rk);
         sub_w(rd, rj, scratch);
@@ -1147,16 +1189,26 @@ void MacroAssembler::And(Register rd, Register rj, const Operand& rk) {
   if (rk.is_reg()) {
     and_(rd, rj, rk.rm());
   } else {
-    if (is_uint12(rk.immediate()) && !MustUseReg(rk.rmode())) {
-      andi(rd, rj, static_cast<int32_t>(rk.immediate()));
-    } else {
-      // li handles the relocation.
-      UseScratchRegisterScope temps(this);
-      Register scratch = temps.Acquire();
-      DCHECK(rj != scratch);
-      li(scratch, rk);
-      and_(rd, rj, scratch);
+    if (!MustUseReg(rk.rmode())) {
+      uint64_t mask = rk.immediate();
+      if (is_uint12(mask)) {
+        andi(rd, rj, static_cast<int32_t>(rk.immediate()));
+        return;
+      }
+      uint64_t mask_width = base::bits::CountPopulation(mask);
+      uint64_t mask_clz = base::bits::CountLeadingZeros64(mask);
+      if ((mask_width != 0) && ((mask_width + mask_clz) == 64)) {
+        bstrpick_d(rd, rj, mask_width - 1, 0);
+        return;
+      }
     }
+
+    // li handles the relocation.
+    UseScratchRegisterScope temps(this);
+    Register scratch = temps.Acquire();
+    DCHECK(rj != scratch);
+    li(scratch, rk);
+    and_(rd, rj, scratch);
   }
 }
 
@@ -1236,6 +1288,32 @@ void MacroAssembler::Orn(Register rd, Register rj, const Operand& rk) {
 void MacroAssembler::Neg(Register rj, const Operand& rk) {
   DCHECK(rk.is_reg());
   sub_d(rj, zero_reg, rk.rm());
+}
+
+// Performs a bitwise test on rj with mask rk.
+// NOTE: When rk is an immediate exceeding uint12 range and forms a contiguous
+// bitmask with trailing zeros (mask_ctz > 0), Tst() optimizes using bstrpick_d.
+// In this case, the value saved to 'rd' differs from 'And':
+// E.g., for rj = 0x30000 and mask rk = 0x30000 (mask_ctz = 16, > uint12):
+//   - And(): rd = 0x30000 (bitwise AND value)
+//   - Tst(): rd = 0x3     (extracted field value via bstrpick_d)
+// Registers or uint12 immediates fall back to And(). In all cases, rd == 0 if
+// and only if (rj & rk) == 0, making it safe for conditional branch testing
+// (eq/ne).
+void MacroAssembler::Tst(Register rd, Register rj, const Operand& rk) {
+  if (rk.is_reg() || is_uint12(rk.immediate())) {
+    And(rd, rj, rk);
+  } else {
+    uint64_t mask = rk.immediate();
+    uint64_t mask_width = base::bits::CountPopulation(mask);
+    uint64_t mask_clz = base::bits::CountLeadingZeros64(mask);
+    uint64_t mask_ctz = base::bits::CountTrailingZeros64(mask);
+    if ((mask_width != 0) && ((mask_width + mask_clz + mask_ctz) == 64)) {
+      bstrpick_d(rd, rj, mask_width + mask_ctz - 1, mask_ctz);
+    } else {
+      And(rd, rj, rk);
+    }
+  }
 }
 
 void MacroAssembler::Slt(Register rd, Register rj, const Operand& rk) {
@@ -1381,8 +1459,10 @@ void MacroAssembler::Rotr_d(Register rd, Register rj, const Operand& rk) {
 }
 
 void MacroAssembler::Alsl_w(Register rd, Register rj, Register rk, uint8_t sa) {
-  DCHECK(sa >= 1 && sa <= 31);
-  if (sa <= 4) {
+  DCHECK(sa >= 0 && sa <= 31);
+  if (sa == 0) {
+    add_w(rd, rj, rk);
+  } else if (sa <= 4) {
     alsl_w(rd, rj, rk, sa);
   } else {
     UseScratchRegisterScope temps(this);
@@ -1394,8 +1474,10 @@ void MacroAssembler::Alsl_w(Register rd, Register rj, Register rk, uint8_t sa) {
 }
 
 void MacroAssembler::Alsl_d(Register rd, Register rj, Register rk, uint8_t sa) {
-  DCHECK(sa >= 1 && sa <= 63);
-  if (sa <= 4) {
+  DCHECK(sa >= 0 && sa <= 63);
+  if (sa == 0) {
+    add_d(rd, rj, rk);
+  } else if (sa <= 4) {
     alsl_d(rd, rj, rk, sa);
   } else {
     UseScratchRegisterScope temps(this);
@@ -1747,7 +1829,11 @@ void MacroAssembler::li(Register dst, Handle<HeapObject> value,
     IndirectLoadConstant(dst, value);
     return;
   }
-  li(dst, Operand(value), mode);
+  if (rmode == RelocInfo::COMPRESSED_EMBEDDED_OBJECT) {
+    li(dst, Operand(value, rmode), mode);
+  } else {
+    li(dst, Operand(value), mode);
+  }
 }
 
 void MacroAssembler::li(Register dst, ExternalReference reference,
@@ -3643,27 +3729,32 @@ void MacroAssembler::CompareTaggedAndBranch(Label* label, Condition cond,
   if (COMPRESS_POINTERS_BOOL) {
     UseScratchRegisterScope temps(this);
     Register scratch0 = temps.Acquire();
-    slli_w(scratch0, r1, 0);
-    if (IsZero(r2)) {
+    if (cond == eq || cond == ne) {
+      Sub_w(scratch0, r1, r2);
       Branch(label, cond, scratch0, Operand(zero_reg), need_link);
     } else {
-      Register scratch1 = temps.Acquire();
-      if (r2.is_reg()) {
-        slli_w(scratch1, r2.rm(), 0);
+      slli_w(scratch0, r1, 0);
+      if (IsZero(r2)) {
+        Branch(label, cond, scratch0, Operand(zero_reg), need_link);
       } else {
-        if (RelocInfo::IsFullEmbeddedObject(r2.rmode())) {
-          li(scratch1,
-             Operand(r2.immediate(), RelocInfo::COMPRESSED_EMBEDDED_OBJECT));
-        } else if (RelocInfo::IsCompressedEmbeddedObject(r2.rmode())) {
-          li(scratch1, r2);
-        } else if (RelocInfo::IsNoInfo(r2.rmode())) {
-          LiLower32BitHelper(scratch1, r2);
+        Register scratch1 = temps.Acquire();
+        if (r2.is_reg()) {
+          slli_w(scratch1, r2.rm(), 0);
         } else {
-          li(scratch1, r2);
-          slli_w(scratch1, scratch1, 0);
+          if (RelocInfo::IsFullEmbeddedObject(r2.rmode())) {
+            li(scratch1,
+               Operand(r2.immediate(), RelocInfo::COMPRESSED_EMBEDDED_OBJECT));
+          } else if (RelocInfo::IsCompressedEmbeddedObject(r2.rmode())) {
+            li(scratch1, r2);
+          } else if (RelocInfo::IsNoInfo(r2.rmode())) {
+            LiLower32BitHelper(scratch1, r2);
+          } else {
+            li(scratch1, r2);
+            slli_w(scratch1, scratch1, 0);
+          }
         }
+        Branch(label, cond, scratch0, Operand(scratch1), need_link);
       }
-      Branch(label, cond, scratch0, Operand(scratch1), need_link);
     }
   } else {
     Branch(label, cond, r1, r2, need_link);
@@ -3847,6 +3938,7 @@ void MacroAssembler::Call(Register target, Condition cond, Register rj,
 void MacroAssembler::CompareTaggedRootAndBranch(const Register& obj,
                                                 RootIndex index, Condition cc,
                                                 Label* target) {
+  DCHECK(cc == eq || cc == ne);
   ASM_CODE_COMMENT(this);
   AssertSmiOrHeapObjectInMainCompressionCage(obj);
   UseScratchRegisterScope temps(this);
@@ -3875,6 +3967,7 @@ void MacroAssembler::CompareTaggedRootAndBranch(const Register& obj,
 void MacroAssembler::CompareRootAndBranch(const Register& obj, RootIndex index,
                                           Condition cc, Label* target,
                                           ComparisonMode mode) {
+  DCHECK(cc == eq || cc == ne);
   ASM_CODE_COMMENT(this);
   if (mode == ComparisonMode::kFullPointer ||
       !base::IsInRange(index, RootIndex::kFirstStrongOrReadOnlyRoot,
@@ -4486,8 +4579,8 @@ void MacroAssembler::InvokeFunctionCode(
   DCHECK_IMPLIES(new_target.is_valid(), new_target == a3);
 
   Register dispatch_handle = kJavaScriptCallDispatchHandleRegister;
-  Ld_w(dispatch_handle,
-       FieldMemOperand(function, offsetof(JSFunction, dispatch_handle_)));
+  Ld_wu(dispatch_handle,
+        FieldMemOperand(function, offsetof(JSFunction, dispatch_handle_)));
 
   // On function call, call into the debugger if necessary.
   Label debug_hook, continue_after_hook;
@@ -4594,30 +4687,46 @@ void MacroAssembler::AddOverflow_d(Register dst, Register left,
   BlockTrampolinePoolScope block_trampoline_pool(this);
   UseScratchRegisterScope temps(this);
   Register scratch = temps.Acquire();
-  Register scratch2 = temps.Acquire();
-  Register right_reg = no_reg;
   if (!right.is_reg()) {
-    li(scratch, Operand(right));
-    right_reg = scratch;
-  } else {
-    right_reg = right.rm();
+    int64_t imm = right.immediate();
+    DCHECK(!AreAliased(overflow, dst));
+    if (dst == left) {
+      mov(scratch, left);
+      left = scratch;
+    }
+    Add_d(dst, left, right);
+    if (imm > 0) {
+      Slt(overflow, dst, left);
+    } else {
+      Sgt(overflow, dst, left);
+    }
+    return;
   }
 
+  Register right_reg = right.rm();
+  Register scratch2 = temps.Acquire();
+  DCHECK(left != scratch && right_reg != scratch && dst != scratch &&
+         overflow != scratch);
   DCHECK(left != scratch2 && right_reg != scratch2 && dst != scratch2 &&
          overflow != scratch2);
-  DCHECK(overflow != left && overflow != right_reg);
 
-  if (dst == left || dst == right_reg) {
-    add_d(scratch2, left, right_reg);
-    xor_(overflow, scratch2, left);
-    xor_(scratch, scratch2, right_reg);
-    and_(overflow, overflow, scratch);
-    mov(dst, scratch2);
-  } else {
+  if (dst != left) {
+    slti(scratch, right_reg, 0);
     add_d(dst, left, right_reg);
-    xor_(overflow, dst, left);
-    xor_(scratch, dst, right_reg);
-    and_(overflow, overflow, scratch);
+    slt(scratch2, dst, left);
+    xor_(overflow, scratch, scratch2);
+  } else if (left != right_reg) {
+    // dst == left
+    slti(scratch, left, 0);
+    add_d(dst, right_reg, left);
+    slt(scratch2, dst, right_reg);
+    xor_(overflow, scratch, scratch2);
+  } else {
+    // dst == left == right_reg
+    add_d(scratch2, left, left);
+    xor_(overflow, scratch2, left);
+    slti(overflow, overflow, 0);
+    mov(dst, scratch2);
   }
 }
 
@@ -4627,31 +4736,30 @@ void MacroAssembler::SubOverflow_d(Register dst, Register left,
   BlockTrampolinePoolScope block_trampoline_pool(this);
   UseScratchRegisterScope temps(this);
   Register scratch = temps.Acquire();
-  Register scratch2 = temps.Acquire();
-  Register right_reg = no_reg;
   if (!right.is_reg()) {
-    li(scratch, Operand(right));
-    right_reg = scratch;
-  } else {
-    right_reg = right.rm();
+    int64_t imm = right.immediate();
+    if (dst == left) {
+      mov(scratch, left);
+      left = scratch;
+    }
+    Sub_d(dst, left, right);
+    if (imm < 0) {
+      Slt(overflow, dst, left);
+    } else {
+      Sgt(overflow, dst, left);
+    }
+    return;
   }
 
+  Register right_reg = right.rm();
+  Register scratch2 = temps.Acquire();
   DCHECK(left != scratch2 && right_reg != scratch2 && dst != scratch2 &&
          overflow != scratch2);
-  DCHECK(overflow != left && overflow != right_reg);
 
-  if (dst == left || dst == right_reg) {
-    Sub_d(scratch2, left, right_reg);
-    xor_(overflow, left, scratch2);
-    xor_(scratch, left, right_reg);
-    and_(overflow, overflow, scratch);
-    mov(dst, scratch2);
-  } else {
-    sub_d(dst, left, right_reg);
-    xor_(overflow, left, dst);
-    xor_(scratch, left, right_reg);
-    and_(overflow, overflow, scratch);
-  }
+  slt(scratch2, left, right_reg);
+  sub_d(dst, left, right_reg);
+  slti(overflow, dst, 0);
+  xor_(overflow, overflow, scratch2);
 }
 
 void MacroAssembler::MulOverflow_w(Register dst, Register left,
@@ -4669,21 +4777,12 @@ void MacroAssembler::MulOverflow_w(Register dst, Register left,
     right_reg = right.rm();
   }
 
-  DCHECK(left != scratch2 && right_reg != scratch2 && dst != scratch2 &&
-         overflow != scratch2);
-  DCHECK(overflow != left && overflow != right_reg);
+  DCHECK(dst != scratch2);
 
-  if (dst == left || dst == right_reg) {
-    Mul_w(scratch2, left, right_reg);
-    Mulh_w(overflow, left, right_reg);
-    mov(dst, scratch2);
-  } else {
-    Mul_w(dst, left, right_reg);
-    Mulh_w(overflow, left, right_reg);
-  }
-
-  srai_d(scratch2, dst, 32);
-  xor_(overflow, overflow, scratch2);
+  mulw_d_w(scratch2, left, right_reg);
+  slli_w(dst, scratch2, 0);
+  xor_(scratch2, scratch2, dst);
+  sltu(overflow, zero_reg, scratch2);
 }
 
 void MacroAssembler::MulOverflow_d(Register dst, Register left,
@@ -4703,19 +4802,13 @@ void MacroAssembler::MulOverflow_d(Register dst, Register left,
 
   DCHECK(left != scratch2 && right_reg != scratch2 && dst != scratch2 &&
          overflow != scratch2);
-  DCHECK(overflow != left && overflow != right_reg);
 
-  if (dst == left || dst == right_reg) {
-    Mul_d(scratch2, left, right_reg);
-    Mulh_d(overflow, left, right_reg);
-    mov(dst, scratch2);
-  } else {
-    Mul_d(dst, left, right_reg);
-    Mulh_d(overflow, left, right_reg);
-  }
+  Mulh_d(scratch2, left, right_reg);
+  Mul_d(dst, left, right_reg);
 
-  srai_d(scratch2, dst, 63);
+  srai_d(overflow, dst, 63);
   xor_(overflow, overflow, scratch2);
+  sltu(overflow, zero_reg, overflow);
 }
 
 void MacroAssembler::CallRuntime(const Runtime::Function* f,
@@ -5839,7 +5932,7 @@ void MacroAssembler::CallJSFunction(Register function_object,
   Register parameter_count = s1;
   Register scratch = s2;
 
-  Ld_w(
+  Ld_wu(
       dispatch_handle,
       FieldMemOperand(function_object, offsetof(JSFunction, dispatch_handle_)));
   LoadEntrypointAndParameterCountFromJSDispatchTable(code, parameter_count,
@@ -5857,6 +5950,8 @@ void MacroAssembler::CallJSDispatchEntry(JSDispatchHandle dispatch_handle,
   Register scratch = s1;
   li(kJavaScriptCallDispatchHandleRegister,
      Operand(dispatch_handle.value(), RelocInfo::JS_DISPATCH_HANDLE));
+  bstrpick_d(kJavaScriptCallDispatchHandleRegister,
+             kJavaScriptCallDispatchHandleRegister, 31, 0);
   LoadEntrypointFromJSDispatchTable(code, kJavaScriptCallDispatchHandleRegister,
                                     scratch);
   CHECK_EQ(argument_count,
@@ -5986,10 +6081,7 @@ void MacroAssembler::GenerateTailCallToReturnedCode(
     Push(kJavaScriptCallTargetRegister, kJavaScriptCallNewTargetRegister,
          kJavaScriptCallArgCountRegister);
 #ifdef V8_JS_LINKAGE_INCLUDES_DISPATCH_HANDLE
-    // No need to SmiTag since dispatch handles always look like Smis.
-    static_assert(kJSDispatchHandleShift > 0);
-    AssertSmi(kJavaScriptCallDispatchHandleRegister);
-    Push(kJavaScriptCallDispatchHandleRegister);
+    PushDispatchHandle(kJavaScriptCallDispatchHandleRegister, a5, a6);
 #endif
     // Function is also the parameter to the runtime call.
     Push(kJavaScriptCallTargetRegister);
@@ -5999,7 +6091,7 @@ void MacroAssembler::GenerateTailCallToReturnedCode(
     // Restore target function, new target, actual argument count and dispatch
     // handle.
 #ifdef V8_JS_LINKAGE_INCLUDES_DISPATCH_HANDLE
-    Pop(kJavaScriptCallDispatchHandleRegister);
+    PopDispatchHandle(kJavaScriptCallDispatchHandleRegister, a5, a6);
 #endif
     Pop(kJavaScriptCallTargetRegister, kJavaScriptCallNewTargetRegister,
         kJavaScriptCallArgCountRegister);
@@ -6090,18 +6182,18 @@ void MacroAssembler::DecompressTagged(Register dst, const MemOperand& src,
                                       int* trap_pc) {
   ASM_CODE_COMMENT(this);
   Ld_wu(dst, src, trap_pc);
-  Add_d(dst, kPtrComprCageBaseRegister, dst);
+  or_(dst, kPtrComprCageBaseRegister, dst);
 }
 
 void MacroAssembler::DecompressTagged(Register dst, Register src) {
   ASM_CODE_COMMENT(this);
   Bstrpick_d(dst, src, 31, 0);
-  Add_d(dst, kPtrComprCageBaseRegister, Operand(dst));
+  or_(dst, kPtrComprCageBaseRegister, dst);
 }
 
 void MacroAssembler::DecompressTagged(Register dst, Tagged_t immediate) {
   ASM_CODE_COMMENT(this);
-  Add_d(dst, kPtrComprCageBaseRegister, static_cast<int32_t>(immediate));
+  Or(dst, kPtrComprCageBaseRegister, Operand(immediate));
 }
 
 void MacroAssembler::DecompressProtected(const Register& destination,
@@ -6139,7 +6231,7 @@ void MacroAssembler::AtomicDecompressTagged(Register dst, const MemOperand& src,
   ASM_CODE_COMMENT(this);
   Ld_wu(dst, src, trap_pc);
   dbar(0);
-  Add_d(dst, kPtrComprCageBaseRegister, dst);
+  or_(dst, kPtrComprCageBaseRegister, dst);
 }
 
 // Calls an API function. Allocates HandleScope, extracts returned value

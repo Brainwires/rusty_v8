@@ -356,7 +356,7 @@ class BytecodeGenerator final : public AstVisitor<BytecodeGenerator> {
   bool VariableNeedsHoleCheckInCurrentBlockForAssignment(
       Variable* variable, Token::Value op, HoleCheckMode hole_check_mode);
   void BuildHoleCheckForVariableAssignment(Variable* variable, Token::Value op);
-  void BuildThrowIfHole(Variable* variable);
+  void BuildThrowIfTdzHole(Variable* variable);
 
   void BuildNewLocalActivationContext();
   void BuildLocalActivationContextInitialization();
@@ -397,7 +397,6 @@ class BytecodeGenerator final : public AstVisitor<BytecodeGenerator> {
                                   Register index, Register value,
                                   FeedbackSlot next_value_slot,
                                   FeedbackSlot next_done_slot,
-                                  FeedbackSlot index_slot,
                                   FeedbackSlot element_slot);
   // Create Array literals. |expr| can be nullptr, but if provided,
   // a boilerplate will be used to create an initial array for elements

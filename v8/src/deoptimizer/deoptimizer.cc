@@ -501,7 +501,7 @@ void Deoptimizer::DeoptimizeFunction(Tagged<JSFunction> function,
   TimerEventScope<TimerEventDeoptimizeCode> timer(isolate);
   TRACE_EVENT("v8", "V8.DeoptimizeCode");
   function->ResetIfCodeFlushed(isolate);
-  if (code.is_null()) code = function->code(isolate);
+  DCHECK(!code.is_null());
 
   if (CodeKindCanDeoptimize(code->kind())) {
     // Mark the code for deoptimization and unlink any functions that also
@@ -731,6 +731,13 @@ Deoptimizer::Deoptimizer(Isolate* isolate, Tagged<JSFunction> function,
   DCHECK_WITH_SANDBOX_ACCESS(IsJSFunction(function));
   CHECK(CodeKindCanDeoptimize(compiled_code_->kind()));
   {
+    // Logging the deopt event prints the name and source position of the
+    // deoptimizing function, which are read from the in-sandbox
+    // SharedFunctionInfo and Script. This only affects the log output and
+    // cannot influence the deoptimization itself.
+    AllowSandboxAccess sandbox_access(
+        "Logging the deopt event reads the script name and source position of "
+        "the deoptimizing function.");
     HandleScope scope(isolate_);
     PROFILE(isolate_, CodeDeoptEvent(direct_handle(compiled_code_, isolate_),
                                      kind, from_, fp_to_sp_delta_));
@@ -936,15 +943,9 @@ void Deoptimizer::TraceMarkForDeoptimization(Isolate* isolate,
            DeoptimizeReasonToString(reason));
   }
   if (!v8_flags.log_deopt) return;
-  no_gc.Release();
-  {
-    HandleScope handle_scope(isolate);
-    PROFILE(isolate,
-            CodeDependencyChangeEvent(
-                direct_handle(code, isolate),
-                direct_handle(deopt_data->GetSharedFunctionInfo(), isolate),
-                DeoptimizeReasonToString(reason)));
-  }
+  PROFILE(isolate,
+          CodeDependencyChangeEvent(code, deopt_data->GetSharedFunctionInfo(),
+                                    DeoptimizeReasonToString(reason)));
 }
 
 // static
@@ -1546,7 +1547,8 @@ void Deoptimizer::DoComputeOutputFramesWasmImpl() {
   // code generator).
   // Note that we explicitly allow deopts to exceed the limit by a certain
   // number of slack bytes.
-  CHECK_GT(
+  // GE and not GT because the runtime stack check allows SP == stack limit.
+  CHECK_GE(
       static_cast<uintptr_t>(caller_frame_top_) - total_output_frame_size,
       stack_guard->real_jslimit() - kStackLimitSlackForDeoptimizationInBytes);
 }
@@ -1939,7 +1941,8 @@ void Deoptimizer::DoComputeOutputFrames() {
   // code generator).
   // Note that we explicitly allow deopts to exceed the limit by a certain
   // number of slack bytes.
-  CHECK_GT(
+  // GE and not GT because the runtime stack check allows SP == stack limit.
+  CHECK_GE(
       static_cast<uintptr_t>(caller_frame_top_) - total_output_frame_size,
       stack_guard->real_jslimit() - kStackLimitSlackForDeoptimizationInBytes);
 }

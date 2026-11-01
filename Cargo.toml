@@ -12,7 +12,7 @@
 [package]
 edition = "2024"
 name = "v8"
-version = "152.2.1+denext.1"
+version = "156.0.0+denext.1"
 authors = ["the Deno authors"]
 build = "build.rs"
 exclude = [
@@ -202,6 +202,10 @@ path = "tests/test_simple_external.rs"
 [[test]]
 name = "test_single_threaded_default_platform"
 path = "tests/test_single_threaded_default_platform.rs"
+
+[[test]]
+name = "test_snapshot_creator_concurrent_isolates"
+path = "tests/test_snapshot_creator_concurrent_isolates.rs"
 
 [[test]]
 name = "test_ui"

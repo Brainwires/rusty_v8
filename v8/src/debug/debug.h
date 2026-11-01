@@ -27,6 +27,8 @@ namespace internal {
 // Forward declarations.
 class AbstractCode;
 class DebugScope;
+class DebugScriptScopeInfo;
+class EphemeronHashTable;
 class InterpretedFrame;
 class JavaScriptFrame;
 class JSGeneratorObject;
@@ -350,7 +352,7 @@ class V8_EXPORT_PRIVATE Debug {
 
   // Returns whether the operation succeeded.
   bool EnsureBreakInfo(Handle<SharedFunctionInfo> shared);
-  void CreateBreakInfo(DirectHandle<SharedFunctionInfo> shared);
+  bool CreateBreakInfo(DirectHandle<SharedFunctionInfo> shared);
   Handle<DebugInfo> GetOrCreateDebugInfo(
       DirectHandle<SharedFunctionInfo> shared);
 
@@ -381,14 +383,6 @@ class V8_EXPORT_PRIVATE Debug {
 
   // Walks the call stack to see if any frames are not ignore listed.
   bool AllFramesOnStackAreBlackboxed();
-
-  // Set new script source, throw an exception if error occurred. When preview
-  // is true: try to set source, throw exception if any without actual script
-  // change. stack_changed is true if after editing script on pause stack is
-  // changed and client should request stack trace again.
-  bool SetScriptSource(Handle<Script> script, Handle<String> source,
-                       bool preview, bool allow_top_frame_live_editing,
-                       debug::LiveEditResult* result);
 
   int GetFunctionDebuggingId(DirectHandle<JSFunction> function);
 
@@ -506,6 +500,12 @@ class V8_EXPORT_PRIVATE Debug {
 
   bool IsTemporaryObject(DirectHandle<HeapObject> object) const;
 
+  DirectHandle<DebugScriptScopeInfo> GetScriptScopeInfo(
+      DirectHandle<Script> script);
+  void SetScriptScopeInfo(DirectHandle<Script> script,
+                          DirectHandle<DebugScriptScopeInfo> info);
+  void ClearScriptScopeInfos();
+
  private:
   explicit Debug(Isolate* isolate);
   ~Debug();
@@ -606,8 +606,6 @@ class V8_EXPORT_PRIVATE Debug {
   bool hook_on_function_call_;
   // Suppress debug events.
   bool is_suppressed_;
-  // Running liveedit.
-  bool running_live_edit_ = false;
   // Do not trigger debug break events.
   bool break_disabled_;
   // Do not break on break points.
@@ -710,6 +708,10 @@ class V8_EXPORT_PRIVATE Debug {
   IndirectHandle<WeakArrayList> wasm_scripts_with_break_points_;
 #endif  // V8_ENABLE_WEBASSEMBLY
 
+  // Ephemeron table caching DebugScriptScopeInfo for Scripts.
+  // This is a global handle, lazily initialized.
+  IndirectHandle<EphemeronHashTable> script_scope_infos_;
+
   // This is a part of machinery for allowing to ignore side effects for one
   // call to this API function. See Function::NewInstanceWithSideEffectType().
   // Since the FunctionTemplateInfo is allowlisted right before the call to
@@ -728,7 +730,6 @@ class V8_EXPORT_PRIVATE Debug {
   friend class DebugScope;
   friend class DisableBreak;
   friend class DisableTemporaryObjectTracking;
-  friend class LiveEdit;
   friend class SuppressDebug;
 
   friend DirectHandle<ProtectedFixedArray>

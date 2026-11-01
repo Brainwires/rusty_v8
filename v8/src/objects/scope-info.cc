@@ -47,7 +47,7 @@ bool NameToIndexHashTableEquals(Tagged<NameToIndexHashTable> a,
 }  // namespace
 
 // TODO(crbug.com/401059828): make it DEBUG only, once investigation is over.
-bool ScopeInfo::Equals(Tagged<ScopeInfo> other, bool is_live_edit_compare,
+bool ScopeInfo::Equals(Tagged<ScopeInfo> other,
                        int* out_last_checked_field) const {
   if (length() != other->length()) return false;
   // Fixed header fields.
@@ -57,20 +57,14 @@ bool ScopeInfo::Equals(Tagged<ScopeInfo> other, bool is_live_edit_compare,
   if (out_last_checked_field) *out_last_checked_field = kParameterCount;
   if (context_local_count() != other->context_local_count()) return false;
   if (out_last_checked_field) *out_last_checked_field = kContextLocalCount;
-  if (!is_live_edit_compare) {
-    if (position_info_start() != other->position_info_start()) return false;
-    if (out_last_checked_field) *out_last_checked_field = kPositionInfoStart;
-    if (position_info_end() != other->position_info_end()) return false;
-    if (out_last_checked_field) *out_last_checked_field = kPositionInfoEnd;
-  }
+  if (position_info_start() != other->position_info_start()) return false;
+  if (out_last_checked_field) *out_last_checked_field = kPositionInfoStart;
+  if (position_info_end() != other->position_info_end()) return false;
+  if (out_last_checked_field) *out_last_checked_field = kPositionInfoEnd;
   // Variable-part tail.
-  const int inferred_function_name_index = InferredFunctionNameIndex();
   for (int index = 0; index < length(); ++index) {
     if (out_last_checked_field) {
       *out_last_checked_field = kVariablePartStart + index;
-    }
-    if (is_live_edit_compare && index == inferred_function_name_index) {
-      continue;
     }
     Tagged<Object> entry = get(index);
     Tagged<Object> other_entry = other->get(index);
@@ -86,13 +80,11 @@ bool ScopeInfo::Equals(Tagged<ScopeInfo> other, bool is_live_edit_compare,
           return false;
         }
       } else if (IsScopeInfo(entry)) {
-        if (!is_live_edit_compare && !Cast<ScopeInfo>(entry)->Equals(
-                                         Cast<ScopeInfo>(other_entry), false)) {
+        if (!Cast<ScopeInfo>(entry)->Equals(Cast<ScopeInfo>(other_entry))) {
           return false;
         }
       } else if (IsSourceTextModuleInfo(entry)) {
-        if (!is_live_edit_compare &&
-            !Cast<SourceTextModuleInfo>(entry)->Equals(
+        if (!Cast<SourceTextModuleInfo>(entry)->Equals(
                 Cast<SourceTextModuleInfo>(other_entry))) {
           return false;
         }
@@ -103,9 +95,6 @@ bool ScopeInfo::Equals(Tagged<ScopeInfo> other, bool is_live_edit_compare,
         }
       } else if (IsDependentCode(entry)) {
         DCHECK(IsDependentCode(other_entry));
-        // Ignore the dependent code field since all the code have to be
-        // deoptimized anyway in case of a live-edit.
-
       } else if (IsNameToIndexHashTable(entry)) {
         if (!NameToIndexHashTableEquals(
                 Cast<NameToIndexHashTable>(entry),
@@ -123,8 +112,7 @@ bool ScopeInfo::Equals(Tagged<ScopeInfo> other, bool is_live_edit_compare,
 // static
 template <typename IsolateT>
 Handle<ScopeInfo> ScopeInfo::Create(IsolateT* isolate, Zone* zone, Scope* scope,
-                                    MaybeDirectHandle<ScopeInfo> outer_scope,
-                                    FunctionKind closure_function_kind) {
+                                    MaybeDirectHandle<ScopeInfo> outer_scope) {
   // Collect variables.
   int context_local_count = 0;
   int module_vars_count = 0;
@@ -226,8 +214,10 @@ Handle<ScopeInfo> ScopeInfo::Create(IsolateT* isolate, Zone* zone, Scope* scope,
                                             scope->AsModuleScope()->module());
   }
 
+  FunctionKind function_kind = FunctionKind::kNormalFunction;
   bool sloppy_eval_can_extend_vars = false;
   if (scope->is_declaration_scope()) {
+    function_kind = scope->AsDeclarationScope()->function_kind();
     sloppy_eval_can_extend_vars =
         scope->AsDeclarationScope()->sloppy_eval_can_extend_vars();
   }
@@ -237,6 +227,12 @@ Handle<ScopeInfo> ScopeInfo::Create(IsolateT* isolate, Zone* zone, Scope* scope,
       has_inlined_local_names ? context_local_count : 1;
 
   const int has_dependent_code = sloppy_eval_can_extend_vars;
+  // Module scopes with many module variables also carry a name -> entry
+  // hash table so ModuleIndex() need not scan the entries linearly (same
+  // threshold as the context-local names hashtable).
+  const bool has_module_vars_hashtable =
+      scope->is_module_scope() &&
+      module_vars_count >= kScopeInfoMaxInlinedLocalNamesSize;
   const int length =
       local_names_container_size + context_local_count +
       (should_save_class_variable ? 1 : 0) +
@@ -245,13 +241,19 @@ Handle<ScopeInfo> ScopeInfo::Create(IsolateT* isolate, Zone* zone, Scope* scope,
       (scope->is_module_scope()
            ? 2 + kModuleVariableEntryLength * module_vars_count
            : 0) +
-      (has_dependent_code ? 1 : 0) + (scope->is_function_scope() ? 1 : 0);
+      (has_module_vars_hashtable ? 1 : 0) + (has_dependent_code ? 1 : 0) +
+      (scope->is_function_scope() ? 1 : 0);
 
   // Create hash table if local names are not inlined.
   Handle<NameToIndexHashTable> local_names_hashtable;
   if (!has_inlined_local_names) {
     local_names_hashtable = NameToIndexHashTable::New(
         isolate, context_local_count, AllocationType::kOld);
+  }
+  Handle<NameToIndexHashTable> module_vars_hashtable;
+  if (has_module_vars_hashtable) {
+    module_vars_hashtable = NameToIndexHashTable::New(
+        isolate, module_vars_count, AllocationType::kOld);
   }
 
   Handle<ScopeInfo> scope_info_handle =
@@ -281,7 +283,7 @@ Handle<ScopeInfo> ScopeInfo::Create(IsolateT* isolate, Zone* zone, Scope* scope,
         FunctionVariableBits::encode(function_name_info) |
         HasInferredFunctionNameBit::encode(has_inferred_function_name) |
         HasSimpleParametersBit::encode(has_simple_parameters) |
-        FunctionKindBits::encode(closure_function_kind) |
+        FunctionKindBits::encode(function_kind) |
         HasOuterScopeInfoBit::encode(has_outer_scope_info) |
         IsDebugEvaluateScopeBit::encode(false) |
         ForceContextAllocationBit::encode(
@@ -315,6 +317,7 @@ Handle<ScopeInfo> ScopeInfo::Create(IsolateT* isolate, Zone* zone, Scope* scope,
     int context_local_info_base =
         context_local_base + local_names_container_size;
     int module_var_entry = scope_info->ModuleVariablesIndex();
+    int module_var_number = 0;
 
     for (Variable* var : *scope->locals()) {
       switch (var->location()) {
@@ -388,7 +391,16 @@ Handle<ScopeInfo> ScopeInfo::Create(IsolateT* isolate, Zone* zone, Scope* scope,
               module_var_entry +
                   offsetof(ModuleVariableInfo, properties) / kTaggedSize,
               Smi::FromInt(properties));
+          if (has_module_vars_hashtable) {
+            // The table was sized for module_vars_count entries, so Add()
+            // never reallocates (and thus never allocates under no_gc).
+            Handle<NameToIndexHashTable> new_table = NameToIndexHashTable::Add(
+                isolate, module_vars_hashtable, var->name(), module_var_number);
+            DCHECK_EQ(*new_table, *module_vars_hashtable);
+            USE(new_table);
+          }
           module_var_entry += kModuleVariableEntryLength;
+          ++module_var_number;
           break;
         }
         default:
@@ -467,6 +479,13 @@ Handle<ScopeInfo> ScopeInfo::Create(IsolateT* isolate, Zone* zone, Scope* scope,
       DCHECK_EQ(index, scope_info->ModuleVariablesIndex());
       // The variable entries themselves have already been written above.
       index += kModuleVariableEntryLength * module_vars_count;
+      DCHECK_EQ(index, scope_info->ModuleVariablesHashtableIndex());
+      DCHECK_EQ(has_module_vars_hashtable,
+                scope_info->HasModuleVariablesHashtable());
+      if (has_module_vars_hashtable) {
+        DCHECK_EQ(module_var_number, module_vars_count);
+        scope_info->set(index++, *module_vars_hashtable);
+      }
     }
 
     DCHECK_EQ(index, scope_info->DependentCodeIndex());
@@ -498,13 +517,11 @@ Handle<ScopeInfo> ScopeInfo::Create(IsolateT* isolate, Zone* zone, Scope* scope,
 template EXPORT_TEMPLATE_DEFINE(V8_EXPORT_PRIVATE)
     Handle<ScopeInfo> ScopeInfo::Create(
         Isolate* isolate, Zone* zone, Scope* scope,
-        MaybeDirectHandle<ScopeInfo> outer_scope,
-        FunctionKind closure_function_kind);
+        MaybeDirectHandle<ScopeInfo> outer_scope);
 template EXPORT_TEMPLATE_DEFINE(V8_EXPORT_PRIVATE)
     Handle<ScopeInfo> ScopeInfo::Create(
         LocalIsolate* isolate, Zone* zone, Scope* scope,
-        MaybeDirectHandle<ScopeInfo> outer_scope,
-        FunctionKind closure_function_kind);
+        MaybeDirectHandle<ScopeInfo> outer_scope);
 
 // static
 DirectHandle<ScopeInfo> ScopeInfo::CreateForWithScope(
@@ -753,8 +770,7 @@ ScopeType ScopeInfo::scope_type() const {
 }
 
 bool ScopeInfo::is_script_scope() const {
-  return !this->IsEmpty() &&
-         (scope_type() == SCRIPT_SCOPE || scope_type() == REPL_MODE_SCOPE);
+  return scope_type() == SCRIPT_SCOPE || scope_type() == REPL_MODE_SCOPE;
 }
 
 bool ScopeInfo::SloppyEvalCanExtendVars() const {
@@ -774,7 +790,6 @@ bool ScopeInfo::is_declaration_scope() const {
 }
 
 int ScopeInfo::ContextLength() const {
-  if (this->IsEmpty()) return 0;
   int context_locals = ContextLocalCount();
   bool function_name_context_slot = HasContextAllocatedFunctionName();
   bool force_context = ForceContextAllocationBit::decode(Flags());
@@ -861,10 +876,9 @@ bool ScopeInfo::IsSloppyNormalJSFunction() const {
 }
 
 bool ScopeInfo::CanOnlyAccessFixedFormalParameters() const {
+  DCHECK(!IsEmpty());
   FunctionKind function_kind = this->function_kind();
   return
-      // Filter out builtins.
-      !IsEmpty() &&
       // Can't be a SloppyNormalJSFunction.
       !IsSloppyNormalJSFunction() &&
       // TODO(dcarney): Make this function kind filter exact. It's currently
@@ -891,8 +905,6 @@ bool ScopeInfo::HasContextAllocatedFunctionName() const {
 bool ScopeInfo::HasInferredFunctionName() const {
   return HasInferredFunctionNameBit::decode(Flags());
 }
-
-bool ScopeInfo::HasPositionInfo() const { return !this->IsEmpty(); }
 
 bool ScopeInfo::HasSharedFunctionName() const {
   return FunctionName() != SharedFunctionInfo::kNoSharedNameSentinel;
@@ -964,17 +976,17 @@ Tagged<String> ScopeInfo::FunctionDebugName() const {
 }
 
 int ScopeInfo::StartPosition() const {
-  DCHECK(HasPositionInfo());
+  DCHECK(!this->IsEmpty());
   return position_info_start();
 }
 
 int ScopeInfo::EndPosition() const {
-  DCHECK(HasPositionInfo());
+  DCHECK(!this->IsEmpty());
   return position_info_end();
 }
 
 void ScopeInfo::SetPositionInfo(int start, int end) {
-  DCHECK(HasPositionInfo());
+  DCHECK(!this->IsEmpty());
   DCHECK_LE(start, end);
   set_position_info_start(start);
   set_position_info_end(end);
@@ -994,7 +1006,6 @@ Tagged<String> ScopeInfo::ContextInlinedLocalName(int var) const {
   DCHECK(HasInlinedLocalNames());
   return context_local_names(var);
 }
-
 
 VariableMode ScopeInfo::ContextLocalMode(int var) const {
   int value = context_local_infos(var);
@@ -1037,6 +1048,7 @@ MaybeAssignedFlag ScopeInfo::ContextLocalMaybeAssignedFlag(int var) const {
   return MaybeAssignedFlagBit::decode(value);
 }
 
+// LINT.IfChange(VariableIsSynthetic)
 // static
 bool ScopeInfo::VariableIsSynthetic(Tagged<String> name) {
   // There's currently no flag stored on the ScopeInfo to indicate that a
@@ -1046,6 +1058,7 @@ bool ScopeInfo::VariableIsSynthetic(Tagged<String> name) {
   return name->length() == 0 || name->Get(0) == '.' || name->Get(0) == '#' ||
          name->Equals(GetReadOnlyRoots().this_string());
 }
+// LINT.ThenChange(/src/debug/debug-scope-info.cc:VariableIsSynthetic)
 
 int ScopeInfo::ModuleVariableCount() const {
   DCHECK_EQ(scope_type(), MODULE_SCOPE);
@@ -1062,6 +1075,17 @@ int ScopeInfo::ModuleIndex(Tagged<String> name, VariableMode* mode,
   DCHECK_NOT_NULL(mode);
   DCHECK_NOT_NULL(init_flag);
   DCHECK_NOT_NULL(maybe_assigned_flag);
+
+  if (HasModuleVariablesHashtable()) {
+    int i = module_variables_hashtable()->Lookup(name);
+    if (i == -1) return 0;
+    DCHECK_LT(i, module_variable_count());
+    DCHECK(name->Equals(module_variables_name(i)));
+    int index;
+    ModuleVariable(i, nullptr, &index, mode, init_flag, maybe_assigned_flag,
+                   initializer_position);
+    return index;
+  }
 
   int module_vars_count = module_variable_count();
   for (int i = 0; i < module_vars_count; ++i) {
@@ -1093,8 +1117,7 @@ int ScopeInfo::ContextSlotIndex(Tagged<String> name,
   DisallowGarbageCollection no_gc;
   DCHECK(IsInternalizedString(name));
   DCHECK_NOT_NULL(lookup_result);
-
-  if (this->IsEmpty()) return -1;
+  DCHECK_IMPLIES(this->IsEmpty(), ContextLocalCount() == 0);
 
   int index = HasInlinedLocalNames()
                   ? InlinedLocalNamesLookup(name)
@@ -1219,6 +1242,10 @@ int ScopeInfo::ModuleVariablesIndex() const {
   return ConvertOffsetToIndex(ModuleVariablesOffset());
 }
 
+int ScopeInfo::ModuleVariablesHashtableIndex() const {
+  return ConvertOffsetToIndex(ModuleVariablesHashtableOffset());
+}
+
 void ScopeInfo::ModuleVariable(int i, Tagged<String>* name, int* index,
                                VariableMode* mode,
                                InitializationFlag* init_flag,
@@ -1264,13 +1291,9 @@ uint32_t ScopeInfo::Hash() {
   // Hash ScopeInfo based on its start and end position.
   // Note: Ideally we'd also have the script ID. But since we only use the
   // hash in a debug-evaluate cache, we don't worry too much about collisions.
-  if (HasPositionInfo()) {
-    return static_cast<uint32_t>(base::hash_combine(
-        flags(kRelaxedLoad), StartPosition(), EndPosition()));
-  }
-
+  DCHECK(!this->IsEmpty());
   return static_cast<uint32_t>(
-      base::hash_combine(flags(kRelaxedLoad), context_local_count()));
+      base::hash_combine(flags(kRelaxedLoad), StartPosition(), EndPosition()));
 }
 
 std::ostream& operator<<(std::ostream& os, VariableAllocationInfo var_info) {
@@ -1441,6 +1464,20 @@ int SourceTextModuleInfo::RegularExportCellIndex(int i) const {
 Tagged<FixedArray> SourceTextModuleInfo::RegularExportExportNames(int i) const {
   return Cast<FixedArray>(regular_exports()->get(
       i * kRegularExportLength + kRegularExportExportNamesOffset));
+}
+
+bool SourceTextModuleInfo::HasStarExports() const {
+  DisallowGarbageCollection no_gc;
+  Tagged<FixedArray> exports = special_exports();
+  const uint32_t length = exports->ulength().value();
+  for (uint32_t i = 0; i < length; ++i) {
+    // Star exports are the only special exports without a name.
+    if (IsUndefined(
+            Cast<SourceTextModuleInfoEntry>(exports->get(i))->export_name())) {
+      return true;
+    }
+  }
+  return false;
 }
 
 const char* ToString(ScopeType type) {

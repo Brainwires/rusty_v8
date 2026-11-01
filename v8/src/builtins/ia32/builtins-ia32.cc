@@ -111,7 +111,7 @@ void Generate_JSBuiltinsConstructStubHelper(MacroAssembler* masm) {
     Generate_PushArguments(masm, esi, eax, ecx, no_reg,
                            ArgumentsElementType::kRaw);
     // The receiver for the builtin/api call.
-    __ PushRoot(RootIndex::kTheHoleValue);
+    __ PushRoot(RootIndex::kTdzHoleValue);
 
     // Call the function.
     // eax: number of arguments (untagged)
@@ -185,9 +185,9 @@ void Builtins::Generate_JSConstructStubGeneric(MacroAssembler* masm) {
   __ CallBuiltin(Builtin::kFastNewObject);
   __ jmp(&post_instantiation_deopt_entry, Label::kNear);
 
-  // Else: use TheHoleValue as receiver for constructor call
+  // Else: use TdzHoleValue as receiver for constructor call
   __ bind(&not_create_implicit_receiver);
-  __ LoadRoot(eax, RootIndex::kTheHoleValue);
+  __ LoadRoot(eax, RootIndex::kTdzHoleValue);
 
   // ----------- S t a t e -------------
   //  --                         eax: implicit receiver
@@ -259,7 +259,7 @@ void Builtins::Generate_JSConstructStubGeneric(MacroAssembler* masm) {
   // on-stack receiver as the result.
   __ bind(&use_receiver);
   __ mov(eax, Operand(esp, 0 * kSystemPointerSize));
-  __ JumpIfRoot(eax, RootIndex::kTheHoleValue, &do_throw);
+  __ JumpIfRoot(eax, RootIndex::kTdzHoleValue, &do_throw);
 
   __ bind(&leave_and_return);
   // Restore arguments count from the frame.
@@ -1579,7 +1579,7 @@ void Builtins::Generate_InterpreterPushArgsThenFastConstructFunction(
   __ EnterFrame(StackFrame::FAST_CONSTRUCT);
   __ Push(esi);
   // Implicit receiver stored in the construct frame.
-  __ PushRoot(RootIndex::kTheHoleValue);
+  __ PushRoot(RootIndex::kTdzHoleValue);
 
   // Push arguments + implicit receiver
   __ movd(eax, xmm0);  // Recover number of arguments.
@@ -1589,7 +1589,7 @@ void Builtins::Generate_InterpreterPushArgsThenFastConstructFunction(
   __ neg(esi);
   __ add(esi, ecx);
   GenerateInterpreterPushArgs(masm, esi, ecx);
-  __ PushRoot(RootIndex::kTheHoleValue);
+  __ PushRoot(RootIndex::kTdzHoleValue);
 
   // Restore context.
   __ mov(esi, Operand(ebp, FastConstructFrameConstants::kContextOffset));
@@ -1642,7 +1642,7 @@ void Builtins::Generate_InterpreterPushArgsThenFastConstructFunction(
   // on-stack receiver as the result.
   __ bind(&use_receiver);
   __ mov(eax, Operand(esp, 0 * kSystemPointerSize));
-  __ JumpIfRoot(eax, RootIndex::kTheHoleValue, &do_throw);
+  __ JumpIfRoot(eax, RootIndex::kTdzHoleValue, &do_throw);
 
   __ bind(&leave_and_return);
   __ LeaveFrame(StackFrame::FAST_CONSTRUCT);
@@ -3373,6 +3373,7 @@ void SwitchStacks(MacroAssembler* masm, ExternalReference fn,
 void ReloadParentStack(MacroAssembler* masm, Register promise,
                        Register return_value, Register context, Register tmp,
                        Register tmp2) {
+  DCHECK_NE(tmp, tmp2);
   Register active_stack = tmp;
   __ LoadRootRelative(active_stack, IsolateData::active_stack_offset());
 
@@ -3384,7 +3385,10 @@ void ReloadParentStack(MacroAssembler* masm, Register promise,
   // Switch stack!
   SwitchStacks(masm, ExternalReference::wasm_return_jspi_stack(), parent,
                nullptr, no_reg, {promise, return_value, context, parent});
+  __ mov(tmp, Operand(parent, wasm::kStackPcOffset));
   LoadJumpBuffer(masm, parent, false);
+  __ mov(MemOperand(ebp, WasmJspiFrameConstants::kParentReturnAddressOffset),
+         tmp);
 }
 
 // Loads the context field of the WasmTrustedInstanceData or WasmImportData
@@ -3524,6 +3528,8 @@ void SwitchBackAndReturnPromise(MacroAssembler* masm, Register tmp,
   }
 
   __ bind(return_promise);
+  // The initial wrapper and a resume callback have different argument cleanup.
+  __ jmp(MemOperand(ebp, WasmJspiFrameConstants::kParentReturnAddressOffset));
 }
 
 void GenerateExceptionHandlingLandingPad(MacroAssembler* masm,
@@ -3746,6 +3752,7 @@ void JSToWasmWrapperHelper(MacroAssembler* masm, wasm::Promise mode) {
 
   if (stack_switch) {
     SwitchBackAndReturnPromise(masm, edx, edi, mode, &return_promise);
+    __ Trap();  // Unreachable.
   }
   __ bind(&suspend);
 
@@ -3852,6 +3859,9 @@ namespace {
 // forwards the value, the onRejected variant throws the value.
 
 void Generate_WasmResumeHelper(MacroAssembler* masm, wasm::OnResume on_resume) {
+  __ cmp(kJavaScriptCallArgCountRegister, Immediate(JSParameterCount(1)));
+  __ Check(equal, AbortReason::kJSSignatureMismatch);
+
   __ EnterFrame(StackFrame::WASM_JSPI);
 
   Register closure = kJSFunctionRegister;  // edi
@@ -5287,7 +5297,7 @@ void Builtins::Generate_RestartFrameTrampoline(MacroAssembler* masm) {
   __ LeaveFrame(StackFrame::INTERPRETED);
 
   // The arguments are already in the stack, but we might need to adapt them
-  // if the function signature changed (e.g. via LiveEdit).
+  // if the function signature changed.
   __ mov(ecx, FieldOperand(edi, offsetof(JSFunction, shared_function_info_)));
   __ movzx_w(ecx, FieldOperand(ecx, offsetof(SharedFunctionInfo,
                                              formal_parameter_count_)));

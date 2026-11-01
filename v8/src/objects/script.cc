@@ -6,12 +6,69 @@
 
 #include "src/ast/ast.h"
 #include "src/common/globals.h"
+#include "src/objects/fixed-array-inl.h"
+#include "src/objects/objects-inl.h"
+#include "src/objects/script-inl.h"
 #include "src/objects/shared-function-info-inl.h"
+#include "src/objects/string-inl.h"
 #include "src/tracing/traced-value.h"
 #include "src/utils/hex-format.h"
 #include "src/utils/sha-256.h"
 
 namespace v8::internal {
+
+#if V8_ENABLE_WEBASSEMBLY
+void Script::set_wasm_managed_native_module(Tagged<Object> value,
+                                            WriteBarrierMode mode) {
+  DCHECK_EQ(type(), Type::kWasm);
+  eval_from_position_.store(this, Cast<UnionOf<Smi, CppGCManagedBase>>(value),
+                            mode);
+}
+
+CppGCManaged<wasm::NativeModule>::Ptr Script::wasm_native_module() const {
+  return Cast<CppGCManaged<wasm::NativeModule>>(wasm_managed_native_module())
+      ->ptr();
+}
+
+bool Script::has_wasm_breakpoint_infos() const {
+  return type() == Type::kWasm &&
+         wasm_breakpoint_infos()->ulength().value() > 0;
+}
+#endif  // V8_ENABLE_WEBASSEMBLY
+
+void Script::set_eval_from_scope_info(Tagged<Object> value,
+                                      WriteBarrierMode mode) {
+  eval_from_scope_info_.store(this, Cast<UnionOf<ScopeInfo, Undefined>>(value),
+                              mode);
+}
+
+bool Script::HasValidSource() {
+  Tagged<Object> src = this->source();
+  if (!IsString(src)) return true;
+  Tagged<String> src_str = Cast<String>(src);
+  if (!StringShape(src_str).IsExternal()) return true;
+  if (src_str->IsOneByteRepresentation()) {
+    return Cast<ExternalOneByteString>(src)->resource() != nullptr;
+  } else if (src_str->IsTwoByteRepresentation()) {
+    return Cast<ExternalTwoByteString>(src)->resource() != nullptr;
+  }
+  return true;
+}
+
+bool Script::HasSourceURLComment() const {
+  return IsString(source_url()) && Cast<String>(source_url())->length() != 0;
+}
+
+bool Script::HasSourceMappingURLComment() const {
+  return IsString(source_mapping_url()) &&
+         Cast<String>(source_mapping_url())->length() != 0;
+}
+
+bool Script::IsMaybeUnfinalized(Isolate* isolate) const {
+  // TODO(v8:12051): A more robust detection, e.g. with a dedicated sentinel
+  // value.
+  return IsUndefined(source()) || Cast<String>(source())->length() == 0;
+}
 
 const char* ToString(Script::Type type) {
   switch (type) {
@@ -31,22 +88,28 @@ const char* ToString(Script::Type type) {
   UNREACHABLE();
 }
 
-const char* ToString(Script::CompilationType type) {
-  switch (type) {
-    case Script::CompilationType::kHost:
-      return "host";
-    case Script::CompilationType::kEval:
-      return "eval";
-  }
-  UNREACHABLE();
-}
-
 const char* ToString(Script::CompilationState type) {
   switch (type) {
     case Script::CompilationState::kInitial:
       return "initial";
     case Script::CompilationState::kCompiled:
       return "compiled";
+  }
+  UNREACHABLE();
+}
+
+const char* ToString(Script::CompilationKind type) {
+  switch (type) {
+    case Script::CompilationKind::kHost:
+      return "host";
+    case Script::CompilationKind::kDirectEval:
+      return "direct-eval";
+    case Script::CompilationKind::kIndirectEval:
+      return "indirect-eval";
+    case Script::CompilationKind::kFunctionConstructor:
+      return "function-constructor";
+    case Script::CompilationKind::kWrapped:
+      return "wrapped";
   }
   UNREACHABLE();
 }
@@ -77,6 +140,8 @@ MaybeHandle<SharedFunctionInfo> Script::FindSharedFunctionInfo(
   CHECK_EQ(result->EndPosition(), function_literal->end_position());
   CHECK_EQ(result->function_literal_id(kRelaxedLoad),
            function_literal->function_literal_id());
+  CHECK_EQ(result->syntax_kind(), function_literal->syntax_kind());
+  CHECK_EQ(result->kind(), function_literal->kind());
   function_literal->set_shared_function_info(result);
   return result;
 }
@@ -101,7 +166,7 @@ Tagged<Script> Script::Iterator::Next() {
 
 // static
 int Script::GetEvalPosition(Isolate* isolate, DirectHandle<Script> script) {
-  DCHECK(script->compilation_type() == Script::CompilationType::kEval);
+  DCHECK(script->has_eval_origin());
   int position = script->eval_from_position();
   if (position < 0) {
     // Due to laziness, the position may not have been translated from code
@@ -467,7 +532,8 @@ bool Script::GetPositionInfo(int position, PositionInfo* info,
   // For wasm, we use the byte offset as the column.
   if (type() == Script::Type::kWasm) {
     DCHECK_LE(0, position);
-    Managed<wasm::NativeModule>::Ptr native_module = wasm_native_module();
+    CppGCManaged<wasm::NativeModule>::Ptr native_module =
+        wasm_native_module();
     const wasm::WasmModule* module = native_module->module();
     if (module->functions.empty()) return false;
     info->line = 0;

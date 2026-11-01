@@ -66,7 +66,7 @@ template <class K, class V>
 using Map = flat_hash_map<K, V, StatefulTestingHash, StatefulTestingEqual,
                           Alloc<std::pair<const K, V>>>;
 
-static_assert(!std::is_standard_layout<NonStandardLayout>(), "");
+static_assert(!std::is_standard_layout<NonStandardLayout>());
 
 using MapTypes =
     ::testing::Types<Map<int, int>, Map<std::string, int>,
@@ -92,7 +92,7 @@ TEST(FlatHashMap, StandardLayout) {
     bool operator==(const Int& other) const { return value == other.value; }
     size_t value;
   };
-  static_assert(std::is_standard_layout<Int>(), "");
+  static_assert(std::is_standard_layout<Int>());
 
   struct Hash {
     size_t operator()(const Int& obj) const { return obj.value; }
@@ -119,11 +119,11 @@ TEST(FlatHashMap, StandardLayout) {
 TEST(FlatHashMap, Relocatability) {
   static_assert(absl::is_trivially_relocatable<int>::value);
   static_assert(
-      std::is_same<decltype(absl::container_internal::FlatHashMapPolicy<
-                            int, int>::transfer<std::allocator<char>>(nullptr,
-                                                                      nullptr,
-                                                                      nullptr)),
-                   std::true_type>::value);
+      std::is_same_v<
+          decltype(absl::container_internal::FlatHashMapPolicy<
+                   int, int>::transfer<std::allocator<char>>(nullptr, nullptr,
+                                                             nullptr)),
+          std::true_type>);
 
   struct NonRelocatable {
     NonRelocatable() = default;
@@ -134,11 +134,11 @@ TEST(FlatHashMap, Relocatability) {
 
   EXPECT_FALSE(absl::is_trivially_relocatable<NonRelocatable>::value);
   EXPECT_TRUE(
-      (std::is_same<decltype(absl::container_internal::FlatHashMapPolicy<
-                            int, NonRelocatable>::
-                                transfer<std::allocator<char>>(nullptr, nullptr,
-                                                               nullptr)),
-                   std::false_type>::value));
+      (std::is_same_v<decltype(absl::container_internal::FlatHashMapPolicy<
+                               int, NonRelocatable>::
+                                   transfer<std::allocator<char>>(
+                                       nullptr, nullptr, nullptr)),
+                      std::false_type>));
 }
 
 // gcc becomes unhappy if this is inside the method, so pull it out here.

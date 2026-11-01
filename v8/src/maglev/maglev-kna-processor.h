@@ -70,9 +70,20 @@ class RecomputeKnownNodeAspectsProcessor {
 
   NodeBase* current_node() const { return current_node_; }
 
+  bool CanEagerDeopt() const {
+    return current_node()->properties().has_eager_deopt_info();
+  }
+
   DeoptFrame* GetDeoptFrameForEagerDeopt() {
-    CHECK(current_node()->properties().has_eager_deopt_info());
+    CHECK(CanEagerDeopt());
     return &current_node()->eager_deopt_info()->top_frame();
+  }
+
+  static BasicBlock* SkipEdgeSplits(BasicBlock* block) {
+    while (block->is_edge_split_block()) {
+      block = block->control_node()->Cast<Jump>()->target();
+    }
+    return block;
   }
 
   BlockProcessResult PreProcessBasicBlock(BasicBlock* block) {
@@ -85,10 +96,10 @@ class RecomputeKnownNodeAspectsProcessor {
       // for all loops.
       known_node_aspects_ = zone()->New<KnownNodeAspects>(zone());
     } else if (block->is_loop()) {
-      DCHECK_GT(block->predecessor_count(), 1);
+      DCHECK_EQ(block->predecessor_count(), 2);
       known_node_aspects_ = block->state()->TakeKnownNodeAspects();
       KnownNodeAspects* backedge_known_node_aspects =
-          block->state()->backedge_known_node_aspects();
+          block->state()->AsLoopHeader()->backedge_known_node_aspects();
       // Merge saved backedge KNA to the forward one.
       TRACE_KNA("Merging KNA at loop header B"
                 << block->id() << ":" << TraceNewline{}
@@ -96,17 +107,16 @@ class RecomputeKnownNodeAspectsProcessor {
                 << TraceNewline{} << "## Backward KNA:" << TraceNewline{}
                 << *backedge_known_node_aspects);
       backedge_known_node_aspects->UnwrapIdentitiesAndPhisInKeys(zone());
-      known_node_aspects_->MergeForLoop(*backedge_known_node_aspects, zone(),
-                                        block->state()->loop_effects());
+      known_node_aspects_->MergeForLoop(
+          *backedge_known_node_aspects, zone(),
+          block->state()->AsLoopHeader()->loop_effects(),
+          block->state()->AsLoopHeader()->loop_has_effects());
     } else if (block->has_state()) {
       known_node_aspects_ = block->state()->TakeKnownNodeAspects();
     } else if (block->is_edge_split_block()) {
       // Clone the next available KNA.
-      BasicBlock* next_block = block;
-      while (next_block->is_edge_split_block()) {
-        next_block = next_block->control_node()->Cast<Jump>()->target();
-      }
-      known_node_aspects_ = next_block->state()->CloneKnownNodeAspects(zone());
+      known_node_aspects_ =
+          SkipEdgeSplits(block)->state()->CloneKnownNodeAspects(zone());
     } else {
       is_fallthrough = true;
     }
@@ -167,7 +177,33 @@ class RecomputeKnownNodeAspectsProcessor {
       if (mark_handler_reachable) {
         tracker_.MarkReachable(exception_handler);
       }
+      // Temporarily clear the cached constant value before merging into the
+      // exception handler so that the catch block does not cache this load. On
+      // the exception path, the value is guaranteed to be the_hole, and the
+      // catch block may resume a generator that initializes the variable.
+      // Restore the cached value afterward for the non-throwing fallthrough
+      // path where the value is known not to be the_hole.
+      // TODO(verwaest): Look into making loaded_context_constants_ monotonic,
+      // e.g. by folding the hole check into the context load rather than
+      // temporarily clearing the cached constant here.
+      ValueNode** cached_slot = nullptr;
+      ValueNode* value = nullptr;
+      if (auto* throw_if_hole = node->TryCast<ThrowReferenceErrorIfTdzHole>()) {
+        value = throw_if_hole->ValueInput().node();
+        if (auto* load = value->TryCast<LoadContextSlotNoCells>();
+            load && load->maybe_assigned() == kNotAssigned) {
+          ValueNode*& slot = known_node_aspects().GetContextCachedValue(
+              load->input(0).node(), load->offset(), kNotAssigned);
+          if (slot == value) {
+            cached_slot = &slot;
+            *cached_slot = nullptr;
+          }
+        }
+      }
       Merge(exception_handler);
+      if (cached_slot) {
+        *cached_slot = value;
+      }
     }
   }
 
@@ -198,12 +234,12 @@ class RecomputeKnownNodeAspectsProcessor {
   }
 
   ProcessResult Process(Jump* node, const ProcessingState& state) {
-    Merge(node->target());
+    MergeFromDeadSource(node->target());
     return ProcessResult::kContinue;
   }
 
   ProcessResult Process(CheckpointedJump* node, const ProcessingState& state) {
-    Merge(node->target());
+    MergeFromDeadSource(node->target());
     return ProcessResult::kContinue;
   }
 
@@ -271,12 +307,18 @@ class RecomputeKnownNodeAspectsProcessor {
   V8_NODISCARD ProcessResult OnContradiction();
 
   void Merge(BasicBlock* block) {
-    while (block->is_edge_split_block()) {
-      block = block->control_node()->Cast<Jump>()->target();
-    }
+    block = SkipEdgeSplits(block);
     // If we don't have state, this must be a fallthrough basic block.
     if (!block->has_state()) return;
     block->state()->MergeNodeAspects(zone(), *known_node_aspects_);
+  }
+
+  // Like Merge, but consume known_node_aspects_ instead of copying it.
+  void MergeFromDeadSource(BasicBlock* block) {
+    block = SkipEdgeSplits(block);
+    // If we don't have state, this must be a fallthrough basic block.
+    if (!block->has_state()) return;
+    block->state()->MergeNodeAspects(zone(), &known_node_aspects_);
   }
 
   template <typename NodeT>
@@ -333,7 +375,7 @@ class RecomputeKnownNodeAspectsProcessor {
 
   ProcessResult ProcessNode(CheckedNumberOrOddballToFloat64* node);
   ProcessResult ProcessNode(UnsafeNumberOrOddballToFloat64* node);
-  ProcessResult ProcessNode(HoleyFloat64ToSilencedFloat64* node);
+  ProcessResult ProcessNode(UnsafeHoleyFloat64ToFloat64* node);
 
 // TODO(victorgomes): Ideally we would like to check we already know the type,
 // but currently we cannot. The issue is that if the GraphBuilder emits a
@@ -363,7 +405,7 @@ class RecomputeKnownNodeAspectsProcessor {
   PROCESS_UNSAFE_CONV(ChangeIntPtrToFloat64, float64, Number)
   PROCESS_UNSAFE_CONV(UnsafeNumberToFloat64, float64, Number)
   // Note: NumberOrOddball->Float64 conversions (such as
-  // UnsafeNumberOrOddballToFloat64 and HoleyFloat64ToSilencedFloat64) lose
+  // UnsafeNumberOrOddballToFloat64 and UnsafeHoleyFloat64ToFloat64) lose
   // oddball identity and are promoted to float64 alternative by explicit
   // handlers if and only if KNA has statically proven the input is strictly
   // NodeType::kNumber without oddballs.
@@ -516,6 +558,12 @@ class RecomputeKnownNodeAspectsProcessor {
 
   ProcessResult ProcessNode(AssumeType* node) {
     return RecordType(node->input_node(0), node->asserted_type());
+  }
+
+  ProcessResult ProcessNode(CheckInt32IsSmi* node) {
+    NodeInfo* info = GetOrCreateInfoFor(node->input_node(0));
+    info->IntersectType(NodeType::kSmi);
+    return ProcessResult::kContinue;
   }
 
   ProcessResult ProcessNode(Node* node) { return ProcessResult::kContinue; }

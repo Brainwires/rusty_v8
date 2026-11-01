@@ -5,6 +5,7 @@
 #include "src/d8/d8.h"
 
 #include "include/v8-fast-api-calls.h"
+#include "include/v8-function.h"
 #include "include/v8-template.h"
 #include "src/api/api-inl.h"
 
@@ -2139,6 +2140,192 @@ Local<FunctionTemplate> Shell::CreateLeafInterfaceTypeTemplate(
   leaf_object_ctor->SetClassName(
       String::NewFromUtf8Literal(isolate, "LeafInterfaceType"));
   return leaf_object_ctor;
+}
+
+namespace {
+
+v8::Intercepted D8InterceptCallback(Local<Name> property,
+                                    const PropertyCallbackInfo<Value>& info) {
+  Isolate* isolate = info.GetIsolate();
+  Local<Value> data = info.DataV2().As<Value>();
+  if (!data->IsFunction()) {
+    isolate->ThrowError("Interceptor callback must be a function");
+    return v8::Intercepted::kYes;
+  }
+  Local<Context> context = isolate->GetCurrentContext();
+  Local<Function> fn = data.As<Function>();
+  Local<Value> argv[1] = {property};
+  Local<Value> ret;
+  if (fn->Call(context, info.Holder(), 1, argv).ToLocal(&ret)) {
+    info.GetReturnValue().Set(ret);
+  }
+  // TODO(leszeks): Add a mechanism to allow not intercepting.
+  return v8::Intercepted::kYes;
+}
+
+enum class AccessPolicy : uintptr_t {
+  kDeny = 0,
+  kAllow = 1,
+  kSameContext = 2,
+  kSecurityToken = 3,
+};
+
+bool ParseAccessPolicy(Isolate* isolate, Local<Value> val,
+                       AccessPolicy* policy) {
+  if (val->IsBoolean()) {
+    *policy =
+        val->BooleanValue(isolate) ? AccessPolicy::kAllow : AccessPolicy::kDeny;
+    return true;
+  }
+  if (val->IsString()) {
+    String::Utf8Value str(isolate, val);
+    if (strcmp(*str, "same-context") == 0) {
+      *policy = AccessPolicy::kSameContext;
+      return true;
+    }
+    if (strcmp(*str, "security-token") == 0) {
+      *policy = AccessPolicy::kSecurityToken;
+      return true;
+    }
+  }
+  isolate->ThrowError(
+      "Invalid access policy: expected true, false, \"same-context\", or "
+      "\"security-token\"");
+  return false;
+}
+
+bool D8AccessCheck(Local<Context> accessing_context,
+                   Local<Object> accessed_object, Local<Value> data) {
+  if (accessed_object->InternalFieldCount() == 0) return true;
+
+  auto policy = static_cast<AccessPolicy>(reinterpret_cast<uintptr_t>(
+      accessed_object->GetAlignedPointerFromInternalField(
+          0, kEmbedderDataTypeTagDefault)));
+
+  switch (policy) {
+    case AccessPolicy::kAllow:
+      return true;
+    case AccessPolicy::kDeny:
+      return false;
+    case AccessPolicy::kSameContext: {
+      Isolate* isolate = Isolate::GetCurrent();
+      Local<Context> creation_context;
+      if (accessed_object->GetCreationContext(isolate).ToLocal(
+              &creation_context)) {
+        return accessing_context == creation_context;
+      }
+      return false;
+    }
+    case AccessPolicy::kSecurityToken: {
+      Isolate* isolate = Isolate::GetCurrent();
+      Local<Context> creation_context;
+      if (accessed_object->GetCreationContext(isolate).ToLocal(
+              &creation_context)) {
+        return accessing_context->GetSecurityToken()->StrictEquals(
+            creation_context->GetSecurityToken());
+      }
+      return false;
+    }
+  }
+  UNREACHABLE();
+}
+
+}  // namespace
+
+void Shell::CreateInterceptorObject(const FunctionCallbackInfo<Value>& info) {
+  Isolate* isolate = info.GetIsolate();
+  if (info.Length() == 0 || !info[0]->IsFunction()) {
+    isolate->ThrowError("Usage: d8.test.createInterceptorObject(function)");
+    return;
+  }
+  Local<Context> context = isolate->GetCurrentContext();
+  Local<FunctionTemplate> ctor = FunctionTemplate::New(isolate);
+  Local<ObjectTemplate> templ = ctor->InstanceTemplate();
+  templ->SetHandler(NamedPropertyHandlerConfiguration(
+      D8InterceptCallback, nullptr, nullptr, nullptr, nullptr, info[0]));
+
+  Local<Function> fn;
+  if (!ctor->GetFunction(context).ToLocal(&fn)) return;
+  Local<Object> instance;
+  if (!fn->NewInstance(context).ToLocal(&instance)) return;
+  info.GetReturnValue().Set(instance);
+}
+
+void Shell::CreateAccessCheckedObject(const FunctionCallbackInfo<Value>& info) {
+  Isolate* isolate = info.GetIsolate();
+  if (info.Length() == 0) {
+    isolate->ThrowError("Usage: d8.test.createAccessCheckedObject(policy)");
+    return;
+  }
+  AccessPolicy policy;
+  if (!ParseAccessPolicy(isolate, info[0], &policy)) return;
+
+  Local<Context> context = isolate->GetCurrentContext();
+  Local<FunctionTemplate> ctor = FunctionTemplate::New(isolate);
+  Local<ObjectTemplate> templ = ctor->InstanceTemplate();
+  templ->SetInternalFieldCount(1);
+  templ->SetAccessCheckCallback(D8AccessCheck);
+
+  Local<Function> fn;
+  if (!ctor->GetFunction(context).ToLocal(&fn)) return;
+  Local<Object> instance;
+  if (!fn->NewInstance(context).ToLocal(&instance)) return;
+  instance->SetAlignedPointerInInternalField(
+      0, reinterpret_cast<void*>(static_cast<uintptr_t>(policy)),
+      kEmbedderDataTypeTagDefault);
+  info.GetReturnValue().Set(instance);
+}
+
+void Shell::CreateAccessCheckedInterceptorObject(
+    const FunctionCallbackInfo<Value>& info) {
+  Isolate* isolate = info.GetIsolate();
+  if (info.Length() < 2 || !info[1]->IsFunction()) {
+    isolate->ThrowError(
+        "Usage: d8.test.createAccessCheckedInterceptorObject(policy, "
+        "function)");
+    return;
+  }
+  AccessPolicy policy;
+  if (!ParseAccessPolicy(isolate, info[0], &policy)) return;
+
+  Local<Context> context = isolate->GetCurrentContext();
+  Local<FunctionTemplate> ctor = FunctionTemplate::New(isolate);
+  Local<ObjectTemplate> templ = ctor->InstanceTemplate();
+
+  templ->SetInternalFieldCount(1);
+  templ->SetAccessCheckCallbackAndHandler(
+      D8AccessCheck,
+      NamedPropertyHandlerConfiguration(D8InterceptCallback, nullptr, nullptr,
+                                        nullptr, nullptr, info[1]),
+      IndexedPropertyHandlerConfiguration());
+
+  Local<Function> fn;
+  if (!ctor->GetFunction(context).ToLocal(&fn)) return;
+  Local<Object> instance;
+  if (!fn->NewInstance(context).ToLocal(&instance)) return;
+  instance->SetAlignedPointerInInternalField(
+      0, reinterpret_cast<void*>(static_cast<uintptr_t>(policy)),
+      kEmbedderDataTypeTagDefault);
+  info.GetReturnValue().Set(instance);
+}
+
+void Shell::SetAccessPolicy(const FunctionCallbackInfo<Value>& info) {
+  Isolate* isolate = info.GetIsolate();
+  if (info.Length() < 2 || !info[0]->IsObject()) {
+    isolate->ThrowError("Usage: d8.test.setAccessPolicy(object, policy)");
+    return;
+  }
+  Local<Object> obj = info[0].As<Object>();
+  if (obj->InternalFieldCount() == 0) {
+    isolate->ThrowError("Object does not support access checks");
+    return;
+  }
+  AccessPolicy policy;
+  if (!ParseAccessPolicy(isolate, info[1], &policy)) return;
+
+  obj->SetAlignedPointerInInternalField(
+      0, reinterpret_cast<void*>(static_cast<uintptr_t>(policy)),
+      kEmbedderDataTypeTagDefault);
 }
 
 }  // namespace v8

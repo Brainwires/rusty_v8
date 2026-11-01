@@ -291,6 +291,10 @@ class Heap final {
   int increment_dispatch_table_allocations() {
     return ++dispatch_table_allocations_;
   }
+  int dispatch_table_gc_interval() const { return dispatch_table_gc_interval_; }
+  void set_dispatch_table_gc_interval(int interval) {
+    dispatch_table_gc_interval_ = interval;
+  }
 #endif
 
   // Emits GC events for DevTools timeline.
@@ -389,6 +393,10 @@ class Heap final {
 
   bool is_gc_tracing_category_enabled() const {
     return *gc_tracing_category_enabled_;
+  }
+
+  bool is_gc_extra_tracing_category_enabled() const {
+    return *gc_extra_tracing_category_enabled_;
   }
 
   enum class StackScanMode { kNone, kFull, kSelective };
@@ -909,9 +917,11 @@ class Heap final {
   V8_INLINE void SetDoubleStringCache(Tagged<DoubleStringCache> cache);
   V8_INLINE void SetCachedBigIntDivisor(Tagged<BigInt> divisor);
   V8_INLINE void SetNextCachedBigIntDivisor(Tagged<BigInt> divisor);
+  V8_INLINE void SetRegExpSplitCache(Tagged<FixedArray> cache);
 
 #if V8_ENABLE_WEBASSEMBLY
   V8_INLINE void SetWasmCanonicalRtts(Tagged<WeakFixedArray> rtts);
+  V8_INLINE void SetWasmSharedCanonicalRtts(Tagged<WeakFixedArray> rtts);
   V8_INLINE void SetJSToWasmWrappers(
       Tagged<WeakFixedArray> js_to_wasm_wrappers);
 #endif
@@ -2388,6 +2398,7 @@ class Heap final {
 
 #ifdef V8_ENABLE_ALLOCATION_TIMEOUT
   int dispatch_table_allocations_ = 0;
+  int dispatch_table_gc_interval_ = v8_flags.dispatch_table_gc_interval;
 #endif
 
   std::vector<HeapObjectAllocationTracker*> allocation_trackers_;
@@ -2451,6 +2462,7 @@ class Heap final {
   std::atomic<uint64_t> total_allocated_bytes_ = 0;
 
   const uint8_t* gc_tracing_category_enabled_ = nullptr;
+  const uint8_t* gc_extra_tracing_category_enabled_ = nullptr;
   size_t notify_context_disposed_counter_ = 1;
 
   // Classes in "heap" can be friends.
@@ -2520,11 +2532,12 @@ class Heap final {
   // The Isolate constructs us.
   friend class Isolate;
 
-  // Used in cctest.
+  // Used in cctest and unittests.
   friend class heap::HeapTester;
   FRIEND_TEST(SpacesTest, InlineAllocationObserverCadence);
   FRIEND_TEST(SpacesTest, AllocationObserver);
   FRIEND_TEST(MinimalStackTest, MinimalStackInTurbofanAllocate);
+  FRIEND_TEST(HeapTest, Regress10560);
   friend class HeapInternalsBase;
 };
 
@@ -2850,6 +2863,8 @@ class ClearStaleLeftTrimmedPointerVisitor : public RootVisitor {
   void Synchronize(VisitorSynchronization::SyncTag tag) override {
     visitor_->Synchronize(tag);
   }
+
+  GarbageCollector collector() const override { return visitor_->collector(); }
 
   // The pointer compression cage base value used for decompression of all
   // tagged values except references to InstructionStream objects.

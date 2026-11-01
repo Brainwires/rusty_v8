@@ -170,7 +170,7 @@ std::vector<std::unique_ptr<V8DebuggerScript>> V8Debugger::getCompiledScripts(
       if (m_inspector->contextGroupId(contextId) != contextGroupId) continue;
     }
     result.push_back(std::make_unique<V8DebuggerScript>(
-        m_isolate, script, false, false, agent, m_inspector->client()));
+        m_isolate, script, false, agent, m_inspector->client()));
   }
   return result;
 }
@@ -501,15 +501,14 @@ void V8Debugger::handleProgramBreak(
   m_externalAsyncTaskPauseRequested = false;
   m_taskWithScheduledBreakPauseRequested = false;
 
-  bool scheduledOOMBreak = m_scheduledOOMBreak;
-  DCHECK(scheduledOOMBreak ==
-         breakReasons.contains(v8::debug::BreakReason::kOOM));
+  bool isOOMBreak = breakReasons.contains(v8::debug::BreakReason::kOOM);
+  DCHECK(!isOOMBreak || m_scheduledOOMBreak);
   bool hasAgents = false;
 
   m_inspector->forEachSession(
       contextGroupId,
-      [&scheduledOOMBreak, &hasAgents](V8InspectorSessionImpl* session) {
-        if (session->debuggerAgent()->acceptsPause(scheduledOOMBreak)) {
+      [isOOMBreak, &hasAgents](V8InspectorSessionImpl* session) {
+        if (session->debuggerAgent()->acceptsPause(isOOMBreak)) {
           hasAgents = true;
         }
       });
@@ -528,14 +527,15 @@ void V8Debugger::handleProgramBreak(
   m_inspector->forEachSession(
       contextGroupId,
       [&pausedContext, &exception, &breakpointIds, &exceptionType, &isUncaught,
-       &scheduledOOMBreak, &breakReasons](V8InspectorSessionImpl* session) {
-        if (session->debuggerAgent()->acceptsPause(scheduledOOMBreak)) {
+       isOOMBreak, &breakReasons](V8InspectorSessionImpl* session) {
+        if (session->debuggerAgent()->acceptsPause(isOOMBreak)) {
           session->debuggerAgent()->didPause(
               InspectedContext::contextId(pausedContext), exception,
               breakpointIds, exceptionType, isUncaught, breakReasons);
         }
       });
   {
+    v8::Isolate::AllowJavascriptExecutionScope allow_script(m_isolate);
     v8::Context::Scope scope(pausedContext);
 
     m_inspector->forEachSession(
@@ -556,8 +556,10 @@ void V8Debugger::handleProgramBreak(
                                 }
                               });
 
-  if (m_scheduledOOMBreak) m_isolate->RestoreOriginalHeapLimit();
-  m_scheduledOOMBreak = false;
+  if (isOOMBreak) {
+    if (m_scheduledOOMBreak) m_isolate->RestoreOriginalHeapLimit();
+    m_scheduledOOMBreak = false;
+  }
 }
 
 namespace {
@@ -598,7 +600,7 @@ size_t V8Debugger::nearHeapLimitCallback(void* data, size_t current_heap_limit,
 }
 
 void V8Debugger::ScriptCompiled(v8::Local<v8::debug::Script> script,
-                                bool is_live_edited, bool has_compile_error) {
+                                bool has_compile_error) {
   if (m_ignoreScriptParsedEventsCounter != 0) return;
 
   int contextId;
@@ -609,12 +611,12 @@ void V8Debugger::ScriptCompiled(v8::Local<v8::debug::Script> script,
 
   m_inspector->forEachSession(
       m_inspector->contextGroupId(contextId),
-      [isolate, &script, has_compile_error, is_live_edited,
+      [isolate, &script, has_compile_error,
        client](V8InspectorSessionImpl* session) {
         auto agent = session->debuggerAgent();
         if (!agent->enabled()) return;
         agent->didParseSource(std::make_unique<V8DebuggerScript>(
-            isolate, script, has_compile_error, is_live_edited, agent, client));
+            isolate, script, has_compile_error, agent, client));
       });
 }
 
@@ -810,6 +812,7 @@ v8::MaybeLocal<v8::Value> V8Debugger::getTargetScopes(
     v8::Local<v8::Context> context, v8::Local<v8::Value> value,
     ScopeTargetKind kind) {
   std::unique_ptr<v8::debug::ScopeIterator> iterator;
+  v8::Local<v8::Function> generator_function;
   switch (kind) {
     case FUNCTION:
       iterator = v8::debug::ScopeIterator::CreateForFunction(
@@ -820,6 +823,7 @@ v8::MaybeLocal<v8::Value> V8Debugger::getTargetScopes(
           v8::debug::GeneratorObject::Cast(value);
       if (!generatorObject->IsSuspended()) return v8::MaybeLocal<v8::Value>();
 
+      generator_function = generatorObject->Function();
       iterator = v8::debug::ScopeIterator::CreateForGeneratorObject(
           m_isolate, value.As<v8::Object>());
       break;
@@ -830,7 +834,25 @@ v8::MaybeLocal<v8::Value> V8Debugger::getTargetScopes(
     return v8::MaybeLocal<v8::Value>();
   }
 
-  for (; !iterator->Done(); iterator->Advance()) {
+  // [[Scopes]] reflects the runtime context chain: For generators, list the
+  // generator's own scopes up to its function scope, then continue with the
+  // closure's context chain like for functions (instead of the lexical outer
+  // scopes). Empty scopes are omitted, except for a generator's own scope.
+  auto advance = [&]() {
+    if (!generator_function.IsEmpty() &&
+        iterator->GetType() == v8::debug::ScopeIterator::ScopeTypeLocal) {
+      iterator = v8::debug::ScopeIterator::CreateForFunction(
+          m_isolate, generator_function);
+      generator_function.Clear();
+    } else {
+      iterator->Advance();
+    }
+  };
+  for (; iterator && !iterator->Done(); advance()) {
+    if (iterator->GetType() != v8::debug::ScopeIterator::ScopeTypeLocal &&
+        !iterator->DeclaresLocals()) {
+      continue;
+    }
     v8::Local<v8::Object> scope = v8::Object::New(m_isolate);
     if (!addInternalObject(context, scope, V8InternalValueType::kScope)) {
       return v8::MaybeLocal<v8::Value>();

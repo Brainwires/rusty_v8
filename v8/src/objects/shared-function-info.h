@@ -137,6 +137,8 @@ static_assert(IsAligned(OFFSET_OF_DATA_START(PreparseData),
 // Abstract class representing extra data for an uncompiled function, which is
 // not stored in the SharedFunctionInfo.
 V8_OBJECT class UncompiledData : public ExposedTrustedObject {
+  V8_IT_ABSTRACT;
+
  public:
   inline Tagged<String> inferred_name() const;
   inline void set_inferred_name(Tagged<String> value,
@@ -169,6 +171,8 @@ V8_OBJECT class UncompiledData : public ExposedTrustedObject {
 // data from the pre-parser, either because it's a leaf function or because the
 // pre-parser bailed out.
 V8_OBJECT class UncompiledDataWithoutPreparseData : public UncompiledData {
+  V8_IT_OWN_TYPE;
+
  public:
   DECL_PRINTER(UncompiledDataWithoutPreparseData)
   DECL_VERIFIER(UncompiledDataWithoutPreparseData)
@@ -179,6 +183,8 @@ V8_OBJECT class UncompiledDataWithoutPreparseData : public UncompiledData {
 // Class representing data for an uncompiled function that has pre-parsed scope
 // data.
 V8_OBJECT class UncompiledDataWithPreparseData : public UncompiledData {
+  V8_IT_OWN_TYPE;
+
  public:
   inline Tagged<PreparseData> preparse_data() const;
   inline void set_preparse_data(Tagged<PreparseData> value,
@@ -283,7 +289,7 @@ V8_OBJECT class SharedFunctionInfo : public HeapObject {
       PropertiesAreFinalBit::Next<bool, 1>;
   using IsHoistedInContextBit =
       PrivateNameLookupSkipsOuterClassBit::Next<bool, 1>;
-  using LiveEditedBit = IsHoistedInContextBit::Next<bool, 1>;
+  using ClassInitializerAllowsAwaitBit = IsHoistedInContextBit::Next<bool, 1>;
   // Bit positions in |flags2|.
   using ClassScopeHasPrivateBrandBit = base::BitField<bool, 0, 1, uint8_t>;
   using HasStaticPrivateMethodsOrAccessorsBit =
@@ -374,6 +380,8 @@ V8_OBJECT class SharedFunctionInfo : public HeapObject {
   static constexpr int kAgeSize = sizeof(uint16_t);
   static constexpr uint16_t kMaxAge = UINT16_MAX;
 
+  inline bool HasScopeInfo() const;
+  inline bool HasScopeInfo(AcquireLoadTag tag) const;
   DECL_ACQUIRE_GETTER(scope_info, Tagged<ScopeInfo>)
   // Deprecated, use the ACQUIRE version instead.
   DECL_GETTER(scope_info, Tagged<ScopeInfo>)
@@ -395,9 +403,6 @@ V8_OBJECT class SharedFunctionInfo : public HeapObject {
 
   // Start position of this function in the script source.
   V8_EXPORT_PRIVATE int StartPosition() const;
-
-  V8_EXPORT_PRIVATE void UpdateFromFunctionLiteralForLiveEdit(
-      IsolateForSandbox isolate, FunctionLiteral* lit);
 
   // [outer scope info | feedback metadata] Shared storage for outer scope info
   // (on uncompiled functions) and feedback metadata (on compiled functions).
@@ -516,7 +521,7 @@ V8_OBJECT class SharedFunctionInfo : public HeapObject {
 
  public:
   static constexpr IndirectPointerTagRange kTrustedDataIndirectPointerRange =
-      kAllIndirectPointerTags;
+      kSFITrustedDataIndirectPointerRange;
 
   inline bool IsApiFunction() const;
   inline bool is_class_constructor() const;
@@ -701,11 +706,11 @@ V8_OBJECT class SharedFunctionInfo : public HeapObject {
   // closest outer class scope.
   DECL_BOOLEAN_ACCESSORS(private_name_lookup_skips_outer_class)
 
-  // Indicates that the shared function info was live-edited.
-  DECL_BOOLEAN_ACCESSORS(live_edited)
-
   // Indicates that the function is a hoisted-in-context declaration.
   DECL_BOOLEAN_ACCESSORS(is_hoisted_in_context)
+
+  // Indicates that a class initializer's enclosing scope allowed await.
+  DECL_BOOLEAN_ACCESSORS(class_initializer_allows_await)
 
   inline FunctionKind kind() const;
 
@@ -824,13 +829,13 @@ V8_OBJECT class SharedFunctionInfo : public HeapObject {
   void SetFunctionTokenPosition(int function_token_position,
                                 int start_position);
 
-  static void EnsureBytecodeArrayAvailable(
+  V8_EXPORT_PRIVATE static void EnsureBytecodeArrayAvailable(
       Isolate* isolate, Handle<SharedFunctionInfo> shared_info,
       IsCompiledScope* is_compiled_scope,
       CreateSourcePositions flag = CreateSourcePositions{false});
 
   inline bool CanCollectSourcePosition(Isolate* isolate);
-  static void EnsureSourcePositionsAvailable(
+  V8_EXPORT_PRIVATE static void EnsureSourcePositionsAvailable(
       Isolate* isolate, DirectHandle<SharedFunctionInfo> shared_info);
 
   template <typename IsolateT>
@@ -960,9 +965,7 @@ V8_OBJECT class SharedFunctionInfo : public HeapObject {
   inline Tagged<BytecodeArray> GetBytecodeArrayInternal(Isolate* isolate) const;
 
  public:
-  // trusted_function_data may point at any concrete ExposedTrustedObject, so
-  // the indirect-pointer tag range covers all trusted tags.
-  TrustedPointerMember<ExposedTrustedObject, kAllIndirectPointerTags>
+  TrustedPointerMember<ExposedTrustedObject, kTrustedDataIndirectPointerRange>
       trusted_function_data_;
   TaggedMember<Object> untrusted_function_data_;
   TaggedMember<NameOrScopeInfoT> name_or_scope_info_;

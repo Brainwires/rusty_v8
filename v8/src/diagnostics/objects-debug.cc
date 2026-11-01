@@ -43,6 +43,7 @@
 #include "src/objects/js-disposable-stack.h"
 #include "src/objects/js-proxy-inl.h"
 #include "src/objects/literal-objects.h"
+#include "src/objects/object-conversions-inl.h"
 #include "src/objects/objects-inl.h"
 #include "src/objects/objects.h"
 #include "src/objects/property-details.h"
@@ -197,6 +198,8 @@ void HeapObject::HeapObjectVerify(Isolate* isolate) {
   // Cast away heapobject-ness so that the IsHeapObject test is non-trivial.
   CHECK(IsHeapObject(Tagged<Object>(this)));
 
+  if (IsInaccessible(Tagged<HeapObject>(this))) return;
+
   Object::VerifyPointer(isolate, map());
   CHECK(IsMap(map()));
 
@@ -294,6 +297,13 @@ void HeapObject::HeapObjectVerify(Isolate* isolate) {
     case WASM_EXCEPTION_PACKAGE_TYPE:
       Cast<WasmExceptionPackage>(this)->WasmExceptionPackageVerify(isolate);
       break;
+    case WASM_NULL_TYPE:
+      // With static roots, WasmNull is caught by the IsInaccessible(...) check
+      // before the switch.
+      // Without static roots, WasmNull is accessible, and we reach here.
+      DCHECK(!V8_STATIC_ROOTS_BOOL);
+      Cast<WasmNull>(this)->WasmNullVerify(isolate);
+      break;
 #endif  // V8_ENABLE_WEBASSEMBLY
     case JS_SET_KEY_VALUE_ITERATOR_TYPE:
     case JS_SET_VALUE_ITERATOR_TYPE:
@@ -319,15 +329,12 @@ void HeapObject::HeapObjectVerify(Isolate* isolate) {
       Cast<HashSeedWrapper>(this)->HashSeedWrapperVerify(isolate);
       break;
 
-#define MAKE_TORQUE_CASE(Name, TYPE)                \
+#define MAKE_VERIFY_CASE(Name, TYPE)                \
   case TYPE:                                        \
     TrustedCast<Name>(this)->Name##Verify(isolate); \
     break;
-      // Every class that has its fields defined in a .tq file and corresponds
-      // to exactly one InstanceType value is included in the following list.
-      TORQUE_INSTANCE_CHECKERS_SINGLE_FULLY_DEFINED(MAKE_TORQUE_CASE)
-      TORQUE_INSTANCE_CHECKERS_MULTIPLE_FULLY_DEFINED(MAKE_TORQUE_CASE)
-#undef MAKE_TORQUE_CASE
+      HEAP_OBJECT_DIAGNOSTIC_DISPATCH_LIST(MAKE_VERIFY_CASE)
+#undef MAKE_VERIFY_CASE
 
     case HOLE_TYPE:
       Cast<Hole>(this)->HoleVerify(isolate);
@@ -386,6 +393,9 @@ void HeapObject::VerifyHeapPointer(Isolate* isolate, Tagged<Object> p) {
   // If you crashed here and {isolate->is_shared()}, there is a bug causing the
   // host of {p} to point to a non-shared object.
   CHECK(IsValidHeapObject(isolate->heap(), Cast<HeapObject>(p)));
+  // Before we can inspect instance types, we have to skip over inaccessible
+  // objects.
+  if (IsInaccessible(Cast<HeapObject>(p))) return;
   CHECK_IMPLIES(V8_EXTERNAL_CODE_SPACE_BOOL, !IsInstructionStream(p));
 }
 
@@ -1126,6 +1136,9 @@ void ScopeInfo::ScopeInfoVerify(Isolate* isolate) {
 
   if (is_module) {
     CHECK_LE(0, module_variable_count());
+    if (HasModuleVariablesHashtable()) {
+      CHECK(IsNameToIndexHashTable(module_variables_hashtable()));
+    }
   }
 
   if (has_hashtable) {
@@ -1693,7 +1706,8 @@ void JSFunction::JSFunctionVerify(Isolate* isolate) {
     CHECK(IsAccessorInfo(*it.GetAccessors()));
   } else {
     CHECK(!it.IsFound() || it.state() != LookupIterator::ACCESSOR ||
-          !IsAccessorInfo(*it.GetAccessors()));
+          !IsAccessorInfo(*it.GetAccessors()) ||
+          *it.GetAccessors() == *isolate->factory()->lazy_closure_accessor());
   }
 
   CHECK_IMPLIES(shared()->HasBuiltinId(),
@@ -1915,6 +1929,10 @@ void Hole::HoleVerify(Isolate* isolate) {
 }
 
 void Foreign::ForeignVerify(Isolate* isolate) { CHECK(Is<Foreign>(this)); }
+
+void CppGCManagedBase::CppGCManagedBaseVerify(Isolate* isolate) {
+  CHECK(Is<CppGCManagedBase>(this));
+}
 
 void TrustedForeign::TrustedForeignVerify(Isolate* isolate) {
   CHECK(Is<TrustedForeign>(this));
@@ -2171,7 +2189,7 @@ void JSCollator::JSCollatorVerify(Isolate* isolate) {
 void JSV8BreakIterator::JSV8BreakIteratorVerify(Isolate* isolate) {
   JSObjectVerify(isolate);
   CHECK(IsString(locale()));
-  CHECK(IsForeign(icu_iterator_with_text_.load()));
+  CHECK(IsCppGCManagedBase(icu_iterator_with_text_.load()));
   CHECK(IsUndefined(bound_adopt_text()) || IsJSFunction(bound_adopt_text()));
   CHECK(IsUndefined(bound_first()) || IsJSFunction(bound_first()));
   CHECK(IsUndefined(bound_next()) || IsJSFunction(bound_next()));
@@ -2191,7 +2209,7 @@ void JSDateTimeFormat::JSDateTimeFormatVerify(Isolate* isolate) {
 
 void JSDisplayNames::JSDisplayNamesVerify(Isolate* isolate) {
   JSObjectVerify(isolate);
-  CHECK(IsForeign(internal_.load()));
+  CHECK(IsCppGCManagedBase(internal_.load()));
   CHECK(IsSmi(flags_.load()));
 }
 
@@ -2242,14 +2260,14 @@ void JSSegmenter::JSSegmenterVerify(Isolate* isolate) {
 
 void JSSegments::JSSegmentsVerify(Isolate* isolate) {
   JSObjectVerify(isolate);
-  CHECK(IsForeign(icu_iterator_with_text_.load()));
+  CHECK(IsCppGCManagedBase(icu_iterator_with_text_.load()));
   CHECK(IsString(raw_string()));
   CHECK(IsSmi(flags_.load()));
 }
 
 void JSSegmentIterator::JSSegmentIteratorVerify(Isolate* isolate) {
   JSObjectVerify(isolate);
-  CHECK(IsForeign(icu_iterator_with_text_.load()));
+  CHECK(IsCppGCManagedBase(icu_iterator_with_text_.load()));
   CHECK(IsString(raw_string()));
   CHECK(IsSmi(flags_.load()));
 }
@@ -2789,7 +2807,7 @@ void RegExpData::RegExpDataVerify(Isolate* isolate) {
 #define DEFINE_TEMPORAL_VERIFIER(JSType, field)   \
   void JSType::JSType##Verify(Isolate* isolate) { \
     JSObjectVerify(isolate);                      \
-    CHECK(IsForeign(field##_.load()));            \
+    CHECK(IsCppGCManagedBase(field##_.load()));   \
   }
 
 DEFINE_TEMPORAL_VERIFIER(JSTemporalDuration, duration)
@@ -3413,24 +3431,29 @@ void WasmExportedFunctionData::WasmExportedFunctionDataVerify(
   CHECK(IsCell(wrapper_budget_.load()));
   Object::VerifyPointer(isolate, packed_args_size_.load());
   CHECK(IsSmi(packed_args_size_.load()));
-  Tagged<Code> wrapper = wrapper_code(isolate);
-  CHECK(wrapper->kind() == CodeKind::JS_TO_WASM_FUNCTION ||
-        wrapper->kind() == CodeKind::C_WASM_ENTRY ||
-        (wrapper->is_builtin() &&
-         (wrapper->builtin_id() == Builtin::kJSToWasmWrapper ||
+  // The external JSFunction is attached after NewWasmExportedFunctionData
+  // finishes, so verify its wrapper code once attached.
+  Tagged<JSFunction> external;
+  if (internal()->try_get_external(&external)) {
+    Object::VerifyPointer(isolate, external);
+    Tagged<Code> wrapper = external->code(isolate);
+    CHECK(wrapper->kind() == CodeKind::JS_TO_WASM_FUNCTION ||
+          (wrapper->is_builtin() &&
+           (wrapper->builtin_id() == Builtin::kJSToWasmWrapper ||
 #if V8_ENABLE_DRUMBRAKE
-          wrapper->builtin_id() == Builtin::kJSToWasmInterpreterWrapper ||
-          wrapper->builtin_id() == Builtin::kJSToWasmInterpreterWrapperAsm ||
+            wrapper->builtin_id() == Builtin::kJSToWasmInterpreterWrapper ||
+            wrapper->builtin_id() == Builtin::kJSToWasmInterpreterWrapperAsm ||
 #endif  // V8_ENABLE_DRUMBRAKE
-          wrapper->builtin_id() == Builtin::kWasmPromising ||
-          wrapper->builtin_id() == Builtin::kWasmStressSwitch)));
+            wrapper->builtin_id() == Builtin::kWasmPromising ||
+            wrapper->builtin_id() == Builtin::kWasmStressSwitch)));
+  }
 }
 
 void WasmCapiFunctionData::WasmCapiFunctionDataVerify(Isolate* isolate) {
   CHECK(Is<WasmCapiFunctionData>(this));
   WasmFunctionDataVerify(isolate);
   Object::VerifyPointer(isolate, embedder_data_.load());
-  CHECK(IsForeign(embedder_data_.load()));
+  CHECK(Is<CppGCManagedBase>(embedder_data_.load()));
 }
 
 void WasmSuspenderObject::WasmSuspenderObjectVerify(Isolate* isolate) {
@@ -3491,6 +3514,14 @@ void WasmTagObject::WasmTagObjectVerify(Isolate* isolate) {
 
 void WasmStruct::WasmStructVerify(Isolate* isolate) {
   CHECK(Is<WasmStruct>(this));
+}
+
+void WasmCustomMap::WasmCustomMapVerify(Isolate* isolate) { UNIMPLEMENTED(); }
+
+void WasmCustomMapWrapper::WasmCustomMapWrapperVerify(Isolate* isolate) {
+  CHECK(Is<WasmCustomMapWrapper>(this));
+  CHECK(Is<WasmCustomMap>(wrapped()));
+  JSObjectVerify(isolate);
 }
 
 void WasmArray::WasmArrayVerify(Isolate* isolate) {
@@ -3908,6 +3939,7 @@ void ErrorStackData::ErrorStackDataVerify(Isolate* isolate) {
       isolate, raw_data_for_call_site_infos_or_formatted_stack_.load());
   Object::VerifyPointer(isolate, stack_trace_.load());
 }
+
 
 void SloppyArgumentsElements::SloppyArgumentsElementsVerify(Isolate* isolate) {
   CHECK_LE(length_, kMaxCapacity);

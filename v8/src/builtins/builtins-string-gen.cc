@@ -1014,6 +1014,12 @@ TF_BUILTIN(WasmJSStringEqual, StringBuiltinsAssembler) {
   // Callers must handle the case where {lhs} and {rhs} refer to the same
   // String object.
   CSA_DCHECK(this, TaggedNotEqual(left, right));
+#ifdef V8_IS_TSAN
+  CallRuntime(Runtime::kTsanAcquireForInitializationFence, NoContextConstant(),
+              right);
+  CallRuntime(Runtime::kTsanAcquireForInitializationFence, NoContextConstant(),
+              left);
+#endif
   GenerateStringEqual(left, right, length);
 }
 
@@ -1029,6 +1035,12 @@ TF_BUILTIN(WasmStringAdd_NoMapCheck, StringBuiltinsAssembler) {
 TF_BUILTIN(WasmStringCompare, StringBuiltinsAssembler) {
   auto left = Parameter<String>(Descriptor::kLeft);
   auto right = Parameter<String>(Descriptor::kRight);
+#ifdef V8_IS_TSAN
+  CallRuntime(Runtime::kTsanAcquireForInitializationFence, NoContextConstant(),
+              right);
+  CallRuntime(Runtime::kTsanAcquireForInitializationFence, NoContextConstant(),
+              left);
+#endif
   GenerateStringRelationalComparison(left, right, StringComparison::kCompare);
 }
 #endif
@@ -1575,6 +1587,11 @@ TNode<JSArray> StringBuiltinsAssembler::StringToArray(
 
     TNode<FixedArray> elements =
         CAST(AllocateFixedArray(PACKED_ELEMENTS, length));
+    // The allocation above may have internalized a shared subject, forwarding
+    // it to a ThinString or freeing an external resource, which would leave
+    // the pointer below pointing at unrelated heap data.
+    to_direct.BailIfTransitioned(&fill_thehole_and_call_runtime);
+
     // Don't allocate anything while {string_data} is live!
     TNode<RawPtrT> string_data =
         to_direct.PointerToData(&fill_thehole_and_call_runtime);
@@ -1854,13 +1871,16 @@ void StringBuiltinsAssembler::ReplaceUnpairedSurrogates(TNode<String> source,
             if_indirect);
 
   TNode<RawPtrT> source_data = DirectStringData(source, source_instance_type);
-  // The destination string is a freshly allocated SeqString, and so is always
-  // direct.
-  TNode<Uint16T> dest_instance_type = LoadInstanceType(dest);
-  CSA_DCHECK(this, Word32Equal(Word32And(dest_instance_type,
-                                         Int32Constant(kStringEncodingMask)),
-                               Int32Constant(kTwoByteStringTag)));
-  TNode<RawPtrT> dest_data = DirectStringData(dest, dest_instance_type);
+  // The destination string is a freshly allocated TwoByteSeqString, and so is
+  // always direct.
+  CSA_DCHECK(this,
+             Word32Equal(
+                 Word32And(LoadInstanceType(dest),
+                           Int32Constant(kIsNotStringMask |
+                                         kStringRepresentationAndEncodingMask)),
+                 Int32Constant(kSeqTwoByteStringTag)));
+  TNode<RawPtrT> dest_data =
+      DirectStringData(dest, Int32Constant(SEQ_TWO_BYTE_STRING_TYPE));
   TNode<IntPtrT> length = LoadStringLengthAsWord(source);
   CSA_DCHECK(this, IntPtrEqual(length, LoadStringLengthAsWord(dest)));
 

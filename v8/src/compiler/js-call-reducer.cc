@@ -7215,9 +7215,31 @@ Reduction JSCallReducer::ReduceGeneratorPrototypeNext(Node* node) {
     return NoChange();
   }
 
+  // Don't inline Generator.prototype.next across native contexts.
+  HeapObjectMatcher m(n.target());
+  if (m.HasResolvedValue() && m.Ref(broker()).IsJSFunction()) {
+    JSFunctionRef function = m.Ref(broker()).AsJSFunction();
+    if (!function.native_context(broker()).equals(native_context())) {
+      return NoChange();
+    }
+  }
+
   MapInference inference(broker(), receiver, effect);
+  bool can_use_static_maps = false;
   if (inference.HaveMaps() &&
       inference.AllOfInstanceTypesAre(JS_GENERATOR_OBJECT_TYPE)) {
+    can_use_static_maps = true;
+    for (MapRef map : inference.GetMaps()) {
+      OptionalObjectRef ctor = map.GetConstructor(broker());
+      if (!ctor.has_value() || !ctor->IsJSFunction() ||
+          !ctor->AsJSFunction().native_context(broker()).equals(
+              native_context())) {
+        return inference.NoChange();
+      }
+    }
+  }
+
+  if (can_use_static_maps) {
     inference.RelyOnMapsPreferStability(dependencies(), jsgraph(), &effect,
                                         control, p.feedback());
   } else {
@@ -7246,6 +7268,24 @@ Reduction JSCallReducer::ReduceGeneratorPrototypeNext(Node* node) {
         simplified()->CheckIf(DeoptimizeReason::kWrongInstanceType,
                               p.feedback()),
         is_generator, effect, control);
+
+    Node* receiver_context = effect = graph()->NewNode(
+        simplified()->LoadField(AccessBuilder::ForJSGeneratorObjectContext()),
+        receiver, effect, control);
+    Node* receiver_context_map = effect =
+        graph()->NewNode(simplified()->LoadField(AccessBuilder::ForMap()),
+                         receiver_context, effect, control);
+    Node* receiver_native_context = effect = graph()->NewNode(
+        simplified()->LoadField(AccessBuilder::ForMapNativeContext()),
+        receiver_context_map, effect, control);
+    Node* target_native_context =
+        jsgraph()->ConstantNoHole(native_context(), broker());
+    Node* check_realm =
+        graph()->NewNode(simplified()->ReferenceEqual(),
+                         receiver_native_context, target_native_context);
+    effect = graph()->NewNode(
+        simplified()->CheckIf(DeoptimizeReason::kWrongValue, p.feedback()),
+        check_realm, effect, control);
   }
 
   // Check if the {receiver} is running or already closed.
@@ -8105,7 +8145,7 @@ namespace {
 FrameState CreateStringCreateLazyDeoptContinuationFrameState(
     JSGraph* graph, SharedFunctionInfoRef shared, Node* target, Node* context,
     Node* outer_frame_state) {
-  Node* const receiver = graph->TheHoleConstant();
+  Node* const receiver = graph->TdzHoleConstant();
   Node* stack_parameters[]{receiver};
   const int stack_parameter_count = arraysize(stack_parameters);
   return CreateJavaScriptBuiltinContinuationFrameState(
@@ -8495,9 +8535,9 @@ Reduction JSCallReducer::ReduceTypedArrayConstructor(
                                                     context, common(), graph());
 
   // This continuation just returns the newly created JSTypedArray. We
-  // pass the_hole as the receiver, just like the builtin construct stub
+  // pass tdz_hole as the receiver, just like the builtin construct stub
   // does in this case.
-  Node* const receiver = jsgraph()->TheHoleConstant();
+  Node* const receiver = jsgraph()->TdzHoleConstant();
   Node* continuation_frame_state = CreateGenericLazyDeoptContinuationFrameState(
       jsgraph(), shared, target, context, receiver, frame_state);
 

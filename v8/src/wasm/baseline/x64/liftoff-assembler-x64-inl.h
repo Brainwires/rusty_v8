@@ -7,6 +7,7 @@
 
 #include <optional>
 
+#include "src/base/overflowing-math.h"
 #include "src/codegen/assembler.h"
 #include "src/codegen/atomic-memory-order.h"
 #include "src/codegen/cpu-features.h"
@@ -229,7 +230,9 @@ void LiftoffAssembler::PrepareTailCall(int num_callee_stack_params,
 }
 
 void LiftoffAssembler::AlignFrameSize() {
-  max_used_spill_offset_ = RoundUp(max_used_spill_offset_, kSystemPointerSize);
+  int alignment = v8_flags.enforce_x64_16byte_alignment ? 2 * kSystemPointerSize
+                                                        : kSystemPointerSize;
+  max_used_spill_offset_ = RoundUp(max_used_spill_offset_, alignment);
 }
 
 void LiftoffAssembler::PatchPrepareStackFrame(
@@ -244,6 +247,8 @@ void LiftoffAssembler::PatchPrepareStackFrame(
     frame_size -= kSystemPointerSize;
   }
   DCHECK_EQ(0, frame_size % kSystemPointerSize);
+  DCHECK_IMPLIES(v8_flags.enforce_x64_16byte_alignment,
+                 GetTotalFrameSize() % (2 * kSystemPointerSize) == 0);
 
   // We can't run out of space when patching, just pass anything big enough to
   // not cause the assembler to try to grow the buffer.
@@ -648,8 +653,15 @@ void LiftoffAssembler::Load(LiftoffRegister dst, Register src_addr,
       break;
     case LoadType::kF32LoadF16: {
       CpuFeatureScope f16c_scope(this, F16C);
-      CpuFeatureScope avx2_scope(this, AVX2);
-      vpbroadcastw(dst.fp(), src_op);
+      if (CpuFeatures::IsSupported(AVX2)) {
+        CpuFeatureScope avx2_scope(this, AVX2);
+        vpbroadcastw(dst.fp(), src_op);
+      } else {
+        CpuFeatureScope avx_scope(this, AVX);
+        vxorps(dst.fp(), dst.fp(), dst.fp());
+        if (trapping_load_pc) *trapping_load_pc = pc_offset();
+        vpinsrw(dst.fp(), dst.fp(), src_op, 0);
+      }
       vcvtph2ps(dst.fp(), dst.fp());
       break;
     }
@@ -702,6 +714,36 @@ void LiftoffAssembler::Store(Register dst_addr, Register offset_reg,
     case StoreType::kS128Store:
       Movdqu(dst_op, src.fp());
       break;
+  }
+}
+
+void LiftoffAssembler::StoreConst(Register dst_addr, Register offset_reg,
+                                  uintptr_t offset_imm, int32_t value,
+                                  StoreType type, uint32_t* trapping_store_pc,
+                                  bool i64_offset) {
+  if (offset_reg != no_reg && !i64_offset) AssertZeroExtended(offset_reg);
+  Operand dst_op = liftoff::GetMemOp(this, dst_addr, offset_reg, offset_imm);
+  if (trapping_store_pc) *trapping_store_pc = pc_offset();
+  switch (type.value()) {
+    case StoreType::kI32Store8:
+    case StoreType::kI64Store8:
+      movb(dst_op, Immediate(value));
+      break;
+    case StoreType::kI32Store16:
+    case StoreType::kI64Store16:
+      movw(dst_op, Immediate(value));
+      break;
+    case StoreType::kI32Store:
+    case StoreType::kI64Store32:
+      movl(dst_op, Immediate(value));
+      break;
+    case StoreType::kI64Store:
+      // The 32-bit immediate is sign-extended, matching how Liftoff keeps i64
+      // constants.
+      movq(dst_op, Immediate(value));
+      break;
+    default:
+      UNREACHABLE();
   }
 }
 
@@ -1024,7 +1066,7 @@ void LiftoffAssembler::AtomicExchangeTaggedPointer(
   if (trapping_load_pc) *trapping_load_pc = pc_offset();
   if constexpr (COMPRESS_POINTERS_BOOL) {
     xchgl(result.gp(), dst_op);
-    addq(result.gp(), kPtrComprCageBaseRegister);
+    orq(result.gp(), kPtrComprCageBaseRegister);
   } else {
     xchgq(result.gp(), dst_op);
   }
@@ -1373,9 +1415,7 @@ void LiftoffAssembler::emit_i32_sub(Register dst, Register lhs, Register rhs) {
 
 void LiftoffAssembler::emit_i32_subi(Register dst, Register lhs, int32_t imm) {
   if (dst != lhs) {
-    // We'll have to implement an UB-safe version if we need this corner case.
-    DCHECK_NE(imm, kMinInt);
-    leal(dst, Operand(lhs, -imm));
+    leal(dst, Operand(lhs, base::NegateWithWraparound(imm)));
   } else {
     subl(dst, Immediate(imm));
   }
@@ -2664,14 +2704,14 @@ void LiftoffAssembler::emit_cond_jump(Condition cond, Label* label,
 void LiftoffAssembler::emit_i32_cond_jumpi(Condition cond, Label* label,
                                            Register lhs, int imm,
                                            const FreezeCacheState& frozen) {
-  cmpl(lhs, Immediate(imm));
+  Cmp(lhs, imm);
   j(cond, label);
 }
 
 void LiftoffAssembler::emit_ptrsize_cond_jumpi(Condition cond, Label* label,
                                                Register lhs, int32_t imm,
                                                const FreezeCacheState& frozen) {
-  cmpq(lhs, Immediate(imm));
+  Cmpq(lhs, imm);
   j(cond, label);
 }
 
@@ -3098,8 +3138,8 @@ void LiftoffAssembler::emit_s128_relaxed_laneselect(LiftoffRegister dst,
 
 void LiftoffAssembler::emit_i8x16_popcnt(LiftoffRegister dst,
                                          LiftoffRegister src) {
-  I8x16Popcnt(dst.fp(), src.fp(), kScratchDoubleReg,
-              liftoff::kScratchDoubleReg2, kScratchRegister);
+  I8x16Popcnt(dst.fp(), src.fp(), kScratchRegister, kScratchDoubleReg,
+              liftoff::kScratchDoubleReg2);
 }
 
 void LiftoffAssembler::emit_i8x16_splat(LiftoffRegister dst,
@@ -3458,8 +3498,9 @@ void LiftoffAssembler::emit_s128_select(LiftoffRegister dst,
   // Ensure that we don't overwrite any inputs with the movaps below.
   DCHECK_NE(dst, src1);
   DCHECK_NE(dst, src2);
-  if (!CpuFeatures::IsSupported(AVX) && dst != mask) {
-    movaps(dst.fp(), mask.fp());
+  // AVX10 vpternlogd and non-AVX fallback require dst == mask.
+  if ((UseAvx10_1() || !CpuFeatures::IsSupported(AVX)) && dst != mask) {
+    Movaps(dst.fp(), mask.fp());
     S128Select(dst.fp(), dst.fp(), src1.fp(), src2.fp(), kScratchDoubleReg);
   } else {
     S128Select(dst.fp(), mask.fp(), src1.fp(), src2.fp(), kScratchDoubleReg);
@@ -3779,12 +3820,9 @@ void LiftoffAssembler::emit_i16x8_q15mulr_sat_s(LiftoffRegister dst,
 void LiftoffAssembler::emit_i16x8_relaxed_q15mulr_s(LiftoffRegister dst,
                                                     LiftoffRegister src1,
                                                     LiftoffRegister src2) {
-  if (CpuFeatures::IsSupported(AVX) || dst == src1) {
-    Pmulhrsw(dst.fp(), src1.fp(), src2.fp());
-  } else {
-    movdqa(dst.fp(), src1.fp());
-    pmulhrsw(dst.fp(), src2.fp());
-  }
+  liftoff::EmitSimdCommutativeBinOp<&Assembler::vpmulhrsw,
+                                    &Assembler::pmulhrsw>(this, dst, src1, src2,
+                                                          SSSE3);
 }
 
 void LiftoffAssembler::emit_i16x8_dot_i8x16_i7x16_s(LiftoffRegister dst,
@@ -4052,12 +4090,16 @@ void LiftoffAssembler::emit_i64x2_sub(LiftoffRegister dst, LiftoffRegister lhs,
 
 void LiftoffAssembler::emit_i64x2_mul(LiftoffRegister dst, LiftoffRegister lhs,
                                       LiftoffRegister rhs) {
-  static constexpr RegClass tmp_rc = reg_class_for(kS128);
-  LiftoffRegister tmp1 =
-      GetUnusedRegister(tmp_rc, LiftoffRegList{dst, lhs, rhs});
-  LiftoffRegister tmp2 =
-      GetUnusedRegister(tmp_rc, LiftoffRegList{dst, lhs, rhs, tmp1});
-  I64x2Mul(dst.fp(), lhs.fp(), rhs.fp(), tmp1.fp(), tmp2.fp());
+  if (UseAvx10_1()) {
+    I64x2Mul(dst.fp(), lhs.fp(), rhs.fp());
+  } else {
+    static constexpr RegClass tmp_rc = reg_class_for(kS128);
+    LiftoffRegister tmp1 =
+        GetUnusedRegister(tmp_rc, LiftoffRegList{dst, lhs, rhs});
+    LiftoffRegister tmp2 =
+        GetUnusedRegister(tmp_rc, LiftoffRegList{dst, lhs, rhs, tmp1});
+    I64x2Mul(dst.fp(), lhs.fp(), rhs.fp(), tmp1.fp(), tmp2.fp());
+  }
 }
 
 void LiftoffAssembler::emit_i64x2_extmul_low_i32x4_s(LiftoffRegister dst,
@@ -5059,7 +5101,7 @@ bool LiftoffAssembler::emit_f16x8_qfms(LiftoffRegister dst,
 }
 
 bool LiftoffAssembler::supports_f16_mem_access() {
-  return CpuFeatures::IsSupported(F16C) && CpuFeatures::IsSupported(AVX2);
+  return CpuFeatures::IsSupported(F16C);
 }
 
 void LiftoffAssembler::set_trap_on_oob_mem64(Register index, uint64_t max_index,

@@ -9,6 +9,7 @@ load("./clang_all.star", "clang_all")
 load("./clang_exception.star", "clang_exception")
 load("./config.star", "config")
 load("./gn_logs.star", "gn_logs")
+load("./platform.star", "platform")
 load("./reclient.star", "reclient")
 load("./rewrapper_cfg.star", "rewrapper_cfg")
 load("./win_sdk.star", "win_sdk")
@@ -65,8 +66,6 @@ def __step_config(ctx, step_config):
                         win_toolchain_dir + ":headers-ci",
                     ],
                 })
-            else:
-                win_sdk.step_config(ctx, step_config)
         remote_wrapper = rewrapper_config.get("remote_wrapper")
         input_root_absolute_path = gn_logs.read(ctx).get("clang_need_input_root_absolute_path") == "true"
 
@@ -108,7 +107,7 @@ def __step_config(ctx, step_config):
                 "name": "clang-cl/cxx_module",
                 "handler": "clang_compile",
                 "action": "(.*_)?cxx_module",
-                "command_prefix": "..\\third_party\\llvm-build\\Release+Asserts\\bin\\clang-cl.exe",
+                "command_prefix": "..\\..\\third_party\\llvm-build\\Release+Asserts\\bin\\clang-cl.exe",
                 "inputs": rewrapper_config_inputs + [
                     "third_party/llvm-build/Release+Asserts/bin/clang-cl.exe",
                 ],
@@ -137,7 +136,7 @@ def __step_config(ctx, step_config):
             {
                 "name": "clang-coverage/cxx",
                 "action": "(.*_)?cxx",
-                "command_prefix": "python3.exe ../../build/toolchain/clang_code_coverage_wrapper.py",
+                "command_prefix": platform.python_bin + " ../../build/toolchain/clang_code_coverage_wrapper.py",
                 "inputs": rewrapper_config_inputs + [
                     "third_party/llvm-build/Release+Asserts/bin/clang++",
                 ],
@@ -151,7 +150,7 @@ def __step_config(ctx, step_config):
             {
                 "name": "clang-coverage/cxx_module",
                 "action": "(.*_)?cxx_module",
-                "command_prefix": "python3.exe ../../build/toolchain/clang_code_coverage_wrapper.py",
+                "command_prefix": platform.python_bin + " ../../build/toolchain/clang_code_coverage_wrapper.py",
                 "inputs": rewrapper_config_inputs + [
                     "third_party/llvm-build/Release+Asserts/bin/clang++",
                 ],
@@ -167,7 +166,7 @@ def __step_config(ctx, step_config):
             {
                 "name": "clang-coverage/cc",
                 "action": "(.*_)?cc",
-                "command_prefix": "python3.exe ../../build/toolchain/clang_code_coverage_wrapper.py",
+                "command_prefix": platform.python_bin + " ../../build/toolchain/clang_code_coverage_wrapper.py",
                 "inputs": rewrapper_config_inputs + [
                     "third_party/llvm-build/Release+Asserts/bin/clang",
                 ],

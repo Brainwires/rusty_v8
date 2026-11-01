@@ -3,6 +3,7 @@
 // found in the LICENSE file.
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <vector>
 
@@ -14,6 +15,7 @@
 #include "partition_alloc/internal_allocator.h"
 #include "partition_alloc/partition_address_space.h"
 #include "partition_alloc/partition_alloc_base/compiler_specific.h"
+#include "partition_alloc/partition_alloc_base/containers/span.h"
 #include "partition_alloc/partition_alloc_base/thread_annotations.h"
 #include "partition_alloc/partition_alloc_base/threading/platform_thread_for_testing.h"
 #include "partition_alloc/partition_alloc_config.h"
@@ -27,7 +29,7 @@
 // cannot test the thread cache.
 //
 // Finally, the thread cache is not supported on all platforms.
-#if !defined(MEMORY_TOOL_REPLACES_ALLOCATOR) && \
+#if !PA_BUILDFLAG(MEMORY_TOOL_REPLACES_ALLOCATOR) && \
     PA_CONFIG(THREAD_CACHE_SUPPORTED)
 
 namespace partition_alloc::internal {
@@ -1213,7 +1215,7 @@ TEST_P(PartitionAllocThreadCacheTest, ClearFromTail) {
 }
 
 TEST_P(PartitionAllocThreadCacheTest, Bookkeeping) {
-  void* arr[kFillCountForMediumBucket] = {};
+  std::array<void*, kFillCountForMediumBucket> arr = {};
   auto* tcache = root()->thread_cache_for_testing();
 
   root()->PurgeMemory(PurgeFlags::kDecommitEmptySlotSpans |
@@ -1232,8 +1234,7 @@ TEST_P(PartitionAllocThreadCacheTest, Bookkeeping) {
   void* ptr =
       root()->Alloc(root()->AdjustSizeForExtrasSubtract(kMediumSize), "");
 
-  auto* medium_bucket =
-      PA_UNSAFE_TODO(root()->buckets_ + SizeToIndex(kMediumSize));
+  auto* medium_bucket = &root()->buckets_[SizeToIndex(kMediumSize)];
   size_t medium_alloc_size = medium_bucket->slot_size;
   expected_allocated_size += medium_alloc_size;
   expected_committed_size += kUseLazyCommit
@@ -1250,7 +1251,7 @@ TEST_P(PartitionAllocThreadCacheTest, Bookkeeping) {
 
   // These allocations all come from the thread-cache.
   for (size_t i = 0; i < kFillCountForMediumBucket; i++) {
-    PA_UNSAFE_TODO(arr[i]) =
+    arr[i] =
         root()->Alloc(root()->AdjustSizeForExtrasSubtract(kMediumSize), "");
     EXPECT_EQ(expected_committed_size, root()->total_size_of_committed_pages_);
     EXPECT_EQ(expected_committed_size, root()->max_size_of_committed_pages_);
@@ -1289,19 +1290,19 @@ TEST_P(PartitionAllocThreadCacheTest, AllocationRecording) {
   void* ptr =
       root()->Alloc(root()->AdjustSizeForExtrasSubtract(kSmallSize), "");
   ASSERT_TRUE(ptr);
-  expected_total_size += PartitionRoot::GetUsableSize(ptr);
+  expected_total_size += PartitionRoot::GetExternalUsableSize(ptr);
   void* ptr2 = root()->Alloc(
       root()->AdjustSizeForExtrasSubtract(kBucketedNotCached), "");
   ASSERT_TRUE(ptr2);
-  expected_total_size += PartitionRoot::GetUsableSize(ptr2);
+  expected_total_size += PartitionRoot::GetExternalUsableSize(ptr2);
   void* ptr3 =
       root()->Alloc(root()->AdjustSizeForExtrasSubtract(kDirectMapped), "");
   ASSERT_TRUE(ptr3);
-  expected_total_size += PartitionRoot::GetUsableSize(ptr3);
+  expected_total_size += PartitionRoot::GetExternalUsableSize(ptr3);
   void* ptr4 =
       root()->Alloc(root()->AdjustSizeForExtrasSubtract(kSingleSlot), "");
   ASSERT_TRUE(ptr4);
-  expected_total_size += PartitionRoot::GetUsableSize(ptr4);
+  expected_total_size += PartitionRoot::GetExternalUsableSize(ptr4);
 
   EXPECT_EQ(4u, tcache->thread_alloc_stats().alloc_count);
   EXPECT_EQ(expected_total_size, tcache->thread_alloc_stats().alloc_total_size);
@@ -1340,17 +1341,23 @@ TEST_P(PartitionAllocThreadCacheTest, AllocationRecordingAligned) {
   // - Direct-mapped with large alignment
   size_t alloc_count = 0;
   size_t total_size = 0;
-  size_t size_alignments[][2] = {{128, 4},
-                                 {128, 128},
-                                 {1024, 128},
-                                 {128, 1024},
-                                 {128, 2 * internal::PartitionPageSize()},
-                                 {(4 << 20) + 1, 1 << 19}};
+  struct SizeAndAlignment {
+    size_t requested_size;
+    size_t alignment;
+  };
+  const auto size_alignments = std::to_array<SizeAndAlignment>({
+      {.requested_size = 128, .alignment = 4},
+      {.requested_size = 128, .alignment = 128},
+      {.requested_size = 1024, .alignment = 128},
+      {.requested_size = 128, .alignment = 1024},
+      {.requested_size = 128, .alignment = 2 * internal::PartitionPageSize()},
+      {.requested_size = (4 << 20) + 1, .alignment = 1 << 19},
+  });
   for (auto [requested_size, alignment] : size_alignments) {
     void* ptr = root()->AlignedAlloc(alignment, requested_size);
     ASSERT_TRUE(ptr);
     alloc_count++;
-    total_size += PartitionRoot::GetUsableSize(ptr);
+    total_size += PartitionRoot::GetExternalUsableSize(ptr);
     EXPECT_EQ(alloc_count, tcache->thread_alloc_stats().alloc_count);
     EXPECT_EQ(total_size, tcache->thread_alloc_stats().alloc_total_size);
     root()->Free(ptr);
@@ -1378,25 +1385,30 @@ TEST_P(PartitionAllocThreadCacheTest, AllocationRecordingRealloc) {
   size_t dealloc_count = 0;
   size_t total_alloc_size = 0;
   size_t total_dealloc_size = 0;
-  size_t size_new_sizes[][2] = {
-      {16, 15},
-      {16, 64},
-      {16, internal::PartitionPageSize() + 1},
-      {4 << 20, 8 << 20},
-      {8 << 20, 4 << 20},
-      {(8 << 20) - internal::SystemPageSize(), 8 << 20}};
+  struct SizeAndNewSize {
+    size_t size;
+    size_t new_size;
+  };
+  const auto size_new_sizes = std::to_array<SizeAndNewSize>({
+      {.size = 16, .new_size = 15},
+      {.size = 16, .new_size = 64},
+      {.size = 16, .new_size = internal::PartitionPageSize() + 1},
+      {.size = 4 << 20, .new_size = 8 << 20},
+      {.size = 8 << 20, .new_size = 4 << 20},
+      {.size = (8 << 20) - internal::SystemPageSize(), .new_size = 8 << 20},
+  });
   for (auto [size, new_size] : size_new_sizes) {
     void* ptr = root()->Alloc(size);
     ASSERT_TRUE(ptr);
     alloc_count++;
-    size_t usable_size = PartitionRoot::GetUsableSize(ptr);
+    size_t usable_size = PartitionRoot::GetExternalUsableSize(ptr);
     total_alloc_size += usable_size;
 
     ptr = root()->Realloc(ptr, new_size, "");
     ASSERT_TRUE(ptr);
     total_dealloc_size += usable_size;
     dealloc_count++;
-    usable_size = PartitionRoot::GetUsableSize(ptr);
+    usable_size = PartitionRoot::GetExternalUsableSize(ptr);
     total_alloc_size += usable_size;
     alloc_count++;
 
@@ -1423,5 +1435,5 @@ TEST_P(PartitionAllocThreadCacheTest, AllocationRecordingRealloc) {
 
 }  // namespace partition_alloc::internal
 
-#endif  // !defined(MEMORY_TOOL_REPLACES_ALLOCATOR) &&
+#endif  // !PA_BUILDFLAG(MEMORY_TOOL_REPLACES_ALLOCATOR) &&
         // PA_CONFIG(THREAD_CACHE_SUPPORTED)

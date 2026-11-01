@@ -12,6 +12,7 @@
 #include "src/objects/backing-store.h"
 #include "src/objects/js-function.h"
 #include "src/objects/js-objects.h"
+#include "src/sandbox/check.h"
 #include "src/sandbox/external-pointer.h"
 
 // Has to be the last include (doesn't have include guards):
@@ -55,6 +56,12 @@ V8_OBJECT class JSArrayBuffer : public JSAPIObjectWithEmbedderSlots {
   inline ArrayBufferExtension* extension() const;
   inline void set_extension(ArrayBufferExtension* value);
   inline void init_extension();
+  // Returns the current extension and resets it to nullptr. Expects a witness
+  // DisallowGarbageCollection to make sure the returned extension isn't freed
+  // while a pointer to it is held on stack.
+  inline ArrayBufferExtension* extract_extension(
+      Isolate* isolate,
+      const DisallowGarbageCollection& disallow_gc V8_LIFETIME_BOUND);
 
   // [bit_field]: boolean flags
   inline uint32_t bit_field() const;
@@ -182,20 +189,6 @@ V8_OBJECT class JSArrayBuffer : public JSAPIObjectWithEmbedderSlots {
   V8_EXPORT_PRIVATE ArrayBufferExtension* CreateExtension(
       Isolate* isolate, std::shared_ptr<BackingStore> backing_store);
 
-  // Frees the associated ArrayBufferExtension and returns its backing store.
-  std::shared_ptr<BackingStore> RemoveExtension();
-
-  //
-  // Serializer/deserializer support.
-  //
-
-  // Backing stores are serialized/deserialized separately. During serialization
-  // the backing store reference is stored in the backing store field and upon
-  // deserialization it is converted back to actual external (off-heap) pointer
-  // value.
-  inline uint32_t GetBackingStoreRefForDeserialization() const;
-  inline void SetBackingStoreRefForSerialization(uint32_t ref);
-
   // Dispatched behavior.
   DECL_PRINTER(JSArrayBuffer)
   DECL_VERIFIER(JSArrayBuffer)
@@ -319,7 +312,7 @@ class ArrayBufferExtension final
   bool IsMarked() const { return marked_.load(std::memory_order_relaxed); }
 
   void YoungMark() {
-    DCHECK_EQ(ArrayBufferExtension::Age::kYoung, age());
+    SBXCHECK_EQ(ArrayBufferExtension::Age::kYoung, age());
     set_young_gc_state(GcState::Copied);
   }
   void YoungMarkPromoted() {
@@ -424,6 +417,8 @@ class ArrayBufferExtension final
 };
 
 V8_OBJECT class JSArrayBufferView : public JSAPIObjectWithEmbedderSlots {
+  V8_IT_ABSTRACT;
+
  public:
   // [buffer]: the underlying ArrayBuffer.
   inline Tagged<JSArrayBuffer> buffer() const;
@@ -486,6 +481,8 @@ static_assert(IsAligned(offsetof(JSArrayBufferView, raw_byte_length_),
                         kUIntptrSize));
 
 V8_OBJECT class JSTypedArray : public JSArrayBufferView {
+  V8_IT_OWN_TYPE;
+
  public:
   static constexpr size_t kMaxByteLength = JSArrayBuffer::kMaxByteLength;
   static_assert(kMaxByteLength == v8::TypedArray::kMaxByteLength);
@@ -556,20 +553,8 @@ V8_OBJECT class JSTypedArray : public JSArrayBufferView {
   // Serializer/deserializer support.
   //
 
-  // External backing stores are serialized/deserialized separately.
-  // During serialization the backing store reference is stored in the typed
-  // array object and upon deserialization it is converted back to actual
-  // external (off-heap) pointer value.
-  // The backing store reference is stored in the external_pointer field.
-  inline uint32_t GetExternalBackingStoreRefForDeserialization() const;
-  inline void SetExternalBackingStoreRefForSerialization(uint32_t ref);
-
-  // Subtracts external pointer compensation from the external pointer value.
-  inline void RemoveExternalPointerCompensationForSerialization(
-      Isolate* isolate);
-  // Adds external pointer compensation to the external pointer value.
-  inline void AddExternalPointerCompensationForDeserialization(
-      Isolate* isolate);
+  // Initializes the external pointer value for on-heap typed arrays.
+  inline void InitOnHeapDataPtrAfterDeserialization(Isolate* isolate);
 
   static inline MaybeDirectHandle<JSTypedArray> Validate(
       Isolate* isolate, DirectHandle<Object> receiver, const char* method_name,
@@ -596,8 +581,6 @@ V8_OBJECT class JSTypedArray : public JSArrayBufferView {
       v8::ArrayBufferView::kEmbedderFieldCount > 0;
 
  private:
-  template <typename IsolateT>
-  friend class Deserializer;
   friend class Factory;
 
   inline void set_length(size_t value);
@@ -633,6 +616,8 @@ V8_OBJECT class JSDetachedTypedArray : public JSTypedArray {
 } V8_OBJECT_END;
 
 V8_OBJECT class JSDataViewOrRabGsabDataView : public JSArrayBufferView {
+  V8_IT_ABSTRACT;
+
  public:
   // [data_pointer]: pointer to the actual data.
   inline void* data_pointer() const;
@@ -676,6 +661,7 @@ V8_OBJECT class JSRabGsabDataView : public JSDataViewOrRabGsabDataView {
 } V8_OBJECT_END;
 
 V8_OBJECT class TypedArrayConstructor : public JSFunctionWithPrototype {
+  V8_IT_ABSTRACT;
 } V8_OBJECT_END;
 V8_OBJECT class Uint8TypedArrayConstructor : public TypedArrayConstructor {
 } V8_OBJECT_END;

@@ -67,6 +67,18 @@ class NodeRanges {
     return *range;
   }
 
+  void InitializeRangeIfMissing(BasicBlock* block, ValueNode* node,
+                                Range range) {
+    DCHECK(ranges_initialized_.Contains(block->id()));
+    RangeMap& map = ranges_[block->id()];
+    if (!map.find(node)) {
+      map = map.insert(zone(), node, range);
+      TRACE_RANGE("Initializing in Block b" << block->id() << ": "
+                                            << PrintNodeBrief(node) << ": "
+                                            << range);
+    }
+  }
+
   void UnionUpdate(BasicBlock* block, ValueNode* node, Range range) {
     DCHECK(ranges_initialized_.Contains(block->id()));
     RangeMap& map = ranges_[block->id()];
@@ -210,6 +222,15 @@ class RangeProcessor {
   BlockProcessResult PreProcessBasicBlock(BasicBlock* block) {
     current_block_ = block;
     ranges_.EnsureMapExistsFor(block);
+    if (block->has_state() && block->state()->is_resumable_loop() &&
+        block->predecessor_count() == 1) {
+      // Resumable loop headers might not have a live forward predecessor: that
+      // part of the code might be dead even though the loop is still reachable
+      // via a resume point. Make sure we initialize phis in such case. If the
+      // loop has a live predecessor, ProcessPhis is called when processing that
+      // live predecessor, and this code is a no-op.
+      InitializeLoopPhisIfMissing(block);
+    }
     return BlockProcessResult::kContinue;
   }
   BlockProcessResult PostProcessBasicBlock(BasicBlock* block) {
@@ -325,6 +346,12 @@ class RangeProcessor {
                         const ProcessingState&) {
     UnionUpdateInt32(
         node, Range::Mul(Get(node->input_node(0)), Get(node->input_node(1))));
+    return ProcessResult::kContinue;
+  }
+  ProcessResult Process(Int32ModulusWithOverflow* node,
+                        const ProcessingState&) {
+    UnionUpdateInt32(
+        node, Range::Mod(Get(node->input_node(0)), Get(node->input_node(1))));
     return ProcessResult::kContinue;
   }
   ProcessResult Process(Int32BitwiseAnd* node, const ProcessingState&) {
@@ -537,17 +564,24 @@ class RangeProcessor {
     }
   }
 
+  void InitializeLoopPhisIfMissing(BasicBlock* block) {
+    if (!block->has_phi()) return;
+    for (Phi* phi : *block->phis()) {
+      ranges_.InitializeRangeIfMissing(
+          block, phi, phi->is_int32() ? Range::Int32() : Range::All());
+    }
+  }
+
   // Returns true if the loop reach a fixpoint.
   bool ProcessLoopPhisBackedge(BasicBlock* block, BasicBlock* backedge_pred) {
     if (!block->has_phi()) return true;
     DCHECK_EQ(backedge_pred, block->backedge_predecessor());
     ranges_.EnsureMapExistsFor(block);  // TODO(victorgomes): not sure if needed
     TRACE_RANGE(">>>> Processing backedges for Block b" << block->id());
-    int backedge_id = block->state()->predecessor_count() - 1;
     bool is_done = true;
     for (Phi* phi : *block->phis()) {
       Range range = ranges_.Get(block, phi);
-      Range backedge = ranges_.Get(backedge_pred, phi->input_node(backedge_id));
+      Range backedge = ranges_.Get(backedge_pred, phi->backedge());
       Range widened = Range::Widen(range, backedge);
       if (phi->is_int32()) {
         // Since phi representation selector promoted this phi to Int32,

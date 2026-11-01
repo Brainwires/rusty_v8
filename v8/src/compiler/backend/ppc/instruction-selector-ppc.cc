@@ -1194,6 +1194,10 @@ void InstructionSelector::VisitUint64Add128(OpIndex node) { UNIMPLEMENTED(); }
 
 void InstructionSelector::VisitUint64Sub128(OpIndex node) { UNIMPLEMENTED(); }
 
+void InstructionSelector::VisitUint64Add3WithCarry(OpIndex node) {
+  UNREACHABLE();
+}
+
 void InstructionSelector::VisitUint32MulHigh(OpIndex node) {
   PPCOperandGenerator g(this);
   const WordBinopOp& op = Cast<WordBinopOp>(node);
@@ -2724,7 +2728,7 @@ void InstructionSelector::VisitS128Const(OpIndex node) {
   uint32_t val[kSimd128Size / sizeof(uint32_t)];
   const Simd128ConstantOp& constant =
       this->Get(node).template Cast<Simd128ConstantOp>();
-  memcpy(val, constant.value, kSimd128Size);
+  memcpy(val, constant.value.data(), kSimd128Size);
   // If all bytes are zeros, avoid emitting code for generic constants.
   bool all_zeros = !(val[0] || val[1] || val[2] || val[3]);
   bool all_ones = val[0] == UINT32_MAX && val[1] == UINT32_MAX &&

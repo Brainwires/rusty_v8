@@ -26,45 +26,56 @@ namespace v8::internal::compiler::turboshaft {
           s[11], s[12], s[13], s[14], s[15]);                                 \
   } while (false)
 
-void DemandedByteAnalysis::Add(OpIndex node, DemandedBytes demanded) {
+void DemandedByteAnalysis::Add(OpIndex node, DemandState demand) {
   const Operation& op = input_graph().Get(node);
   // We're trying to find out which SIMD bytes of op are used. If op has more
   // than a single user we will have to visit it multiple times. Both `Record`
   // methods will attempt to recursively add more operations.
   if (op.saturated_use_count.Is(1)) {
-    TRACE("Found Op %d, demanded bytes: %#04x\n", input_graph().Index(op).id(),
-          static_cast<uint32_t>(demanded.bytes()));
-    RecordOp(op, demanded);
+    RecordOp(op, demand);
   } else {
-    RecordPartialOp(op, demanded);
+    RecordPartialOp(op, demand);
   }
 }
 
 void DemandedByteAnalysis::AddOp(const Simd128UnaryOp& unop,
-                                 DemandedBytes demanded) {
+                                 DemandState demand) {
   if (Visited(&unop)) return;
   visited_.insert(&unop);
 
   if (IsUnaryLowHalfOp(unop.kind)) {
-    demanded.HalveWithLimit(GetInputElementSizeInBytes(unop.kind));
-    Add(unop.input(), demanded);
+    demand.bytes.HalveWithLimit(ElementSizeInBytes(unop.input_element_rep()));
+    Add(unop.input(), demand);
+  } else if (IsUnaryPassThruOp(unop.kind)) {
+    if (!TrySearchThroughPassThru(
+            unop, demand, ElementSizeInBytes(unop.input_element_rep()))) {
+      return;
+    }
+    Add(unop.input(), demand);
   }
 }
 
 void DemandedByteAnalysis::AddOp(const Simd128BinopOp& binop,
-                                 DemandedBytes demanded) {
+                                 DemandState demand) {
   if (Visited(&binop)) return;
   visited_.insert(&binop);
 
   if (IsBinaryLowHalfOp(binop.kind)) {
-    demanded.HalveWithLimit(GetInputElementSizeInBytes(binop.kind));
-    Add(binop.left(), demanded);
-    Add(binop.right(), demanded);
+    demand.bytes.HalveWithLimit(ElementSizeInBytes(binop.input_element_rep()));
+    Add(binop.left(), demand);
+    Add(binop.right(), demand);
+  } else if (IsBinaryPassThruOp(binop.kind)) {
+    if (!TrySearchThroughPassThru(
+            binop, demand, ElementSizeInBytes(binop.input_element_rep()))) {
+      return;
+    }
+    Add(binop.left(), demand);
+    Add(binop.right(), demand);
   }
 }
 
 void DemandedByteAnalysis::AddOp(const Simd128ExtractLaneOp& extract_op,
-                                 DemandedBytes demanded) {
+                                 DemandState demand) {
   if (Visited(&extract_op)) return;
   visited_.insert(&extract_op);
 
@@ -73,68 +84,107 @@ void DemandedByteAnalysis::AddOp(const Simd128ExtractLaneOp& extract_op,
 
   uint8_t elem_size =
       ElementSizeInBytes(Simd128ExtractLaneOp::element_rep(extract_op.kind));
-  demanded = DemandedBytes::LowFromLane(elem_size, extract_op.lane);
+  demand.bytes = DemandedBytes::LowFromLane(elem_size, extract_op.lane);
   TRACE("ExtractOp %d extracts lane %d, of size %d, so demands: %#04x\n",
         input_graph().Index(extract_op).id(), extract_op.lane, elem_size,
-        static_cast<uint32_t>(demanded.bytes()));
-  Add(extract_op.input(), demanded);
+        static_cast<uint32_t>(demand.bytes.bytes()));
+  Add(extract_op.input(), demand);
 }
 
 void DemandedByteAnalysis::AddOp(const Simd128LaneMemoryOp& lane_op,
-                                 DemandedBytes demanded) {
+                                 DemandState demand) {
   if (Visited(&lane_op)) return;
   visited_.insert(&lane_op);
 
   if (lane_op.mode == Simd128LaneMemoryOp::Mode::kStore) {
-    demanded = DemandedBytes::LowFromLane(lane_op.lane_size(), lane_op.lane);
+    demand.bytes =
+        DemandedBytes::LowFromLane(lane_op.lane_size(), lane_op.lane);
     TRACE("LaneMemoryOp %d stores lane %d, of size %d, so demands: %#04x\n",
           input_graph().Index(lane_op).id(), lane_op.lane, lane_op.lane_size(),
-          static_cast<uint32_t>(demanded.bytes()));
-    Add(lane_op.value(), demanded);
+          static_cast<uint32_t>(demand.bytes.bytes()));
+    Add(lane_op.value(), demand);
   }
 }
 
-void DemandedByteAnalysis::RecordOp(const Operation& op,
-                                    DemandedBytes demanded) {
+void DemandedByteAnalysis::AddOp(const Simd128ShiftOp& shiftop,
+                                 DemandState demand) {
+  if (Visited(&shiftop)) return;
+  visited_.insert(&shiftop);
+
+  if (IsShiftPassThruOp(shiftop.kind)) {
+    if (!TrySearchThroughPassThru(
+            shiftop, demand, ElementSizeInBytes(shiftop.input_element_rep()))) {
+      return;
+    }
+    Add(shiftop.input(), demand);
+  }
+}
+
+void DemandedByteAnalysis::AddOp(const Simd128TernaryOp& ternary,
+                                 DemandState demand) {
+  if (Visited(&ternary)) return;
+  visited_.insert(&ternary);
+
+  if (IsTernaryPassThruOp(ternary.kind)) {
+    if (!TrySearchThroughPassThru(
+            ternary, demand, ElementSizeInBytes(ternary.input_element_rep()))) {
+      return;
+    }
+    Add(ternary.first(), demand);
+    Add(ternary.second(), demand);
+    Add(ternary.third(), demand);
+  }
+}
+
+void DemandedByteAnalysis::RecordOp(const Operation& op, DemandState demand) {
+  // Don't record it if we can't reduce it.
+  if (demand.bytes.IsAll()) return;
+
   if (auto* unop = op.TryCast<Simd128UnaryOp>()) {
-    AddOp(*unop, demanded);
+    AddOp(*unop, demand);
   } else if (auto* binop = op.TryCast<Simd128BinopOp>()) {
-    AddOp(*binop, demanded);
+    AddOp(*binop, demand);
+  } else if (auto* shiftop = op.TryCast<Simd128ShiftOp>()) {
+    AddOp(*shiftop, demand);
+  } else if (auto* ternary = op.TryCast<Simd128TernaryOp>()) {
+    AddOp(*ternary, demand);
   } else if (auto* extract_op = op.TryCast<Simd128ExtractLaneOp>()) {
-    AddOp(*extract_op, demanded);
+    AddOp(*extract_op, demand);
   } else if (auto* lane_op = op.TryCast<Simd128LaneMemoryOp>()) {
-    AddOp(*lane_op, demanded);
+    AddOp(*lane_op, demand);
   } else if (auto* shuffle = op.TryCast<Simd128ShuffleOp>()) {
-    if (!demanded.IsAll()) {
-      if (demanded_bytes_.size() < kMaxNumOperations) {
-        demanded_bytes_.emplace_back(shuffle, demanded);
-      } else if (!demanded_limit_reached_) {
-        TRACE("Demanded elements limit reached in RecordOp\n");
-        demanded_limit_reached_ = true;
-      }
+    if (demanded_bytes_.size() < kMaxNumOperations) {
+      TRACE("Shuffle Op %d, demanded bytes: %#04x\n",
+            input_graph().Index(op).id(),
+            static_cast<uint32_t>(demand.bytes.bytes()));
+      demanded_bytes_.emplace_back(shuffle, demand.bytes);
+    } else if (!demanded_limit_reached_) {
+      TRACE("Demanded elements limit reached in RecordOp\n");
+      demanded_limit_reached_ = true;
     }
   }
 }
 
-std::optional<DemandedBytes> DemandedByteAnalysis::AddUserAndCheckFoundAll(
-    const Operation& op, const DemandedBytes& demanded) {
+std::optional<DemandedByteAnalysis::DemandState>
+DemandedByteAnalysis::AddUserAndCheckFoundAll(const Operation& op,
+                                              DemandState demand) {
   for (MultiUserBits& multi_use : to_revisit_) {
     if (multi_use.op() == &op) {
-      multi_use.Add(demanded);
+      multi_use.Add(demand);
       if (multi_use.FoundAllUsers()) {
         // Ensure we don't visit this again from the top-level search.
         visited_.insert(&op);
         TRACE("Found all users (%d) of Op %d, demanded bytes: %#04x\n",
               op.saturated_use_count.GetMaybeSaturated(),
               input_graph().Index(op).id(),
-              static_cast<uint32_t>(multi_use.demanded().bytes()));
-        return multi_use.demanded();
+              static_cast<uint32_t>(multi_use.demand().bytes.bytes()));
+        return multi_use.demand();
       }
       return {};
     }
   }
   if (to_revisit_.size() < kMaxNumOperations) {
-    to_revisit_.emplace_back(&op, demanded, 1);
+    to_revisit_.emplace_back(&op, demand, 1);
   } else if (!revisit_limit_reached_) {
     TRACE("Revisit limit reached\n");
     revisit_limit_reached_ = true;
@@ -142,42 +192,123 @@ std::optional<DemandedBytes> DemandedByteAnalysis::AddUserAndCheckFoundAll(
   return {};
 }
 
+bool DemandedByteAnalysis::TrySearchThroughPassThru(
+    const Operation& op, DemandState& demand, uint8_t bytes_per_lane) const {
+  if (demand.pass_thru_depth >= kMaxPassThruDepth) {
+    TRACE("Pass-through depth limit reached at Op %d\n",
+          input_graph().Index(op).id());
+    return false;
+  }
+  demand.bytes.WidenToLaneBoundary(bytes_per_lane);
+  ++demand.pass_thru_depth;
+  return true;
+}
+
 void DemandedByteAnalysis::RecordPartialOp(const Operation& op,
-                                           DemandedBytes demanded) {
+                                           DemandState demand) {
+  // Don't record it if we can't reduce it.
+  if (demand.bytes.IsAll()) return;
+
   TRACE("Recording partial Op %d, demanded bytes: %#04x\n",
-        input_graph().Index(op).id(), static_cast<uint32_t>(demanded.bytes()));
+        input_graph().Index(op).id(),
+        static_cast<uint32_t>(demand.bytes.bytes()));
+
   if (auto* unop = op.TryCast<Simd128UnaryOp>()) {
-    RecordPartialOp(*unop, demanded);
+    RecordPartialOp(*unop, demand);
   } else if (auto* binop = op.TryCast<Simd128BinopOp>()) {
-    RecordPartialOp(*binop, demanded);
+    RecordPartialOp(*binop, demand);
+  } else if (auto* shiftop = op.TryCast<Simd128ShiftOp>()) {
+    RecordPartialOp(*shiftop, demand);
+  } else if (auto* ternary = op.TryCast<Simd128TernaryOp>()) {
+    RecordPartialOp(*ternary, demand);
   } else if (auto* shuffle = op.TryCast<Simd128ShuffleOp>()) {
-    (void)AddUserAndCheckFoundAll(*shuffle, demanded);
+    TRACE("Recording partial ShuffleOp %d, demanded lanes: %#04x\n",
+          input_graph().Index(op).id(),
+          static_cast<uint32_t>(demand.bytes.bytes()));
+    if (AddUserAndCheckFoundAll(*shuffle, demand)) {
+      TRACE("Found all users (%d) of ShuffleOp %d, demanded lanes: %#04x\n",
+            op.saturated_use_count.GetMaybeSaturated(),
+            input_graph().Index(op).id(),
+            static_cast<uint32_t>(demand.bytes.bytes()));
+    }
   }
 }
 
 void DemandedByteAnalysis::RecordPartialOp(const Simd128UnaryOp& unop,
-                                           DemandedBytes demanded) {
-  if (IsUnaryLowHalfOp(unop.kind)) {
+                                           DemandState demand) {
+  if (IsUnaryLowHalfOp(unop.kind) || IsUnaryPassThruOp(unop.kind)) {
     // If we've now visited this unop from all of its users, visit its
     // operand.
-    if (auto maybe_demanded = AddUserAndCheckFoundAll(unop, demanded)) {
-      demanded = maybe_demanded.value();
-      demanded.HalveWithLimit(GetInputElementSizeInBytes(unop.kind));
-      Add(unop.input(), demanded);
+    if (auto merged = AddUserAndCheckFoundAll(unop, demand)) {
+      demand = *merged;
+      if (IsUnaryLowHalfOp(unop.kind)) {
+        demand.bytes.HalveWithLimit(
+            ElementSizeInBytes(unop.input_element_rep()));
+      } else {
+        if (!TrySearchThroughPassThru(
+                unop, demand, ElementSizeInBytes(unop.input_element_rep()))) {
+          return;
+        }
+      }
+      Add(unop.input(), demand);
     }
   }
 }
 
 void DemandedByteAnalysis::RecordPartialOp(const Simd128BinopOp& binop,
-                                           DemandedBytes demanded) {
-  if (IsBinaryLowHalfOp(binop.kind)) {
+                                           DemandState demand) {
+  if (IsBinaryLowHalfOp(binop.kind) || IsBinaryPassThruOp(binop.kind)) {
     // If we've now visited this binop from all of its users, visit its
     // operands.
-    if (auto maybe_demanded = AddUserAndCheckFoundAll(binop, demanded)) {
-      demanded = maybe_demanded.value();
-      demanded.HalveWithLimit(GetInputElementSizeInBytes(binop.kind));
-      Add(binop.left(), demanded);
-      Add(binop.right(), demanded);
+    if (auto merged = AddUserAndCheckFoundAll(binop, demand)) {
+      demand = *merged;
+      if (IsBinaryLowHalfOp(binop.kind)) {
+        demand.bytes.HalveWithLimit(
+            ElementSizeInBytes(binop.input_element_rep()));
+      } else {
+        if (!TrySearchThroughPassThru(
+                binop, demand, ElementSizeInBytes(binop.input_element_rep()))) {
+          return;
+        }
+      }
+      Add(binop.left(), demand);
+      Add(binop.right(), demand);
+    }
+  }
+}
+
+void DemandedByteAnalysis::RecordPartialOp(const Simd128TernaryOp& ternary,
+                                           DemandState demand) {
+  if (IsTernaryPassThruOp(ternary.kind)) {
+    if (auto merged = AddUserAndCheckFoundAll(ternary, demand)) {
+      demand = *merged;
+      if (!TrySearchThroughPassThru(
+              ternary, demand,
+              ElementSizeInBytes(ternary.input_element_rep()))) {
+        return;
+      }
+      Add(ternary.first(), demand);
+      Add(ternary.second(), demand);
+      Add(ternary.third(), demand);
+    }
+  }
+}
+
+void DemandedByteAnalysis::RecordPartialOp(const Simd128ShiftOp& shiftop,
+                                           DemandState demand) {
+  if (IsShiftPassThruOp(shiftop.kind)) {
+    if (auto merged = AddUserAndCheckFoundAll(shiftop, demand)) {
+      demand = *merged;
+      if (!TrySearchThroughPassThru(
+              shiftop, demand,
+              ElementSizeInBytes(shiftop.input_element_rep()))) {
+        return;
+      }
+      TRACE("Found all users (%d) of ShiftOp %d, demanded lanes: %#04x\n",
+            shiftop.saturated_use_count.GetMaybeSaturated(),
+            input_graph().Index(shiftop).id(),
+            static_cast<uint32_t>(demand.bytes.bytes()));
+      Add(shiftop.input(), demand);
     }
   }
 }
@@ -207,12 +338,141 @@ void DemandedByteAnalysis::Revisit() {
     if (multi_user.FoundAllUsers()) {
       const Operation* op = multi_user.op();
       if (auto* shuffle = op->TryCast<Simd128ShuffleOp>()) {
-        RevisitShuffle(*shuffle, multi_user.demanded());
+        RevisitShuffle(*shuffle, multi_user.demand().bytes);
       }
     }
   }
   to_revisit_.clear();
   revisit_limit_reached_ = false;
+}
+
+WasmShuffleAnalyzer::Reduction::SearchResult
+WasmShuffleAnalyzer::Reduction::Search(const Operation& op) {
+  if (auto binop = op.TryCast<Simd128BinopOp>()) {
+    return Search(*binop);
+  } else if (auto phi = op.TryCast<PhiOp>()) {
+    return Search(*phi);
+  }
+  return SearchResult::kContinue;
+}
+
+namespace {
+bool IsTopBottomInterleave(const Simd128ShuffleOp* shuffle_op) {
+  if (shuffle_op && shuffle_op->left() == shuffle_op->right()) {
+    std::array<uint8_t, kSimd128Size> shuffle_bytes;
+    std::copy_n(shuffle_op->shuffle.begin(), kSimd128Size,
+                shuffle_bytes.begin());
+    return SimdShuffle::TryMatchCanonical(shuffle_bytes) ==
+           SimdShuffle::CanonicalShuffle::kS16x8TopBottomInterleave;
+  }
+  return false;
+}
+}  // end namespace
+
+WasmShuffleAnalyzer::Reduction::SearchResult
+WasmShuffleAnalyzer::Reduction::Search(const Simd128BinopOp& binop) {
+  // Starting at the input to an I32x4AddReduce, walk backwards through a
+  // reduction tree:
+  //   * I32x4Add keeps the search inside the tree by visiting both inputs.
+  //   * I32x4DotI8x16S is a leaf candidate. We only record it when both inputs
+  //     are the canonical generated shuffle used before dot-product lowering.
+  //
+  // Dots already accepted by an earlier reduction search abort this search.
+  //
+  // Example:
+  //                     -----
+  //                     |   |
+  //                     v   |
+  //                    Phi  |
+  //          Sub  Dot /     |
+  //           \   /  /      |
+  // Mul  Dot   Add  /       ^
+  //   \  /      \  /        |
+  //   Add       Add         |
+  //      \     /            |
+  //        Add -------->-----
+  //         |
+  //     AddReduce
+  // TODO(sparker): Is it worth exploring through Sub operations?
+
+  OpIndex binop_index = input_graph().Index(binop);
+  if (!visited_.insert(binop_index).second) return SearchResult::kContinue;
+
+  if (binop.kind != Simd128BinopOp::Kind::kI32x4Add &&
+      binop.kind != Simd128BinopOp::Kind::kI32x4DotI8x16S) {
+    return SearchResult::kContinue;
+  }
+
+  nodes_.insert(binop_index);
+
+  const Operation& left = input_graph().Get(binop.left());
+  const Operation& right = input_graph().Get(binop.right());
+
+  if (binop.kind == Simd128BinopOp::Kind::kI32x4Add) {
+    if (Search(left) == SearchResult::kAbort) return SearchResult::kAbort;
+    if (Search(right) == SearchResult::kAbort) return SearchResult::kAbort;
+  } else if (binop.kind == Simd128BinopOp::Kind::kI32x4DotI8x16S) {
+    if (existing_dot_candidates_.contains(binop_index)) {
+      TRACE("Aborting reduction search at already discovered dot %d\n",
+            binop_index.id());
+      dot_candidates_.clear();
+      return SearchResult::kAbort;
+    }
+    auto shuffle_left = left.TryCast<Simd128ShuffleOp>();
+    auto shuffle_right = right.TryCast<Simd128ShuffleOp>();
+    if (IsTopBottomInterleave(shuffle_left) &&
+        IsTopBottomInterleave(shuffle_right)) {
+      // When we generate kI32x4DotI8x16S, we use shuffles to reorder the
+      // inputs to preserve the semantics. But now that we've discovered that
+      // the result is being horizontally reduced, we know the order of the
+      // summation is not important. So, we can remove those shuffles.
+      TRACE("Found a Dot candidate: %d\n", input_graph().Index(binop).id());
+      dot_candidates_.emplace_back(input_graph().Index(binop),
+                                   shuffle_left->left(), shuffle_right->left());
+    }
+  }
+  return SearchResult::kContinue;
+}
+
+WasmShuffleAnalyzer::Reduction::SearchResult
+WasmShuffleAnalyzer::Reduction::Search(const PhiOp& phi) {
+  // We search through phis so we can support an in-loop reduction, and the
+  // search supports unrolled loops too.
+  OpIndex phi_index = input_graph().Index(phi);
+  if (!visited_.insert(phi_index).second) return SearchResult::kContinue;
+
+  nodes_.insert(phi_index);
+  TRACE("Found new phi %d\n", phi_index.id());
+  for (OpIndex input : phi.inputs()) {
+    if (Search(input_graph().Get(input)) == SearchResult::kAbort) {
+      return SearchResult::kAbort;
+    }
+  }
+  return SearchResult::kContinue;
+}
+
+// Iterate through all the discovered nodes and look at their users, which we
+// should have discovered them all. The other manual checks are for reduce node
+// users.
+bool WasmShuffleAnalyzer::Reduction::UsesStayInReduction(
+    const Simd128UseMap& use_map) const {
+  for (OpIndex node : nodes_) {
+    for (OpIndex use : use_map.uses(node)) {
+      if (nodes_.contains(use)) continue;
+      const Operation& use_op = input_graph().Get(use);
+      if (use_op.saturated_use_count.Is(0) && !use_op.IsRequiredWhenUnused()) {
+        continue;
+      }
+      // We allow any other I32x4AddReduce operation that we didn't discover as
+      // part of the search.
+      if (const Simd128ReduceOp* reduce = use_op.TryCast<Simd128ReduceOp>()) {
+        if (reduce->kind == Simd128ReduceOp::Kind::kI32x4AddReduce) continue;
+      }
+      TRACE("Reduction node %d has outside user %d\n", node.id(), use.id());
+      return false;
+    }
+  }
+  return true;
 }
 
 void WasmShuffleAnalyzer::Run() {
@@ -267,6 +527,11 @@ void WasmShuffleAnalyzer::Process(const Operation& op) {
     ProcessLaneMemory(*lane_op);
     return;
   }
+
+  if (auto* reduce_op = op.TryCast<Simd128ReduceOp>()) {
+    ProcessReduce(*reduce_op);
+    return;
+  }
 }
 
 void WasmShuffleAnalyzer::ProcessUnary(const Simd128UnaryOp& unop) {
@@ -304,13 +569,38 @@ void WasmShuffleAnalyzer::ProcessLaneMemory(
   demanded_byte_analysis_.AddOp(lane_op, DemandedBytes::All());
 }
 
+void WasmShuffleAnalyzer::ProcessReduce(const Simd128ReduceOp& reduce_op) {
+#if V8_TARGET_ARCH_ARM64
+  if (reduce_op.kind != Simd128ReduceOp::Kind::kI32x4AddReduce) return;
+
+  Reduction reduction(input_graph(), dot_candidate_nodes_, phase_zone_);
+  // We use a Simd128UseMap to validate that none of the nodes in the reduction
+  // are used outside of the tree that we've discovered. Creating the map is
+  // quite expensive so only do it once we've discovered a candidate reduction.
+  TRACE("Searching from I32x4AddReduce op %d\n",
+        input_graph().Index(reduce_op).id());
+  if (reduction.Search(input_graph().Get(reduce_op.input())) !=
+          Reduction::SearchResult::kAbort &&
+      !reduction.candidates().empty() &&
+      reduction.UsesStayInReduction(GetOrCreateUseMap())) {
+    TRACE("Found valid reduction:\n");
+    for (const auto& candidate : reduction.candidates()) {
+      bool inserted = dot_candidate_nodes_.insert(candidate.dot).second;
+      DCHECK(inserted);
+      USE(inserted);
+      TRACE(" - with dot %d\n", candidate.dot.id());
+      dot_candidates_.push_back(candidate);
+    }
+  }
+#endif  // V8_TARGET_ARCH_ARM64
+}
+
 namespace {
 
 struct ShuffleWindows {
   WasmShuffleAnalyzer::ShuffleWindow shuffle_out_window;
   WasmShuffleAnalyzer::ShuffleWindow shuffle_in_window;
 };
-
 // Searches for a contiguous window of size `shuffle_in_demanded` within
 // `shuffle` such that all elements in the window are sourced from `side`, and
 // all elements outside of the window are sourced from the other side. Returns
@@ -411,8 +701,13 @@ bool WasmShuffleAnalyzer::ProcessShuffleOfShuffle(
   // shuffle_out will be added to the shuffles_to_read_shifted list which will
   // update its shuffle array to look at indices 0 and 1, instead of 2 and 3.
 
+  // If shuffle_out is already scheduled to be shifted to expose a specific
+  // window at index 0, its unshifted elements cannot be used as shuffle_out
+  // without conflicting coordinate transformations.
+  if (IsShuffleToShift(shuffle_out)) return false;
+
   DemandedBytes shuffle_out_demanded = GetDemandedBytes(&shuffle_out);
-  std::span<const uint8_t> shuffle_out_bytes(shuffle_out.shuffle,
+  std::span<const uint8_t> shuffle_out_bytes(shuffle_out.shuffle.data(),
                                              shuffle_out_demanded.bytes());
   for (uint8_t bytes : {8, 4, 2, 1}) {
     auto shuffle_in_demanded = DemandedBytes::Low(bytes);
@@ -559,7 +854,7 @@ void WasmShuffleAnalyzer::ProcessShuffleOfLoads(const Simd128ShuffleOp& shuffle,
   if (GetDemandedBytes(&shuffle).IsAll()) {
     // Full width shuffles.
     SimdShuffle::ShuffleArray shuffle_bytes;
-    std::copy_n(shuffle.shuffle, kSimd128Size, shuffle_bytes.begin());
+    std::copy_n(shuffle.shuffle.begin(), kSimd128Size, shuffle_bytes.begin());
     auto canonical = SimdShuffle::TryMatchCanonical(shuffle_bytes);
     switch (canonical) {
       default:
@@ -605,11 +900,14 @@ void WasmShuffleAnalyzer::ProcessShuffleOfLoads(const Simd128ShuffleOp& shuffle,
 void WasmShuffleAnalyzer::TryReduceFromMSB(OpIndex input,
                                            const Simd128ShuffleOp& shuffle,
                                            const ShuffleSide side) {
-  DemandedBytes demanded = GetDemandedBytes(&shuffle);
+  const ShuffleWindow* shift_window = FindShiftWindow(shuffle);
+  uint8_t start_index = shift_window ? shift_window->begin_index() : 0;
+  uint8_t count = shift_window ? shift_window->OutputDemanded().bytes()
+                               : GetDemandedBytes(&shuffle).bytes();
   std::optional<uint8_t> max = {};
 
-  for (unsigned i = 0; i < demanded.bytes(); ++i) {
-    uint8_t index = shuffle.shuffle[i];
+  for (unsigned i = 0; i < count; ++i) {
+    uint8_t index = shuffle.shuffle[start_index + i];
     if (InRange(index, side)) {
       max = std::max(static_cast<uint8_t>(index % kSimd128Size),
                      max.value_or(uint8_t{0}));
@@ -629,8 +927,6 @@ void WasmShuffleAnalyzer::ProcessShuffle(const Simd128ShuffleOp& shuffle) {
   bool reduced_right = false;
   const Operation& left = input_graph().Get(shuffle.left());
   const Operation& right = input_graph().Get(shuffle.right());
-
-#if V8_TARGET_ARCH_ARM64
 
   if (shuffle.kind != Simd128ShuffleOp::Kind::kI8x16) {
     return;
@@ -666,8 +962,6 @@ void WasmShuffleAnalyzer::ProcessShuffle(const Simd128ShuffleOp& shuffle) {
           ProcessShuffleOfShuffle(*shuffle_right, shuffle, ShuffleSide::kRight);
     }
   }
-
-#endif  // V8_TARGET_ARCH_ARM64
 
   uint8_t max_uses = shuffle.left() == shuffle.right() ? 2 : 1;
   if (!reduced_left && left.saturated_use_count.Is(max_uses)) {

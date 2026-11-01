@@ -163,7 +163,12 @@ unsafe extern "C" {
 
 pub type AccessorNameGetterCallback = NamedGetterCallbackForAccessor;
 
-/// Note: [ReturnValue] is ignored for accessors.
+/// Setter for a native data property (V8's `AccessorNameSetterCallbackV2`).
+///
+/// To report that the operation failed, call `rv.set_bool(false)`; when
+/// [PropertyCallbackArguments::should_throw_on_error] is true (strict mode)
+/// the callback may instead throw a more specific `TypeError`. Leaving the
+/// [ReturnValue] unset reports success.
 pub type AccessorNameSetterCallback = NamedSetterCallbackForAccessor;
 
 /// Interceptor for get requests on an object.

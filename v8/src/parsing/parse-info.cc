@@ -39,6 +39,7 @@ UnoptimizedCompileFlags::UnoptimizedCompileFlags(Isolate* isolate,
       v8_flags.parallel_compile_tasks_for_eager_toplevel);
   set_post_parallel_compile_tasks_for_lazy(
       v8_flags.parallel_compile_tasks_for_lazy);
+  set_allow_heap_allocation(true);
 }
 
 // static
@@ -54,6 +55,8 @@ UnoptimizedCompileFlags UnoptimizedCompileFlags::ForFunctionCompile(
   flags.set_is_lazy_compile(true);
 
   flags.set_is_repl_mode(script->is_repl_mode());
+  flags.set_class_initializer_allows_await(
+      shared->class_initializer_allows_await());
 
   // Do not support re-parsing top-level function of a wrapped script.
   DCHECK_IMPLIES(flags.is_toplevel(), !script->is_wrapped());
@@ -67,14 +70,16 @@ UnoptimizedCompileFlags UnoptimizedCompileFlags::ForScriptCompile(
   UnoptimizedCompileFlags flags(isolate, script->id());
 
   flags.SetFlagsForToplevelCompile(
-      script->IsUserJavaScript(), flags.outer_language_mode(),
+      script->IsUserJavaScript(), script->outer_language_mode(),
       construct_repl_mode(script->is_repl_mode()),
       script->origin_options().IsModule() ? ScriptType::kModule
                                           : ScriptType::kClassic,
       v8_flags.lazy);
+  flags.set_outer_language_mode(script->outer_language_mode());
   flags.SetFlagsForFunctionFromScript(script);
   if (script->is_wrapped()) {
     flags.set_function_syntax_kind(FunctionSyntaxKind::kWrapped);
+    flags.set_is_eval(true);
   }
 
   return flags;
@@ -145,13 +150,16 @@ void UnoptimizedCompileFlags::SetFlagsForFunctionFromScript(
     Tagged<Script> script) {
   DCHECK_EQ(script_id(), script->id());
 
-  set_is_eval(is_toplevel() &&
-              script->compilation_type() == Script::CompilationType::kEval);
+  set_is_eval(is_toplevel() && script->has_eval_origin());
   set_is_module(script->origin_options().IsModule());
   DCHECK_IMPLIES(is_eval(), !is_module());
 
   set_block_coverage_enabled(block_coverage_enabled() &&
                              script->IsUserJavaScript());
+  if (is_toplevel() && script->compilation_kind() ==
+                           Script::CompilationKind::kFunctionConstructor) {
+    set_parse_restriction(ONLY_SINGLE_FUNCTION_LITERAL);
+  }
 }
 
 ReusableUnoptimizedCompileState::ReusableUnoptimizedCompileState(
@@ -206,8 +214,7 @@ ParseInfo::ParseInfo(const UnoptimizedCompileFlags flags,
       language_mode_(flags.outer_language_mode()),
       is_background_compilation_(false),
       is_streaming_compilation_(false),
-      has_module_in_scope_chain_(flags.is_module()),
-      has_generator_in_scope_chain_(false) {
+      has_module_in_scope_chain_(flags.is_module()) {
   if (flags.block_coverage_enabled()) {
     AllocateSourceRangeMap();
   }
@@ -263,13 +270,15 @@ Handle<Script> ParseInfo::CreateScript(
   }
   raw_script->set_origin_options(origin_options);
   raw_script->set_is_repl_mode(flags().is_repl_mode());
+  raw_script->set_outer_language_mode(flags().outer_language_mode());
 
   DCHECK_EQ(is_wrapped_as_function(), !maybe_wrapped_arguments.is_null());
   if (is_wrapped_as_function()) {
+    raw_script->set_compilation_kind(Script::CompilationKind::kWrapped);
     raw_script->set_wrapped_arguments(
         *maybe_wrapped_arguments.ToHandleChecked());
   } else if (flags().is_eval()) {
-    raw_script->set_compilation_type(Script::CompilationType::kEval);
+    raw_script->set_compilation_kind(Script::CompilationKind::kDirectEval);
   }
   CheckFlagsForToplevelCompileFromScript(raw_script);
 
@@ -316,8 +325,7 @@ void ParseInfo::CheckFlagsForFunctionFromScript(Tagged<Script> script) {
   // We set "is_eval" for wrapped scripts to get an outer declaration scope.
   // This is a bit hacky, but ok since we can't be both eval and wrapped.
   DCHECK_EQ(flags().is_eval() && !script->is_wrapped(),
-            flags().is_toplevel() &&
-                script->compilation_type() == Script::CompilationType::kEval);
+            flags().is_toplevel() && script->has_eval_origin());
   DCHECK_EQ(flags().is_module(), script->origin_options().IsModule());
   DCHECK_IMPLIES(flags().block_coverage_enabled() && script->IsUserJavaScript(),
                  source_range_map() != nullptr);

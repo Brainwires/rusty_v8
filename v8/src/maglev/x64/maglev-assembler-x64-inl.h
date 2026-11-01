@@ -367,6 +367,14 @@ inline void MaglevAssembler::LoadDataViewElement(Register result,
   LoadSignedField(result, element_address, element_size);
 }
 
+inline void MaglevAssembler::LoadUnsignedDataViewElement(Register result,
+                                                         Register data_pointer,
+                                                         Register index,
+                                                         int element_size) {
+  MemOperand element_address = Operand(data_pointer, index, times_1, 0);
+  LoadUnsignedField(result, element_address, element_size);
+}
+
 inline void MaglevAssembler::LoadTaggedFieldByIndex(Register result,
                                                     Register object,
                                                     Register index, int scale,
@@ -396,7 +404,9 @@ inline void MaglevAssembler::LoadExternalPointerField(Register result,
 void MaglevAssembler::LoadFixedArrayElement(Register result, Register array,
                                             Register index) {
   if (v8_flags.debug_code) {
-    AssertObjectType(array, FIXED_ARRAY_TYPE, AbortReason::kUnexpectedValue);
+    AssertObjectTypeInRange(array, FIRST_FIXED_ARRAY_TYPE,
+                            LAST_FIXED_ARRAY_TYPE,
+                            AbortReason::kUnexpectedValue);
     CompareInt32AndAssert(index, 0, kUnsignedGreaterThanEqual,
                           AbortReason::kUnexpectedNegativeValue);
   }
@@ -413,7 +423,9 @@ inline void MaglevAssembler::LoadTaggedFieldWithoutDecompressing(
 void MaglevAssembler::LoadFixedArrayElementWithoutDecompressing(
     Register result, Register array, Register index) {
   if (v8_flags.debug_code) {
-    AssertObjectType(array, FIXED_ARRAY_TYPE, AbortReason::kUnexpectedValue);
+    AssertObjectTypeInRange(array, FIRST_FIXED_ARRAY_TYPE,
+                            LAST_FIXED_ARRAY_TYPE,
+                            AbortReason::kUnexpectedValue);
     CompareInt32AndAssert(index, 0, kUnsignedGreaterThanEqual,
                           AbortReason::kUnexpectedNegativeValue);
   }
@@ -483,6 +495,54 @@ inline void MaglevAssembler::StoreTaggedFieldNoWriteBarrier(Register object,
   MacroAssembler::StoreTaggedField(FieldOperand(object, offset), value);
 }
 
+inline void MaglevAssembler::StoreTaggedFieldNoWriteBarrier(
+    Register object, int offset, ValueNode* constant) {
+  DCHECK(CanStoreTaggedConstant(constant));
+  switch (constant->opcode()) {
+    case Opcode::kSmiConstant:
+      MacroAssembler::StoreTaggedField(
+          FieldOperand(object, offset),
+          Immediate(constant->Cast<SmiConstant>()->value()));
+      break;
+    case Opcode::kRootConstant:
+      MacroAssembler::StoreTaggedField(
+          FieldOperand(object, offset),
+          Immediate(static_cast<int32_t>(
+              ReadOnlyRootPtr(constant->Cast<RootConstant>()->index()))));
+      break;
+    case Opcode::kHeapConstant:
+      StoreTaggedFieldNoWriteBarrier(
+          object, offset, constant->Cast<HeapConstant>()->object().object());
+      break;
+    default:
+      UNREACHABLE();
+  }
+}
+
+inline void MaglevAssembler::StoreTaggedFieldNoWriteBarrier(
+    Register object, int offset, Handle<HeapObject> constant) {
+  DCHECK(kSupportsStoreTaggedConstant);
+  RootIndex root_index;
+  if (isolate()->roots_table().IsRootHandle(constant, &root_index) &&
+      CanBeImmediate(root_index)) {
+    MacroAssembler::StoreTaggedField(
+        FieldOperand(object, offset),
+        Immediate(static_cast<int32_t>(ReadOnlyRootPtr(root_index))));
+    return;
+  }
+  // Embed the compressed object as a relocatable immediate, like
+  // {MacroAssembler::Move(Register, Handle<HeapObject>, RelocInfo::Mode)} does
+  // for the register form. Maglev code is never isolate-independent, so no
+  // root-relative load is needed.
+  DCHECK(!options().isolate_independent_code);
+  EmbeddedObjectIndex index = AddEmbeddedObject(constant);
+  DCHECK(is_uint32(index));
+  MacroAssembler::StoreTaggedField(
+      FieldOperand(object, offset),
+      Immediate(static_cast<int>(index),
+                RelocInfo::COMPRESSED_EMBEDDED_OBJECT));
+}
+
 inline void MaglevAssembler::StoreFixedArrayElementNoWriteBarrier(
     Register array, Register index, Register value) {
   MacroAssembler::StoreTaggedField(
@@ -533,6 +593,18 @@ inline void MaglevAssembler::ReverseByteOrder(Register value, int size) {
   if (size == 2) {
     bswapl(value);
     sarl(value, Immediate(16));
+  } else if (size == 4) {
+    bswapl(value);
+  } else {
+    DCHECK_EQ(size, 1);
+  }
+}
+
+inline void MaglevAssembler::ReverseByteOrderUnsigned(Register value,
+                                                      int size) {
+  if (size == 2) {
+    bswapl(value);
+    shrl(value, Immediate(16));
   } else if (size == 4) {
     bswapl(value);
   } else {
@@ -715,6 +787,31 @@ inline void MaglevAssembler::LoadFloat64(DoubleRegister dst, MemOperand src) {
 }
 inline void MaglevAssembler::StoreFloat64(MemOperand dst, DoubleRegister src) {
   Movsd(dst, src);
+}
+
+inline void MaglevAssembler::LoadUnalignedFloat32(DoubleRegister dst,
+                                                  Register base,
+                                                  Register index) {
+  LoadFloat32(dst, Operand(base, index, times_1, 0));
+}
+inline void MaglevAssembler::LoadUnalignedFloat32AndReverseByteOrder(
+    DoubleRegister dst, Register base, Register index) {
+  movl(kScratchRegister, Operand(base, index, times_1, 0));
+  bswapl(kScratchRegister);
+  Movd(dst, kScratchRegister);
+  Cvtss2sd(dst, dst);
+}
+inline void MaglevAssembler::StoreUnalignedFloat32(Register base,
+                                                   Register index,
+                                                   DoubleRegister src) {
+  StoreFloat32(Operand(base, index, times_1, 0), src);
+}
+inline void MaglevAssembler::ReverseByteOrderAndStoreUnalignedFloat32(
+    Register base, Register index, DoubleRegister src) {
+  Cvtsd2ss(kScratchDoubleReg, src);
+  Movd(kScratchRegister, kScratchDoubleReg);
+  bswapl(kScratchRegister);
+  movl(Operand(base, index, times_1, 0), kScratchRegister);
 }
 
 inline void MaglevAssembler::LoadUnalignedFloat64(DoubleRegister dst,
@@ -1066,7 +1163,7 @@ inline void MaglevAssembler::JumpIfNotSmi(Register src, Label* on_not_smi,
 
 void MaglevAssembler::JumpIfByte(Condition cc, Register value, int32_t byte,
                                  Label* target, Label::Distance distance) {
-  cmpb(value, Immediate(byte));
+  Cmpb(value, byte);
   j(cc, target, distance);
 }
 
@@ -1241,7 +1338,7 @@ inline void MaglevAssembler::CompareInt32AndJumpIf(Register r1, int32_t value,
 void MaglevAssembler::CompareIntPtrAndJumpIf(Register r1, int32_t value,
                                              Condition cond, Label* target,
                                              Label::Distance distance) {
-  cmpq(r1, Immediate(value));
+  Cmpq(r1, value);
   JumpIf(cond, target, distance);
 }
 
@@ -1267,7 +1364,7 @@ inline void MaglevAssembler::CompareIntPtrAndBranch(
     Register r1, int32_t value, Condition cond, Label* if_true,
     Label::Distance true_distance, bool fallthrough_when_true, Label* if_false,
     Label::Distance false_distance, bool fallthrough_when_false) {
-  cmpq(r1, Immediate(value));
+  Cmpq(r1, value);
   Branch(cond, if_true, true_distance, fallthrough_when_true, if_false,
          false_distance, fallthrough_when_false);
 }
@@ -1464,7 +1561,7 @@ inline void MaglevAssembler::AssertStackSizeCorrect() {
 inline Condition MaglevAssembler::FunctionEntryStackCheck(
     int stack_check_offset) {
   Register stack_cmp_reg = rsp;
-  if (stack_check_offset >= kStackLimitSlackForDeoptimizationInBytes) {
+  if (stack_check_offset > kStackLimitSlackForDeoptimizationInBytes) {
     stack_cmp_reg = kScratchRegister;
     leaq(stack_cmp_reg, Operand(rsp, -stack_check_offset));
   }
@@ -1500,6 +1597,14 @@ inline void MaglevAssembler::MoveRepr(MachineRepresentation repr,
 inline void MaglevAssembler::MaybeEmitPlaceHolderForDeopt() {
   if (v8_flags.cet_compatible) {
     Nop(Assembler::kIntraSegmentJmpInstrSize);
+  }
+}
+
+inline void MaglevAssembler::MemoryBarrier(AtomicMemoryOrder order) {
+  // x64 is no weaker than release-acquire and only needs to emit an
+  // instruction for SeqCst memory barriers.
+  if (order == AtomicMemoryOrder::kSeqCst) {
+    mfence();
   }
 }
 

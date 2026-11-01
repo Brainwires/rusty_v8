@@ -436,7 +436,7 @@ def _CheckNoProductionCodeUsingTestOnlyFunctions(input_api, output_api):
       r'//.*({})'.format(base_function_pattern))
   exclusion_pattern = input_api.re.compile(
       r'::[A-Za-z0-9_]+({})|({})[^;]+'.format(base_function_pattern,
-                                              base_function_pattern) + '\{')
+                                              base_function_pattern) + r'\{')
 
   def FilterFile(affected_file):
     files_to_skip = (_EXCLUDED_PATHS +
@@ -679,6 +679,7 @@ def _CommonChecks(input_api, output_api):
       _CheckNoInlineHeaderIncludesInNormalHeaders,
       _CheckInlineHeadersIncludeNonInlineHeadersFirst,
       _CheckJSONFiles,
+      _CheckMetagenHeaders,
       _CheckNoexceptAnnotations,
       _CheckBannedCpp,
       _RunTestsWithVPythonSpec,
@@ -746,6 +747,8 @@ def _CheckLandOnChromiumBranch(input_api, output_api):
   if not target_branch.startswith('refs/'):
     target_branch = 'refs/heads/%s' % target_branch
   if not target_branch.startswith('refs/heads/chromium/'):
+    return []
+  if '_' in target_branch:  # Allow merges to mini branches.
     return []
 
   description = input_api.change.FullDescriptionText()
@@ -842,6 +845,79 @@ def _CheckNoexceptAnnotations(input_api, output_api):
         'Please report false positives on https://crbug.com/v8/8616.',
         errors)]
   return []
+
+
+def _CheckMetagenHeaders(input_api, output_api):
+  """Check that src/objects/all-objects.h includes every heap object header.
+
+  tools/metagen/metagen.py harvests the InstanceType enum from the class
+  declarations included by all-objects.h. A header with a V8_OBJECT /
+  V8_IT_ class that all-objects.h does not include is skipped without
+  error and its class gets no instance type, so check at upload time.
+
+  The check requires direct inclusion because BUILD.gn declares only
+  all-objects.h as an input of the harvest. A header included through an
+  intermediate header is still harvested, but the intermediate is in
+  neither the action's inputs nor the depfile, so an incremental build
+  keeps a stale instance-types.h.
+
+  Includes are read textually, not by preprocessing, and conditional ones
+  count regardless of their guard: the harvest runs per build
+  configuration, so a header included only under V8_INTL_SUPPORT is
+  harvested in the configurations that enable it.
+  """
+  import subprocess
+  v8_root = input_api.PresubmitLocalPath()
+  join = input_api.os_path.join
+
+  # A header takes part in the harvest if it declares a V8_OBJECT /
+  # V8_ABSTRACT_OBJECT class or carries a `V8_IT_<name>` marker, which is
+  # a member of the class body. Leading whitespace is allowed for both;
+  # requiring the marker at the start of its line is what keeps a
+  # comment that mentions a marker out. object-macros.h matches
+  # structurally because it defines the markers themselves; exclude it.
+  marker_regex = (
+      r"^[[:space:]]*V8_(ABSTRACT_)?OBJECT|^[[:space:]]*V8_IT_[A-Z_]+")
+  try:
+    res = subprocess.run([
+        "git", "grep", "-lE", marker_regex, "--", "src/**/*.h",
+        ":!src/objects/object-macros.h"
+    ],
+                         cwd=v8_root,
+                         capture_output=True,
+                         text=True,
+                         check=True)
+  except (subprocess.CalledProcessError, FileNotFoundError) as e:
+    return [
+        output_api.PresubmitNotifyResult(
+            f"_CheckMetagenHeaders: skipping (git grep failed: {e})")
+    ]
+  live = set(res.stdout.split())
+
+  aggregate = join("src", "objects", "all-objects.h")
+  try:
+    with open(join(v8_root, aggregate)) as f:
+      body = f.read()
+  except OSError as e:
+    return [
+        output_api.PresubmitNotifyResult(
+            f"_CheckMetagenHeaders: skipping ({aggregate}: {e})")
+    ]
+  included = set(re.findall(r'^\s*#\s*include\s+"([^"]+)"', body, re.MULTILINE))
+
+  missing = sorted(live - included)
+  if not missing:
+    return []
+  return [
+      output_api.PresubmitError("\n".join([
+          f"{aggregate} no longer includes every heap object header.",
+          "These headers carry a V8_OBJECT/V8_IT_ marker but are not "
+          "included there, so metagen either misses their classes or "
+          "harvests them through a header the build does not depend on:",
+      ] + [f"    {h}" for h in missing] + [
+          f"Add them to {aggregate}.",
+      ]))
+  ]
 
 
 def _CheckBannedCpp(input_api, output_api):

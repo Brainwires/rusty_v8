@@ -4,12 +4,14 @@
 
 #include "partition_alloc/pointers/raw_ptr.h"
 
+#include <array>
 #include <climits>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <type_traits>
 #include <utility>
@@ -265,6 +267,18 @@ using CountingRawPtrUninitialized =
 // Ensure that the `kUseCountingImplForTest` flag selects the test impl.
 static_assert(
     std::is_same_v<CountingRawPtrUninitialized<int>::Impl, RawPtrCountingImpl>);
+
+template <typename T>
+using CountingRawPtrUnprotectedInRelease =
+    raw_ptr<T,
+            base::RawPtrTraits::kUseCountingImplForTest |
+                base::RawPtrTraits::kAllowPtrArithmetic |
+                base::RawPtrTraits::kIsUnprotectedInRelease>;
+
+// Ensure that the `kUseCountingImplForTest` flag selects the test impl even in
+// the presence of `kIsUnprotectedInRelease`.
+static_assert(std::is_same_v<CountingRawPtrUnprotectedInRelease<int>::Impl,
+                             RawPtrCountingImpl>);
 
 struct MyStruct {
   int x;
@@ -1085,13 +1099,15 @@ TEST_F(RawPtrTest, PlusOperator) {
 }
 
 TEST_F(RawPtrTest, MinusOperator) {
-  int foo[] = {42, 43, 44, 45};
-  CountingRawPtr<int> ptr = PA_UNSAFE_TODO(&foo[4]);
-  for (int i = 1; i <= 4; ++i) {
-    ASSERT_EQ(PA_UNSAFE_TODO(*(ptr - i)), 46 - i);
+  auto foo = std::to_array<int>({42, 43, 44, 45});
+  CountingRawPtr<int> end_ptr = base::to_address(foo.end());
+  for (int i = 1; i <= foo.size(); ++i) {
+    ASSERT_EQ(foo[foo.size() - i], 46 - i);
+    // SAFETY: we've verified the address is in bounds above.
+    ASSERT_EQ(PA_UNSAFE_BUFFERS(*(end_ptr - i)), 46 - i);
   }
   EXPECT_THAT((CountingRawPtrExpectations{
-                  .get_for_dereference_cnt = 4,
+                  .get_for_dereference_cnt = foo.size(),
                   .get_for_extraction_cnt = 0,
                   .get_for_comparison_cnt = 0,
               }),
@@ -1099,15 +1115,23 @@ TEST_F(RawPtrTest, MinusOperator) {
 }
 
 TEST_F(RawPtrTest, MinusDeltaOperator) {
-  int foo[] = {42, 43, 44, 45};
-  CountingRawPtr<int> ptrs[] = {
-      PA_UNSAFE_TODO(&foo[0]), PA_UNSAFE_TODO(&foo[1]), PA_UNSAFE_TODO(&foo[2]),
-      PA_UNSAFE_TODO(&foo[3]), PA_UNSAFE_TODO(&foo[4])};
+  // This test ensures that when subtracting two raw_ptrs from each other the
+  // resulting ptrdiff_t is the same distance from each other as what you'd get
+  // if you subtracted just regular std::array (or int*) pointers. We also want
+  // to test the "end()" address to ensure old C style arrays would work. But to
+  // avoid indexing out of bounds we use base::to_address(foo.end()) to get
+  // the address.
+
+  auto foo = std::to_array<int>({42, 43, 44, 45});
+  auto ptrs = std::to_array<CountingRawPtr<int>>(
+      {&foo[0], &foo[1], &foo[2], &foo[3], base::to_address(foo.end())});
   for (int i = 0; i <= 4; ++i) {
     for (int j = 0; j <= 4; ++j) {
-      ASSERT_EQ(PA_UNSAFE_TODO(ptrs[i] - ptrs[j]), i - j);
-      ASSERT_EQ(PA_UNSAFE_TODO(ptrs[i] - &foo[j]), i - j);
-      ASSERT_EQ(PA_UNSAFE_TODO(&foo[i] - ptrs[j]), i - j);
+      int* foo_i = i == foo.size() ? base::to_address(foo.end()) : &foo[i];
+      int* foo_j = j == foo.size() ? base::to_address(foo.end()) : &foo[j];
+      ASSERT_EQ(ptrs[i] - ptrs[j], i - j);
+      ASSERT_EQ(ptrs[i] - foo_j, i - j);
+      ASSERT_EQ(foo_i - ptrs[j], i - j);
     }
   }
   EXPECT_THAT((CountingRawPtrExpectations{
@@ -1119,11 +1143,11 @@ TEST_F(RawPtrTest, MinusDeltaOperator) {
 }
 
 TEST_F(RawPtrTest, AdvanceString) {
-  const char kChars[] = "Hello";
-  std::string str = kChars;
+  std::string str = "Hello";
   CountingRawPtr<const char> ptr = str.c_str();
-  for (size_t i = 0; i < str.size(); ++i, PA_UNSAFE_TODO(++ptr)) {
-    ASSERT_EQ(*ptr, PA_UNSAFE_TODO(kChars[i]));
+  // SAFETY: `ptr` is incremented only up to `str.size()` times.
+  for (size_t i = 0; i < str.size(); ++i, PA_UNSAFE_BUFFERS(++ptr)) {
+    ASSERT_EQ(*ptr, str[i]);
   }
   EXPECT_THAT((CountingRawPtrExpectations{
                   .get_for_dereference_cnt = 5,
@@ -1619,7 +1643,7 @@ TEST_F(RawPtrTest, AllowUninitialized) {
 namespace base::internal {
 
 #if PA_BUILDFLAG(USE_RAW_PTR_BACKUP_REF_IMPL) && \
-    !defined(MEMORY_TOOL_REPLACES_ALLOCATOR)
+    !PA_BUILDFLAG(MEMORY_TOOL_REPLACES_ALLOCATOR)
 
 void HandleOOM(size_t unused_size) {
   PA_LOG(FATAL) << "Out of memory";
@@ -2447,8 +2471,78 @@ TEST_F(BackupRefPtrTest, QuarantineHook) {
   partition_alloc::PartitionAllocHooks::SetQuarantineOverrideHook(nullptr);
 }
 
+TEST_F(BackupRefPtrTest, DirectMapReallocReuseWithAliveRawPtr) {
+  // Allocate a large chunk (direct-mapped).
+  size_t big_size = 1500 * 1024;  // 1.5MB is direct-mapped.
+  char* ptr = static_cast<char*>(allocator_.root()->Alloc(big_size, ""));
+  ASSERT_TRUE(ptr);
+
+  // Hold a raw_ptr pointing to the start. This increments the slot's refcount.
+  raw_ptr<char, DisableDanglingPtrDetection> ref = ptr;
+
+  // Shrink in-place within the same 2MB reservation.
+  size_t small_size = 1400 * 1024;  // 1.4MB.
+  char* new_ptr =
+      static_cast<char*>(allocator_.root()->Realloc(ptr, small_size, ""));
+
+  // Under BRP, if a slot has active raw_ptr references, it must NOT be
+  // reallocated in-place (to prevent potential UAF on the truncated tail
+  // portion).
+  EXPECT_NE(new_ptr, ptr);
+
+  // Clean up.
+  ref = nullptr;  // Releases BRP quarantine of 'ptr'.
+  if (new_ptr != ptr) {
+    allocator_.root()->Free(new_ptr);
+  } else {
+    allocator_.root()->Free(ptr);
+  }
+}
+
+TEST_F(BackupRefPtrTest, NormalBucketReallocReuseWithAliveRawPtr) {
+  // Find a bucketted size (likely in thread cache) that stays in-place upon
+  // shrinking.
+  size_t big_size = 0;
+  size_t small_size = 0;
+
+  for (size_t size = 128; size <= 1024; size += 64) {
+    size_t alloc_size = allocator_.root()->AdjustSizeForExtrasSubtract(size);
+    if (alloc_size > 32) {
+      size_t s_size = alloc_size - 16;
+      if (allocator_.root()->AllocationCapacityFromRequestedSize(alloc_size) ==
+          allocator_.root()->AllocationCapacityFromRequestedSize(s_size)) {
+        big_size = alloc_size;
+        small_size = s_size;
+        break;
+      }
+    }
+  }
+
+  ASSERT_NE(big_size, 0u)
+      << "Could not find a suitable normal bucket for the test";
+
+  char* ptr = static_cast<char*>(allocator_.root()->Alloc(big_size, ""));
+  ASSERT_TRUE(ptr);
+
+  raw_ptr<char, DisableDanglingPtrDetection> ref = ptr;
+
+  char* new_ptr =
+      static_cast<char*>(allocator_.root()->Realloc(ptr, small_size, ""));
+
+  // Under BRP, if a slot has active raw_ptr references, it must NOT be
+  // reallocated in-place.
+  EXPECT_NE(new_ptr, ptr);
+
+  ref = nullptr;  // Releases BRP quarantine of 'ptr'.
+  if (new_ptr != ptr) {
+    allocator_.root()->Free(new_ptr);
+  } else {
+    allocator_.root()->Free(ptr);
+  }
+}
+
 #endif  // PA_BUILDFLAG(USE_RAW_PTR_BACKUP_REF_IMPL) &&
-        // !defined(MEMORY_TOOL_REPLACES_ALLOCATOR)
+        // !PA_BUILDFLAG(MEMORY_TOOL_REPLACES_ALLOCATOR)
 
 #if PA_BUILDFLAG(USE_RAW_PTR_HOOKABLE_IMPL)
 
@@ -2629,6 +2723,15 @@ TEST(DanglingPtrTest, DetectAndDestructor) {
   }
   EXPECT_EQ(instrumentation->dangling_ptr_detected(), 1u);
   EXPECT_EQ(instrumentation->dangling_ptr_released(), 1u);
+}
+
+TEST(DanglingPtrTest, ReportIfDanglingOnNoOpImpl) {
+  // Ensure ReportIfDangling compiles cleanly when RawPtrNoOpImpl is selected,
+  // such as for UnprotectedInRelease on non-BRP release builds.
+  int x = 42;
+  raw_ptr<int, base::RawPtrTraits::kNoOpImpl> no_op_ptr = &x;
+  no_op_ptr.ReportIfDangling();
+  EXPECT_EQ(no_op_ptr.get(), &x);
 }
 
 TEST(DanglingPtrTest, DetectResetAndDestructor) {
@@ -2976,5 +3079,39 @@ TEST(RawPtrInstanceTracerTest, MoveConversionAssignment) {
 }
 #endif  // PA_BUILDFLAG(ENABLE_BACKUP_REF_PTR_INSTANCE_TRACER) &&
         // PA_BUILDFLAG(USE_RAW_PTR_BACKUP_REF_IMPL)
+
+// Check that RawPtrIfPtrT distinguishes both pointers and scalars, as this
+// helps where an API may be conditionally-smuggling pointers.
+static_assert(std::is_same_v<uintptr_t, RawPtrIfPtrT<uintptr_t>>);
+static_assert(std::is_same_v<raw_ptr<char>, RawPtrIfPtrT<char*>>);
+static_assert(std::is_same_v<raw_ptr<char>, RawPtrIfPtrT<raw_ptr<char>>>);
+
+// Check that RawPtrIfPtrT allows const for both pointers and scalars.
+static_assert(std::is_same_v<const uintptr_t, RawPtrIfPtrT<const uintptr_t>>);
+static_assert(std::is_same_v<raw_ptr<const char>, RawPtrIfPtrT<const char*>>);
+static_assert(
+    std::is_same_v<raw_ptr<const char>, RawPtrIfPtrT<raw_ptr<const char>>>);
+
+// Check that RawPtrIfPtrT allows traits for both pointers and scalars.
+static_assert(
+    std::is_same_v<uintptr_t, RawPtrIfPtrT<uintptr_t, DanglingUntriaged>>);
+static_assert(std::is_same_v<raw_ptr<char, DanglingUntriaged>,
+                             RawPtrIfPtrT<char*, DanglingUntriaged>>);
+static_assert(std::is_same_v<raw_ptr<char, DanglingUntriaged>,
+                             RawPtrIfPtrT<raw_ptr<char>, DanglingUntriaged>>);
+
+// Check that  RawPtrIfPtrT allows combinations of traits   for both pointers
+// and scalars.
+static_assert(
+    std::is_same_v<
+        uintptr_t,
+        RawPtrIfPtrT<uintptr_t, AllowPtrArithmetic | UnprotectedInRelease>>);
+static_assert(std::is_same_v<
+              raw_ptr<char, AllowPtrArithmetic | UnprotectedInRelease>,
+              RawPtrIfPtrT<char*, AllowPtrArithmetic | UnprotectedInRelease>>);
+static_assert(
+    std::is_same_v<raw_ptr<char, AllowPtrArithmetic | UnprotectedInRelease>,
+                   RawPtrIfPtrT<raw_ptr<char>,
+                                AllowPtrArithmetic | UnprotectedInRelease>>);
 
 }  // namespace base::internal

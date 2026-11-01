@@ -23,6 +23,7 @@
 #include "src/objects/literal-objects-inl.h"
 #include "src/objects/map-updater.h"
 #include "src/objects/megadom-handler-inl.h"
+#include "src/objects/object-conversions-inl.h"
 #include "src/objects/objects-inl.h"
 #include "src/objects/property-cell.h"
 
@@ -58,7 +59,10 @@ JSHeapBroker::JSHeapBroker(Isolate* isolate, Zone* broker_zone,
   TRACE(this, "Constructing heap broker");
 }
 
-JSHeapBroker::~JSHeapBroker() { DCHECK_NULL(local_isolate_); }
+JSHeapBroker::~JSHeapBroker() {
+  DCHECK_NULL(local_isolate_);
+  DCHECK_NULL(js_function_cache_worklist_);
+}
 
 std::string JSHeapBroker::Trace() const {
   std::ostringstream oss;
@@ -436,7 +440,6 @@ NamedAccessFeedback::NamedAccessFeedback(
     bool has_deprecated_map_without_migration_target)
     : ProcessedFeedback(kNamedAccess, slot_kind),
       name_(name.UnpackIfThin(broker)),
-      original_name_maybe_thin_(name),
       maps_(maps),
       handlers_(handlers),
       has_deprecated_map_without_migration_target_(
@@ -667,7 +670,7 @@ ProcessedFeedback const& JSHeapBroker::ReadFeedbackForGlobalAccess(
             script_context_index, kAcquireLoad));
 
     OptionalObjectRef contents = context.get(broker, context_slot_index);
-    if (contents.has_value()) CHECK(!contents->IsTheHole());
+    if (contents.has_value()) CHECK(!contents->IsTdzHole());
 
     return *zone()->New<GlobalAccessFeedback>(
         context, context_slot_index,

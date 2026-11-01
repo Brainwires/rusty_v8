@@ -30,6 +30,7 @@
 #include "src/objects/js-segment-iterator-inl.h"
 #include "src/objects/js-segmenter-inl.h"
 #include "src/objects/js-segments-inl.h"
+#include "src/objects/object-conversions-inl.h"
 #include "src/objects/objects-inl.h"
 #include "src/objects/option-utils.h"
 #include "src/objects/property-descriptor.h"
@@ -1325,7 +1326,7 @@ BUILTIN(SegmentsPrototypeIterator) {
   HandleScope scope(isolate);
   CHECK_RECEIVER(JSSegments, segments, method_name);
 
-  Managed<IcuBreakIteratorWithText>::Ptr iterator_with_text =
+  CppGCManaged<IcuBreakIteratorWithText>::Ptr iterator_with_text =
       segments->icu_iterator_with_text()->ptr();
 
   RETURN_RESULT_OR_FAILURE(

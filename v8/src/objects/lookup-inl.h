@@ -18,7 +18,7 @@
 #include "src/objects/internal-index.h"
 #include "src/objects/map-inl.h"
 #include "src/objects/name-inl.h"
-#include "src/objects/objects-inl.h"
+#include "src/objects/object-conversions-inl.h"
 #include "src/objects/property-details.h"
 
 namespace v8 {
@@ -223,6 +223,11 @@ DirectHandle<Name> LookupIterator::name() const {
   return name_;
 }
 
+DirectHandle<Name> LookupIterator::name_for_transition() const {
+  DCHECK_IMPLIES(holder_.is_null(), !IsElement());
+  return name_;
+}
+
 DirectHandle<Name> LookupIterator::GetName() {
   if (name_.is_null()) {
     DCHECK(IsElement());
@@ -289,13 +294,24 @@ bool LookupIterator::ExtendingNonExtensible(DirectHandle<JSReceiver> receiver) {
   if (IsAlwaysSharedSpaceJSObjectMap(receiver_map)) {
     return true;
   }
+#if V8_ENABLE_WEBASSEMBLY
+  // Wasm objects have a fixed layout and must never transition their map.
+  if (IsWasmObjectMap(receiver_map)) {
+    return true;
+  }
+#endif  // V8_ENABLE_WEBASSEMBLY
+
   // Extending non-extensible objects with private fields is currently allowed,
   // but we're disallowing it soon.
   DCHECK(!receiver_map->is_extensible());
   DCHECK(name_->IsAnyPrivate());
-  if (name_->IsAnyPrivateName()) {
-    isolate()->CountUsage(v8::Isolate::kExtendingNonExtensibleWithPrivate);
+  // Internal private symbols are engine implementation details and can always
+  // be added to non-extensible objects.
+  if (name_->IsPrivateInternal()) {
+    return false;
   }
+  DCHECK(name_->IsAnyPrivateName());
+  isolate()->CountUsage(v8::Isolate::kExtendingNonExtensibleWithPrivate);
   return v8_flags.js_nonextensible_applies_to_private;
 }
 

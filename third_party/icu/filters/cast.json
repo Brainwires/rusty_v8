@@ -151,6 +151,11 @@
     ]
   },
   "featureFilters": {
+    "normalization": {
+      "excludelist": [
+        "nfkc_scf"
+      ]
+    },
     "brkitr_adaboost": {
       "includelist": [
         "jaml"

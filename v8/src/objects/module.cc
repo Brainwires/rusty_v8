@@ -279,8 +279,8 @@ bool Module::FinishInstantiate(Isolate* isolate, Handle<Module> module,
   }
 }
 
-MaybeDirectHandle<Object> Module::Evaluate(Isolate* isolate,
-                                           Handle<Module> module) {
+MaybeDirectHandle<JSPromise> Module::Evaluate(Isolate* isolate,
+                                              Handle<Module> module) {
 #ifdef DEBUG
   PrintStatusMessage(*module, "Evaluating module ");
 #endif  // DEBUG
@@ -457,7 +457,7 @@ MaybeDirectHandle<Object> JSModuleNamespace::GetExport(
   }
 
   DirectHandle<Object> value(Cast<Cell>(*object)->value(), isolate);
-  if (IsTheHole(*value)) {
+  if (IsTdzHole(*value)) {
     // According to https://tc39.es/ecma262/#sec-InnerModuleLinking
     // step 10 and
     // https://tc39.es/ecma262/#sec-source-text-module-record-initialize-environment
@@ -470,6 +470,31 @@ MaybeDirectHandle<Object> JSModuleNamespace::GetExport(
   }
 
   return value;
+}
+
+// static
+void JSModuleNamespace::MaybeCountMissingDefaultWithStarExport(
+    LookupIterator* it) {
+  DCHECK_EQ(it->state(), LookupIterator::MODULE_NAMESPACE);
+
+  if (it->IsElement()) return;
+
+  Isolate* isolate = it->isolate();
+  DirectHandle<String> default_string = isolate->factory()->default_string();
+  if (*it->name() != *default_string) return;
+
+  DirectHandle<JSModuleNamespace> ns = it->GetHolder<JSModuleNamespace>();
+  if (ns->HasExport(isolate, default_string)) return;
+
+  {
+    DisallowGarbageCollection no_gc;
+    Tagged<Module> module = ns->module();
+    if (!IsSourceTextModule(module)) return;
+    if (!Cast<SourceTextModule>(module)->info()->HasStarExports()) return;
+  }
+
+  isolate->CountUsage(
+      v8::Isolate::kModuleNamespaceMissingDefaultWithStarExport);
 }
 
 Maybe<PropertyAttributes> JSModuleNamespace::GetPropertyAttributes(
@@ -486,7 +511,7 @@ Maybe<PropertyAttributes> JSModuleNamespace::GetPropertyAttributes(
   if (IsTheHole(*lookup)) return Just(ABSENT);
 
   DirectHandle<Object> value(Cast<Cell>(lookup)->value(), isolate);
-  if (IsTheHole(*value)) {
+  if (IsTdzHole(*value)) {
     isolate->Throw(*isolate->factory()->NewReferenceError(
         MessageTemplate::kNotDefined, name));
     return Nothing<PropertyAttributes>();
@@ -513,16 +538,13 @@ void JSDeferredModuleNamespace::EvaluateModuleSync(
     return;
   }
 
-  MaybeDirectHandle<Object> maybe_result = Module::Evaluate(isolate, module);
-  DirectHandle<Object> result;
-  if (!maybe_result.ToHandle(&result)) {
+  MaybeDirectHandle<JSPromise> maybe_result = Module::Evaluate(isolate, module);
+  DirectHandle<JSPromise> promise;
+  if (!maybe_result.ToHandle(&promise)) {
     return;
   }
 
-  // If there's a result, it needs to be a promise with either Reject or
-  // Fulfilled status.
-  DCHECK(IsJSPromise(*result));
-  DirectHandle<JSPromise> promise = Cast<JSPromise>(result);
+  // The result is always the module's top-level capability promise.
   // 5. If promise.[[PromiseState]] is rejected, then
   if (promise->status() == Promise::kRejected) {
     // a. If promise.[[PromiseIsHandled]] is false, perform

@@ -91,6 +91,10 @@ TF_BUILTIN(StringToLowerCaseIntl, IntlBuiltinsAssembler) {
 TF_BUILTIN(WasmStringToLowerCaseIntl, IntlBuiltinsAssembler) {
   auto context = Parameter<Context>(Descriptor::kContext);
   auto string = Parameter<String>(Descriptor::kString);
+#ifdef V8_IS_TSAN
+  CallRuntime<Undefined>(Runtime::kTsanAcquireForInitializationFence, context,
+                         string);
+#endif
   ToLowerCaseImpl(string, TNode<Object>() /*maybe_locales*/, context,
                   ToLowerCaseKind::kToLowerCase,
                   [this](TNode<Object> ret) { Return(ret); });
@@ -184,6 +188,12 @@ void IntlBuiltinsAssembler::ToLowerCaseImpl(
          &call_c);
 
   {
+    // The allocation above may have internalized a shared source, forwarding
+    // it to a ThinString or freeing an external resource. The loop below would
+    // read that through a stale raw pointer, so bail out instead. {call_c}
+    // re-resolves the source and needs no such check.
+    to_direct.BailIfTransitioned(&runtime);
+
     const TNode<IntPtrT> dst_ptr = PointerToSeqStringData(dst);
     TVARIABLE(IntPtrT, var_cursor, IntPtrConstant(0));
 

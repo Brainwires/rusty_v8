@@ -89,6 +89,11 @@ class BuildFlags : public base::ContextualClass<BuildFlags> {
 #else
     build_flags_["V8_ENABLE_SEEDED_ARRAY_INDEX_HASH"] = false;
 #endif
+#ifdef V8_IS_TSAN
+    build_flags_["V8_IS_TSAN"] = true;
+#else
+    build_flags_["V8_IS_TSAN"] = false;
+#endif
   }
   static bool GetFlag(const std::string& name, const char* production) {
     auto it = Get().build_flags_.find(name);
@@ -1039,6 +1044,7 @@ std::optional<ParseResult> MakeClassDeclaration(
        ANNOTATION_DO_NOT_GENERATE_CPP_CLASS, ANNOTATION_CUSTOM_CPP_CLASS,
        ANNOTATION_CUSTOM_MAP, ANNOTATION_EXPORT,
        ANNOTATION_DO_NOT_GENERATE_CAST,
+       ANNOTATION_DO_NOT_GENERATE_INSTANCE_TYPE_CHECK,
        ANNOTATION_HIGHEST_INSTANCE_TYPE_WITHIN_PARENT,
        ANNOTATION_LOWEST_INSTANCE_TYPE_WITHIN_PARENT,
        ANNOTATION_CPP_OBJECT_LAYOUT_DEFINITION},
@@ -1067,6 +1073,9 @@ std::optional<ParseResult> MakeClassDeclaration(
   }
   if (annotations.Contains(ANNOTATION_DO_NOT_GENERATE_CAST)) {
     flags |= ClassFlag::kDoNotGenerateCast;
+  }
+  if (annotations.Contains(ANNOTATION_DO_NOT_GENERATE_INSTANCE_TYPE_CHECK)) {
+    flags |= ClassFlag::kDoNotGenerateInstanceTypeCheck;
   }
   if (annotations.Contains(ANNOTATION_EXPORT)) {
     flags |= ClassFlag::kExport;

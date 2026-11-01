@@ -12,8 +12,6 @@
 #include <cstddef>
 #include <cstdint>
 
-#include "partition_alloc/partition_alloc_base/component_export.h"
-
 #if PA_BUILDFLAG(ENABLE_PKEYS)
 #include "partition_alloc/thread_isolation/pkey.h"
 #endif
@@ -55,7 +53,7 @@ namespace partition_alloc::internal {
     PA_BUILDFLAG(ENABLE_PARTITION_LOCK_REENTRANCY_CHECK)
 struct PA_THREAD_ISOLATED_ALIGN ThreadIsolationSettings {
   bool enabled = false;
-  PA_CONSTINIT static ThreadIsolationSettings settings;
+  constinit static ThreadIsolationSettings settings;
 };
 #endif  // PA_BUILDFLAG(DCHECKS_ARE_ON) ||
         // PA_BUILDFLAG(ENABLE_PARTITION_LOCK_REENTRANCY_CHECK)

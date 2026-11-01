@@ -165,7 +165,7 @@ class InjectedScript::ProtocolPromiseHandler {
   static void thenCallback(const v8::FunctionCallbackInfo<v8::Value>& info) {
     PromiseHandlerTracker::Id handlerId =
         static_cast<PromiseHandlerTracker::Id>(
-            info.Data().As<v8::Number>()->Value());
+            info.DataV2().As<v8::Value>().As<v8::Number>()->Value());
     PromiseHandlerTracker& handlerTracker =
         static_cast<V8InspectorImpl*>(
             v8::debug::GetInspector(info.GetIsolate()))
@@ -186,7 +186,7 @@ class InjectedScript::ProtocolPromiseHandler {
   static void catchCallback(const v8::FunctionCallbackInfo<v8::Value>& info) {
     PromiseHandlerTracker::Id handlerId =
         static_cast<PromiseHandlerTracker::Id>(
-            info.Data().As<v8::Number>()->Value());
+            info.DataV2().As<v8::Value>().As<v8::Number>()->Value());
     PromiseHandlerTracker& handlerTracker =
         static_cast<V8InspectorImpl*>(
             v8::debug::GetInspector(info.GetIsolate()))
@@ -1136,7 +1136,7 @@ Response InjectedScript::ObjectScope::findInjectedScript(
   std::unique_ptr<RemoteObjectId> remoteId;
   Response response = RemoteObjectId::parse(m_remoteObjectId, &remoteId);
   if (!response.IsSuccess()) return response;
-  InjectedScript* injectedScript = nullptr;
+  std::shared_ptr<InjectedScript> injectedScript;
   response = session->findInjectedScript(remoteId.get(), injectedScript,
                                          &m_inspectedContext);
   if (!response.IsSuccess()) return response;
@@ -1190,7 +1190,7 @@ Response InjectedScript::bindRemoteObjectIfNeeded(
         static_cast<V8InspectorImpl*>(v8::debug::GetInspector(isolate));
     std::shared_ptr<InspectedContext> inspectedContext =
         inspector->getContext(InspectedContext::contextId(context));
-    InjectedScript* injectedScript =
+    std::shared_ptr<InjectedScript> injectedScript =
         inspectedContext ? inspectedContext->getInjectedScript(sessionId)
                          : nullptr;
     if (!injectedScript) {

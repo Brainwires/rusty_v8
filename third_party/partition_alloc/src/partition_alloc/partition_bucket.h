@@ -8,6 +8,7 @@
 #include <cstddef>
 #include <cstdint>
 
+#include "partition_alloc/internal/partition_root_internal_forward.h"
 #include "partition_alloc/partition_alloc_base/compiler_specific.h"
 #include "partition_alloc/partition_alloc_base/component_export.h"
 #include "partition_alloc/partition_alloc_base/thread_annotations.h"
@@ -82,7 +83,8 @@ struct PartitionBucket {
                     size_t raw_size,
                     size_t slot_span_alignment,
                     SlotSpanMetadata** slot_span,
-                    bool* is_already_zeroed)
+                    bool* is_already_zeroed,
+                    bool* stored_raw_size)
           PA_EXCLUSIVE_LOCKS_REQUIRED(PartitionRootLock(root));
 
   PA_ALWAYS_INLINE bool CanStoreRawSize() const { return can_store_raw_size; }

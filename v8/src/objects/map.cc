@@ -6,6 +6,7 @@
 
 #include <optional>
 
+#include "src/base/hashing.h"
 #include "src/common/assert-scope.h"
 #include "src/common/globals.h"
 #include "src/execution/frames.h"
@@ -397,6 +398,9 @@ VisitorId Map::GetVisitorId(Tagged<Map> map) {
     case JS_SPECIAL_API_OBJECT_TYPE:
       return kVisitJSApiObject;
 
+    case CPP_GCMANAGED_BASE_TYPE:
+      return kVisitCppGCManagedBase;
+
     case CPP_HEAP_EXTERNAL_OBJECT_TYPE:
       return kVisitCppHeapExternalObject;
 
@@ -452,6 +456,7 @@ VisitorId Map::GetVisitorId(Tagged<Map> map) {
     case BREAK_POINT_INFO_TYPE:
     case CLASS_BOILERPLATE_TYPE:
     case CLASS_POSITIONS_TYPE:
+    case DEBUG_SCRIPT_SCOPE_INFO_TYPE:
     case ENUM_CACHE_TYPE:
     case ERROR_STACK_DATA_TYPE:
     case FUNCTION_TEMPLATE_RARE_DATA_TYPE:
@@ -504,6 +509,10 @@ VisitorId Map::GetVisitorId(Tagged<Map> map) {
 #if V8_ENABLE_WEBASSEMBLY
     case WASM_ARRAY_TYPE:
       return kVisitWasmArray;
+    case WASM_CUSTOM_MAP_TYPE:
+      return kVisitWasmCustomMap;
+    case WASM_CUSTOM_MAP_WRAPPER_TYPE:
+      return kVisitJSObject;
     case WASM_FUNC_REF_TYPE:
       return kVisitWasmFuncRef;
     case WASM_GLOBAL_OBJECT_TYPE:
@@ -594,10 +603,7 @@ MaybeHandle<Map> Map::CopyWithField(Isolate* isolate, DirectHandle<Map> map,
   MaybeObjectDirectHandle wrapped_type = WrapFieldType(type);
   Descriptor d = Descriptor::DataField(name, offset, attributes, constness,
                                        representation, wrapped_type);
-  Handle<Map> new_map = Map::CopyAddDescriptor(isolate, map, &d, flag);
-
-  new_map->AccountAddedPropertyField();
-  return new_map;
+  return Map::CopyAddDescriptor(isolate, map, &d, flag);
 }
 
 MaybeHandle<Map> Map::CopyWithConstant(Isolate* isolate, DirectHandle<Map> map,
@@ -1003,6 +1009,8 @@ Handle<Map> Map::GetDerivedMap(Isolate* isolate, DirectHandle<Map> from,
     }
     return map;
   }
+
+  if (from->prototype() == *prototype) return handle(*from, isolate);
 
   // The TransitionToPrototype map will not have new_target_is_base reset. But
   // we don't need it to for proxies.
@@ -1604,6 +1612,10 @@ Handle<Map> Map::ShareDescriptor(Isolate* isolate, DirectHandle<Map> map,
     DisallowGarbageCollection no_gc;
     descriptors->Append(descriptor);
     result->InitializeDescriptors(*descriptors);
+    // Account for the field before publishing the transition.
+    if (descriptor->GetDetails().location() == PropertyLocation::kField) {
+      result->AccountAddedPropertyField();
+    }
   }
 
   DCHECK(result->NumberOfOwnDescriptors() == map->NumberOfOwnDescriptors() + 1);
@@ -2322,7 +2334,12 @@ Handle<Map> Map::CopyAddDescriptor(Isolate* isolate, DirectHandle<Map> map,
       DescriptorArray::CopyUpTo(isolate, descriptors, nof, 1);
   new_descriptors->Append(descriptor);
 
-  return CopyReplaceDescriptors(isolate, map, new_descriptors, flag,
+  auto InitMap = [&](DirectHandle<Map> new_map) {
+    if (descriptor->GetDetails().location() == PropertyLocation::kField) {
+      new_map->AccountAddedPropertyField();
+    }
+  };
+  return CopyReplaceDescriptors(isolate, map, new_descriptors, flag, InitMap,
                                 descriptor->GetKey(), "CopyAddDescriptor",
                                 SIMPLE_PROPERTY_TRANSITION);
 }
@@ -2369,8 +2386,8 @@ Handle<Map> Map::CopyReplaceDescriptor(
 }
 
 int Map::Hash(Isolate* isolate, Tagged<HeapObject> prototype) {
-  // For performance reasons we only hash the 2 most variable fields of a map:
-  // prototype and bit_field2.
+  // Hash the prototype, instance type and bit_field2, mixing their bits before
+  // NormalizedMapCache reduces the hash to a cache index.
 
   int prototype_hash;
   if (IsNull(prototype)) {
@@ -2381,7 +2398,10 @@ int Map::Hash(Isolate* isolate, Tagged<HeapObject> prototype) {
     prototype_hash = receiver->GetOrCreateIdentityHash(isolate).value();
   }
 
-  return prototype_hash ^ bit_field2();
+  size_t hash =
+      base::Hasher::Combine(prototype_hash, static_cast<int>(bit_field2()),
+                            static_cast<int>(instance_type()));
+  return static_cast<int>(hash & 0x7FFFFFFF);
 }
 
 namespace {
@@ -2668,6 +2688,11 @@ void Map::SetPrototype(Isolate* isolate, DirectHandle<Map> map,
            HeapLayout::InWritableSharedSpace(*prototype));
   }
 
+  if (IsJSInterceptorMap(*map) && map->prototype() != *prototype) {
+    Cast<JSInterceptorMap>(*map)->set_fast_case_validity_cell(
+        ReadOnlyRoots(isolate).invalid_prototype_validity_cell());
+  }
+
   WriteBarrierMode wb_mode =
       IsNull(*prototype) ? SKIP_WRITE_BARRIER : UPDATE_WRITE_BARRIER;
   map->set_prototype(*prototype, wb_mode);
@@ -2683,6 +2708,7 @@ Handle<Map> Map::TransitionRootMapToPrototypeForNewObject(
     Isolate* isolate, DirectHandle<Map> map,
     DirectHandle<JSPrototype> prototype) {
   DCHECK(IsUndefined(map->GetBackPointer()));
+  DCHECK_NE(map->prototype(), *prototype);
   Handle<Map> new_map = TransitionToUpdatePrototype(isolate, map, prototype);
   if (new_map->GetBackPointer() != *map &&
       map->IsInobjectSlackTrackingInProgress()) {
@@ -2698,6 +2724,7 @@ Handle<Map> Map::TransitionToUpdatePrototype(
     DirectHandle<JSPrototype> prototype) {
   Handle<Map> new_map;
   DCHECK(IsUndefined(map->GetBackPointer()));
+  DCHECK_NE(map->prototype(), *prototype);
   if (auto maybe_map = TransitionsAccessor::GetPrototypeTransition(
           isolate, *map, *prototype)) {
     new_map = handle(*maybe_map, isolate);

@@ -30,6 +30,7 @@ namespace v8::internal {
 
 class IsCompiledScope;
 class FeedbackVectorSpec;
+class SimpleNameDictionary;
 
 enum class UpdateFeedbackMode {
   kOptionalFeedback,
@@ -304,10 +305,10 @@ V8_OBJECT class FeedbackVector : public HeapObject {
  public:
   // Bit positions in |osr_state|.
   using OsrUrgencyBits = base::BitField<uint32_t, 0, 3, uint8_t>;
-  using MaybeHasMaglevOsrCodeBit = OsrUrgencyBits::Next<bool, 1>;
-  using MaybeHasTurbofanOsrCodeBit = MaybeHasMaglevOsrCodeBit::Next<bool, 1>;
+  using MaybeHasTurbofanOsrCodeBit = OsrUrgencyBits::Next<bool, 1>;
+  using MaybeHasMaglevOsrCodeBit = MaybeHasTurbofanOsrCodeBit::Next<bool, 1>;
   using DontUseTheseBitsUnlessBeneficialBits =
-      MaybeHasTurbofanOsrCodeBit::Next<uint32_t, 3>;
+      MaybeHasMaglevOsrCodeBit::Next<uint32_t, 3>;
   // Bit positions in |flags|.
   using TieringInProgressBit = base::BitField<bool, 0, 1, uint16_t>;
   using OsrTieringInProgressBit = TieringInProgressBit::Next<bool, 1>;
@@ -386,11 +387,20 @@ V8_OBJECT class FeedbackVector : public HeapObject {
 
   // Optimized OSR'd code is cached in JumpLoop feedback vector slots. The
   // slots either contain a Code object or the ClearedValue.
+  //
+  // These all run on the main thread only, which is the sole writer of feedback
+  // slots, so reading a slot needs no synchronization. Writing one does:
+  // background compilation threads read JumpLoop slots as a pair under
+  // feedback_vector_access (NexusConfig::GetFeedbackPair), so every write has
+  // to hold that mutex. Note that GetOptimizedOsrCode writes too: it clears the
+  // slot if the cached code was deoptimized.
   inline std::optional<Tagged<Code>> GetOptimizedOsrCode(
       Isolate* isolate, Handle<BytecodeArray> bytecode_array,
       FeedbackSlot slot);
   void SetOptimizedOsrCode(Isolate* isolate, FeedbackSlot slot,
                            Tagged<Code> code);
+  // Acquires feedback_vector_access whenever it has to clear a slot, so it must
+  // not be called while holding it.
   inline void RecomputeOptimizedOsrCodeFlags(
       Isolate* isolate, Handle<BytecodeArray> bytecode_array);
 
@@ -418,6 +428,7 @@ V8_OBJECT class FeedbackVector : public HeapObject {
   // Conversion from an integer index to the underlying array to a slot.
   static inline FeedbackSlot ToSlot(intptr_t index);
 
+  // Use only for 1-sized slots. For longer slots, use FeedbackNexus helpers.
   inline Tagged<MaybeObject> SynchronizedGet(FeedbackSlot slot) const;
   inline void SynchronizedSet(FeedbackSlot slot, Tagged<MaybeObject> value,
                               WriteBarrierMode mode = UPDATE_WRITE_BARRIER);
@@ -945,6 +956,12 @@ class V8_EXPORT_PRIVATE NexusConfig {
                        Tagged<MaybeObject> feedback, WriteBarrierMode mode,
                        Tagged<MaybeObject> feedback_extra,
                        WriteBarrierMode mode_extra) const;
+  // Writes only the extra slot, leaving the main slot as it is. Like
+  // SetFeedbackPair, this takes the feedback_vector_access mutex, which is what
+  // readers of the slot group rely on.
+  void SetFeedbackExtra(Tagged<FeedbackVector> vector, FeedbackSlot start_slot,
+                        Tagged<MaybeObject> feedback_extra,
+                        WriteBarrierMode mode_extra) const;
 
  private:
   explicit NexusConfig(Isolate* isolate)
@@ -1087,6 +1104,10 @@ class V8_EXPORT_PRIVATE FeedbackNexus final {
       SpeculationModeField::Next<CallFeedbackContent, 1>;
   using CallCountField = CallFeedbackContentField::Next<uint32_t, 29>;
 
+  // For JumpLoop.
+  std::optional<Tagged<Code>> GetOptimizedOsrCode(
+      IsolateForSandbox isolate) const;
+
   // For InstanceOf ICs.
   MaybeDirectHandle<JSObject> GetConstructorFeedback() const;
 
@@ -1101,6 +1122,9 @@ class V8_EXPORT_PRIVATE FeedbackNexus final {
   static constexpr uint32_t kCloneObjectPolymorphicEntrySize = 2;
   void ConfigureCloneObject(DirectHandle<Map> source_map,
                             const MaybeObjectHandle& handler);
+
+  // For StringAddAndInternalize ICs.
+  void ConfigureStringAddInternalizeCache(Tagged<SimpleNameDictionary> cache);
 
 // Bit positions in a smi that encodes lexical environment variable access.
 #define LEXICAL_MODE_BIT_FIELDS(V, _)  \
@@ -1122,6 +1146,10 @@ class V8_EXPORT_PRIVATE FeedbackNexus final {
   inline void SetFeedback(Tagged<FeedbackType> feedback, WriteBarrierMode mode,
                           Tagged<FeedbackExtraType> feedback_extra,
                           WriteBarrierMode mode_extra = UPDATE_WRITE_BARRIER);
+  template <typename FeedbackExtraType>
+  inline void SetFeedbackExtra(
+      Tagged<FeedbackExtraType> feedback_extra,
+      WriteBarrierMode mode_extra = UPDATE_WRITE_BARRIER);
 
   inline Tagged<MaybeObject> UninitializedSentinel() const;
   inline Tagged<MaybeObject> MegamorphicSentinel() const;

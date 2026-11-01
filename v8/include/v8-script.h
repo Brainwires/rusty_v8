@@ -280,7 +280,7 @@ class V8_EXPORT Module : public Data {
    *
    * If IsGraphAsync() is false, the returned Promise is settled.
    */
-  V8_WARN_UNUSED_RESULT MaybeLocal<Value> Evaluate(Local<Context> context);
+  V8_WARN_UNUSED_RESULT MaybeLocal<Promise> Evaluate(Local<Context> context);
 
   /**
    * Evaluates async dependencies of a module and defer its evaluation
@@ -292,7 +292,7 @@ class V8_EXPORT Module : public Data {
    * modules that are going to be evaluated. This module and its sync
    * dependencies are not going to be evaluated.
    */
-  V8_WARN_UNUSED_RESULT MaybeLocal<Value> EvaluateForImportDefer(
+  V8_WARN_UNUSED_RESULT MaybeLocal<Promise> EvaluateForImportDefer(
       Local<Context> context);
 
   /**
@@ -351,6 +351,15 @@ class V8_EXPORT Module : public Data {
    * (where an exception was thrown).
    */
   using SyntheticModuleEvaluationSteps =
+      MaybeLocal<Promise> (*)(Local<Context> context, Local<Module> module);
+
+  /*
+   * Deprecated version of SyntheticModuleEvaluationSteps: the returned value is
+   * still required to be a Promise, but that is only enforced at runtime.
+   */
+  // TODO(https://crbug.com/545375591): Remove once all embedders return a
+  // MaybeLocal<Promise>.
+  using LegacySyntheticModuleEvaluationSteps =
       MaybeLocal<Value> (*)(Local<Context> context, Local<Module> module);
 
   /**
@@ -364,6 +373,17 @@ class V8_EXPORT Module : public Data {
       Isolate* isolate, Local<String> module_name,
       const std::span<const Local<String>>& export_names,
       SyntheticModuleEvaluationSteps evaluation_steps,
+      Local<Data> host_defined_options = Local<Data>());
+
+  // TODO(https://crbug.com/545375591): Advance to V8_DEPRECATED and then remove
+  // this overload once all embedders have been migrated to the one above.
+  V8_DEPRECATE_SOON(
+      "Use the CreateSyntheticModule overload whose evaluation_steps return a "
+      "MaybeLocal<Promise>")
+  static Local<Module> CreateSyntheticModule(
+      Isolate* isolate, Local<String> module_name,
+      const std::span<const Local<String>>& export_names,
+      LegacySyntheticModuleEvaluationSteps evaluation_steps,
       Local<Data> host_defined_options = Local<Data>());
 
   /**
@@ -908,16 +928,17 @@ class V8_EXPORT ScriptCompiler {
       Local<String> full_source_string, const ScriptOrigin& origin);
 
   /**
-   * Return a version tag for CachedData for the current V8 version & flags.
+   * Return a version tag for CachedData for the current V8 version, embedder
+   * version string, and flags.
    *
    * This value is meant only for determining whether a previously generated
    * CachedData instance is still valid; the tag has no other meaing.
    *
    * Background: The data carried by CachedData may depend on the exact
-   *   V8 version number or current compiler flags. This means that when
-   *   persisting CachedData, the embedder must take care to not pass in
-   *   data from another V8 version, or the same version with different
-   *   features enabled.
+   *   V8 version number, embedder version string, or current compiler flags.
+   *   This means that when persisting CachedData, the embedder must take care
+   *   to not pass in data from another V8 build, or the same build with
+   *   different features enabled.
    *
    *   The easiest way to do so is to clear the embedder's cache on any
    *   such change.

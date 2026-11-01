@@ -14,6 +14,7 @@
 #include <vector>
 
 #include "absl/container/flat_hash_map.h"
+#include "absl/container/flat_hash_set.h"
 #include "include/v8-profiler.h"
 #include "src/base/platform/time.h"
 #include "src/execution/isolate.h"
@@ -61,6 +62,34 @@ struct EntrySourceLocation {
   const int script_id;
   const int line;
   const int col;
+};
+
+// Describes one scope of the scope tree of a script. Scopes are stored in one
+// flat vector in the snapshot, in pre-order of the scope tree. The tree
+// hierarchy is encoded through the depth of each scope.
+//
+// The context variables declared by the scope and the uses of context
+// variables within the scope are stored in separate flat vectors in the
+// snapshot. Each scope owns the next scope_context_vars_count respectively
+// scope_uses_count entries of those vectors.
+struct SourceScopeInfo {
+  // The snapshot entry of the script this scope belongs to.
+  HeapEntry* script_entry;
+  // Scope id, unique within the script. Can be negative or zero.
+  int scope_id;
+  // Depth within the scope tree of the script, the root scope has depth 0.
+  int depth;
+  uint32_t scope_context_vars_count;
+  uint32_t scope_uses_count;
+};
+
+// A use of a context-allocated variable: the variable is identified by the
+// scope that declares it together with its index in that scope's context.
+// Uses are collected per scope and stored in one flat vector in the snapshot,
+// see SourceScopeInfo::scope_uses_count.
+struct SourceScopeUse {
+  int declaring_scope_id;
+  int slot_index;
 };
 
 class HeapGraphEdge {
@@ -299,6 +328,25 @@ class HeapSnapshot {
   void AddScriptLineEnds(int script_id, String::LineEndsVector&& line_ends);
   String::LineEndsVector& GetScriptLineEnds(int script_id);
 
+  void AddSourceScope(const SourceScopeInfo& info) {
+    source_scopes_.push_back(info);
+  }
+  void AddSourceScopeContextVar(const char* name) {
+    source_scope_context_vars_.push_back(name);
+  }
+  void AddSourceScopeUse(const SourceScopeUse& use) {
+    source_scope_uses_.push_back(use);
+  }
+  const std::vector<SourceScopeInfo>& source_scopes() const {
+    return source_scopes_;
+  }
+  const std::vector<const char*>& source_scope_context_vars() const {
+    return source_scope_context_vars_;
+  }
+  const std::vector<SourceScopeUse>& source_scope_uses() const {
+    return source_scope_uses_;
+  }
+
   void Print(int max_depth);
 
  private:
@@ -329,6 +377,9 @@ class HeapSnapshot {
   using ScriptsLineEndsMap =
       std::unordered_map<ScriptId, String::LineEndsVector>;
   ScriptsLineEndsMap scripts_line_ends_map_;
+  std::vector<SourceScopeInfo> source_scopes_;
+  std::vector<const char*> source_scope_context_vars_;
+  std::vector<SourceScopeUse> source_scope_uses_;
 };
 
 
@@ -365,6 +416,7 @@ class HeapObjectsMap {
       IsNativeObject is_native_object = IsNativeObject::kNo);
   SnapshotObjectId FindMergedNativeEntry(NativeObject addr);
   void AddMergedNativeEntry(NativeObject addr, Address canonical_addr);
+  void ClearMergedNativeEntries();
   V8_EXPORT_PRIVATE bool ContainsEntryWithIdForTesting(
       SnapshotObjectId id) const;
 
@@ -458,6 +510,7 @@ class V8_EXPORT_PRIVATE V8HeapExplorer : public HeapEntriesAllocator {
   HeapEntry* AllocateEntry(Tagged<Smi> smi) override;
   uint32_t EstimateObjectsCount();
   void PopulateLineEnds();
+  void RecordScriptSources();
   bool IterateAndExtractReferences(HeapSnapshotGenerator* generator);
 
   struct NativeContextTagInfo {
@@ -523,6 +576,7 @@ class V8_EXPORT_PRIVATE V8HeapExplorer : public HeapEntriesAllocator {
   void ExtractSharedFunctionInfoReferences(HeapEntry* entry,
                                            Tagged<SharedFunctionInfo> shared);
   void ExtractScriptReferences(HeapEntry* entry, Tagged<Script> script);
+  void ParseScriptScopes(HeapEntry* entry, Tagged<Script> script);
   void ExtractAccessorInfoReferences(HeapEntry* entry,
                                      Tagged<AccessorInfo> accessor_info);
   void ExtractAccessorPairReferences(HeapEntry* entry,
@@ -574,6 +628,8 @@ class V8_EXPORT_PRIVATE V8HeapExplorer : public HeapEntriesAllocator {
   void ExtractInternalReferences(Tagged<JSObject> js_obj, HeapEntry* entry);
   void ExtractCppHeapExternalReferences(HeapEntry* entry,
                                         Tagged<CppHeapExternalObject> obj);
+  void ExtractCppGCManagedBaseReferences(HeapEntry* entry,
+                                         Tagged<CppGCManagedBase> obj);
 
 #if V8_ENABLE_WEBASSEMBLY
   void ExtractWasmStructReferences(Tagged<WasmStruct> obj, HeapEntry* entry);
@@ -637,6 +693,9 @@ class V8_EXPORT_PRIVATE V8HeapExplorer : public HeapEntriesAllocator {
                                   HeapEntry::Type type, int recursion_limit);
 
   HeapEntry* GetEntry(Tagged<Object> obj);
+  bool IsScriptSource(Tagged<String> string) const {
+    return script_sources_.contains(string);
+  }
 
   Heap* heap_;
   HeapSnapshot* snapshot_;
@@ -648,6 +707,8 @@ class V8_EXPORT_PRIVATE V8HeapExplorer : public HeapEntriesAllocator {
       native_context_tag_map_;
   UnorderedHeapObjectMap<const char*> strong_gc_subroot_names_;
   std::unordered_set<Tagged<NativeContext>, Object::Hasher> user_roots_;
+  absl::flat_hash_set<Tagged<String>, Object::Hasher, Object::KeyEqualSafe>
+      script_sources_;
   v8::HeapProfiler::ContextNameResolver* native_context_name_resolver_;
 
   std::vector<bool> visited_fields_;
@@ -850,6 +911,9 @@ class HeapSnapshotJSONSerializer {
   void SerializeStrings();
   void SerializeLocation(const EntrySourceLocation& location);
   void SerializeLocations();
+  void SerializeScopes();
+  void SerializeScopeContextVars();
+  void SerializeScopeUses();
 
   static const int kEdgeFieldsCount;
   static const int kNodeFieldsCountWithTraceNodeId;

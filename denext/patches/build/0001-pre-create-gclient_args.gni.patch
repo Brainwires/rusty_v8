@@ -1,0 +1,26 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: snek <the@snek.dev>
+Date: Wed, 7 Aug 2024 10:37:37 +0200
+Subject: [PATCH 1/8] pre-create gclient_args.gni
+
+---
+ .gitignore              | 1 -
+ config/gclient_args.gni | 0
+ 2 files changed, 1 deletion(-)
+ create mode 100644 config/gclient_args.gni
+
+diff --git a/.gitignore b/.gitignore
+index 3bff996..1bcfd82 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -6,7 +6,6 @@ ciopfs
+ /android/binary_size/apks/**/*.apk
+ /args/chromeos/*.gni
+ /args/chromeos/rewrapper*
+-/config/gclient_args.gni
+ /cros_cache/
+ /Debug
+ /Debug_x64
+diff --git a/config/gclient_args.gni b/config/gclient_args.gni
+new file mode 100644
+index 0000000..e69de29

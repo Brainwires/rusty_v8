@@ -7,6 +7,7 @@
 
 #include "src/base/logging.h"
 #include "src/base/strong-alias.h"
+#include "src/codegen/atomic-memory-order.h"
 #include "src/codegen/machine-type.h"
 #include "src/codegen/macro-assembler.h"
 #include "src/common/globals.h"
@@ -244,6 +245,8 @@ class V8_EXPORT_PRIVATE MaglevAssembler : public MacroAssembler {
       Register object, int offset, Register value,
       RegisterSnapshot register_snapshot, IndirectPointerTag tag);
 
+  inline void MemoryBarrier(AtomicMemoryOrder order);
+
   // Preserves all registers that are in the register snapshot, but is otherwise
   // allowed to clobber both input registers if they are not in the snapshot.
   //
@@ -260,6 +263,22 @@ class V8_EXPORT_PRIVATE MaglevAssembler : public MacroAssembler {
                                         ValueCanBeSmi value_can_be_smi);
   inline void StoreTaggedFieldNoWriteBarrier(Register object, int offset,
                                              Register value);
+
+  // Whether tagged constants (Smis, read-only roots and compressed heap
+  // objects) can be stored as immediates, i.e. whether the overloads below are
+  // implemented.
+#if V8_TARGET_ARCH_X64 || V8_TARGET_ARCH_ARM64
+  static constexpr bool kSupportsStoreTaggedConstant = COMPRESS_POINTERS_BOOL;
+#else
+  static constexpr bool kSupportsStoreTaggedConstant = false;
+#endif
+  // Whether {value} is a constant that {StoreTaggedFieldNoWriteBarrier} can
+  // store as an immediate, without materializing it in a register.
+  static inline bool CanStoreTaggedConstant(ValueNode* value);
+  inline void StoreTaggedFieldNoWriteBarrier(Register object, int offset,
+                                             ValueNode* constant);
+  inline void StoreTaggedFieldNoWriteBarrier(Register object, int offset,
+                                             Handle<HeapObject> constant);
   inline void StoreTaggedSignedField(Register object, int offset,
                                      Register value);
   inline void StoreTaggedSignedField(Register object, int offset,
@@ -268,6 +287,14 @@ class V8_EXPORT_PRIVATE MaglevAssembler : public MacroAssembler {
   inline void StoreInt32Field(Register object, int offset, int32_t value);
 
   inline void AssertElidedWriteBarrier(Register object, Register value,
+                                       RegisterSnapshot snapshot);
+  // For a constant {value} stored as an immediate (see
+  // {CanStoreTaggedConstant}); the constant is only materialized on the
+  // deferred verification path, so no register is needed for it here.
+  inline void AssertElidedWriteBarrier(Register object, ValueNode* value,
+                                       RegisterSnapshot snapshot);
+  inline void AssertElidedWriteBarrier(Register object,
+                                       compiler::HeapObjectRef value,
                                        RegisterSnapshot snapshot);
 
 #ifdef V8_ENABLE_SANDBOX
@@ -282,6 +309,7 @@ class V8_EXPORT_PRIVATE MaglevAssembler : public MacroAssembler {
 
   inline void StoreField(MemOperand operand, Register value, int element_size);
   inline void ReverseByteOrder(Register value, int element_size);
+  inline void ReverseByteOrderUnsigned(Register value, int element_size);
 
   inline void BuildTypedArrayDataPointer(Register data_pointer,
                                          Register object);
@@ -292,6 +320,9 @@ class V8_EXPORT_PRIVATE MaglevAssembler : public MacroAssembler {
                                    Register index, int element_size);
   inline void LoadDataViewElement(Register result, Register data_pointer,
                                   Register index, int element_size);
+  inline void LoadUnsignedDataViewElement(Register result,
+                                          Register data_pointer, Register index,
+                                          int element_size);
 
   enum class CharCodeMaskMode { kValueIsInRange, kMustApplyMask };
 
@@ -502,6 +533,16 @@ class V8_EXPORT_PRIVATE MaglevAssembler : public MacroAssembler {
   inline void LoadFloat64(DoubleRegister dst, MemOperand src);
   inline void StoreFloat64(MemOperand dst, DoubleRegister src);
 
+  inline void LoadUnalignedFloat32(DoubleRegister dst, Register base,
+                                   Register index);
+  inline void LoadUnalignedFloat32AndReverseByteOrder(DoubleRegister dst,
+                                                      Register base,
+                                                      Register index);
+  inline void StoreUnalignedFloat32(Register base, Register index,
+                                    DoubleRegister src);
+  inline void ReverseByteOrderAndStoreUnalignedFloat32(Register base,
+                                                       Register index,
+                                                       DoubleRegister src);
   inline void LoadUnalignedFloat64(DoubleRegister dst, Register base,
                                    Register index);
   inline void LoadUnalignedFloat64AndReverseByteOrder(DoubleRegister dst,
@@ -859,6 +900,9 @@ class V8_EXPORT_PRIVATE MaglevAssembler : public MacroAssembler {
       Register object, RegisterSnapshot& register_snapshot);
 
   void ResetLastYoungAllocation();
+
+  void TryOnStackReplacement(ReduceInterruptBudgetForLoop* node,
+                             FeedbackSlot feedback_slot);
 
   compiler::NativeContextRef native_context() const {
     return code_gen_state()->broker()->target_native_context();

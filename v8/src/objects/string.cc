@@ -95,12 +95,13 @@ void MigrateExternalStringResource(Isolate* isolate,
   if (to_resource_address == kNullAddress) {
     Tagged<StringClass> cast_from = Cast<StringClass>(from);
     // |to| is a just-created internalized copy of |from|. Migrate the resource.
-    to->SetResource(isolate, cast_from->resource());
+    const typename StringClass::Resource* resource =
+        cast_from->ExchangeResource(isolate, nullptr);
+    to->SetResource(isolate, resource);
     // Zap |from|'s resource pointer to reflect the fact that |from| has
     // relinquished ownership of its resource.
     isolate->heap()->UpdateExternalString(
         from, Cast<ExternalString>(from)->ExternalPayloadSize(), 0);
-    cast_from->SetResource(isolate, nullptr);
   } else if (to_resource_address != from->resource_as_address(isolate)) {
     // |to| already existed and has its own resource. Finalize |from|.
     isolate->heap()->FinalizeExternalString(from);
@@ -2100,15 +2101,17 @@ SeqString::DataAndPaddingSizes SeqString::GetDataAndPaddingSizes() const {
 
 SeqString::DataAndPaddingSizes SeqOneByteString::GetDataAndPaddingSizes()
     const {
-  int data_size = sizeof(SeqOneByteString) + length() * kOneByteSize;
-  int padding_size = SizeFor(length()) - data_size;
+  uint32_t len = length();
+  int data_size = DataSizeFor(len);
+  int padding_size = SizeFor(len) - data_size;
   return DataAndPaddingSizes{data_size, padding_size};
 }
 
 SeqString::DataAndPaddingSizes SeqTwoByteString::GetDataAndPaddingSizes()
     const {
-  int data_size = sizeof(SeqTwoByteString) + length() * base::kUC16Size;
-  int padding_size = SizeFor(length()) - data_size;
+  uint32_t len = length();
+  int data_size = DataSizeFor(len);
+  int padding_size = SizeFor(len) - data_size;
   return DataAndPaddingSizes{data_size, padding_size};
 }
 

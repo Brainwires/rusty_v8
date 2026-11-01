@@ -4,6 +4,9 @@
 
 #include "partition_alloc/scheduler_loop_quarantine.h"
 
+#include <thread>
+
+#include "partition_alloc/buildflags.h"
 #include "partition_alloc/extended_api.h"
 #include "partition_alloc/internal/partition_root_internal.h"
 #include "partition_alloc/partition_alloc_base/check.h"
@@ -11,18 +14,21 @@
 #include "partition_alloc/partition_page.h"
 #include "partition_alloc/partition_stats.h"
 #include "partition_alloc/scheduler_loop_quarantine_support.h"
+#include "partition_alloc/shim/allocator_shim_default_dispatch_to_partition_alloc.h"
 #include "partition_alloc/slot_start.h"
 #include "partition_alloc/thread_cache.h"
 #include "testing/gtest/include/gtest/gtest.h"
 
 namespace partition_alloc {
 
-#if !defined(MEMORY_TOOL_REPLACES_ALLOCATOR)
+#if !PA_BUILDFLAG(MEMORY_TOOL_REPLACES_ALLOCATOR)
 
 namespace {
 
 template <bool thread_bound>
-internal::SchedulerLoopQuarantineBranch<thread_bound>*
+internal::SchedulerLoopQuarantineBranch<
+    thread_bound,
+    internal::QuarantineTarget::kMiracleObjects>*
 GetBranchFromAllocatorRoot(PartitionRoot* root);
 
 template <>
@@ -83,7 +89,7 @@ class SchedulerLoopQuarantineTest : public testing::Test {
   QuarantineBranch* GetQuarantineBranch() { return branch_; }
 
   void Quarantine(void* object) {
-    internal::SlotStart slot_start = internal::SlotStart::Unchecked(object);
+    SlotStart slot_start = SlotStart::Unchecked(object);
     auto* slot_span = internal::SlotSpanMetadata::FromSlotStart(
         slot_start.Untag(), GetPartitionRoot());
     auto size_details =
@@ -92,7 +98,7 @@ class SchedulerLoopQuarantineTest : public testing::Test {
   }
 
   size_t GetObjectSize(void* object) {
-    internal::SlotStart slot_start = internal::SlotStart::Unchecked(object);
+    SlotStart slot_start = SlotStart::Unchecked(object);
     auto* entry_slot_span = internal::SlotSpanMetadata::FromSlotStart(
         slot_start.Untag(), GetPartitionRoot());
     return entry_slot_span->bucket->slot_size;
@@ -240,6 +246,49 @@ TYPED_TEST(SchedulerLoopQuarantineTest, ScopedOptOut) {
   ASSERT_TRUE(this->GetQuarantineBranch()->IsQuarantinedForTesting(object2));
 }
 
+// Test if partition 0 is Invalid that the exclusion still works
+// on the other partitions.
+TEST(SchedulerLoopQuarantineTest, ExclusionWithInvalidFirstPartition) {
+  if (kNumPartitions < 2) {
+    GTEST_SKIP() << "Test requires kNumPartitions >= 2";
+  }
+#if PA_BUILDFLAG(USE_ALLOCATOR_SHIM)
+  auto* root1 = allocator_shim::internal::PartitionAllocMalloc::Allocator(1);
+  if (!root1) {
+    GTEST_SKIP() << "Partition 1 is not initialized";
+  }
+
+  // Spawn a fresh thread where index 0 has never allocated (is invalid).
+  std::thread worker([root1] {
+    // Verify index 0 is invalid while index 1 is initialized/valid.
+    ASSERT_FALSE(internal::ThreadCache::IsValid(internal::ThreadCache::Get(0)));
+
+    void* ptr = root1->Alloc(16);
+    auto* tcache1 = internal::ThreadCache::Get(1);
+    ASSERT_TRUE(internal::ThreadCache::IsValid(tcache1));
+
+    auto& branch = tcache1->GetSchedulerLoopQuarantineBranch();
+    internal::SchedulerLoopQuarantineRoot qroot(*root1);
+    branch.Configure(
+        qroot, {.branch_capacity_in_bytes = 1024, .enable_quarantine = true});
+
+    SlotStart slot_start = SlotStart::Unchecked(ptr);
+    auto* slot_span =
+        internal::SlotSpanMetadata::FromSlotStart(slot_start.Untag(), root1);
+    auto size_details = root1->SlotSpanToBucketSizeDetails(slot_span);
+
+    {
+      // Index 0 being invalid caused this to return early, skipping index 1's
+      // opt-out. Now index 1 is correctly opted out.
+      ScopedSchedulerLoopQuarantineExclusion opt_out;
+      branch.Quarantine(slot_start, slot_span, size_details);
+      EXPECT_FALSE(branch.IsQuarantinedForTesting(ptr));
+    }
+  });
+  worker.join();
+#endif  // PA_BUILDFLAG(USE_ALLOCATOR_SHIM)
+}
+
 TYPED_TEST(ThreadBoundSchedulerLoopQuarantineTest,
            TaskControlledPurgeAndPause) {
   auto* branch = this->GetQuarantineBranch();
@@ -318,6 +367,6 @@ TYPED_TEST(ThreadBoundSchedulerLoopQuarantineTest,
 
 }  // namespace
 
-#endif  // !defined(MEMORY_TOOL_REPLACES_ALLOCATOR)
+#endif  // !PA_BUILDFLAG(MEMORY_TOOL_REPLACES_ALLOCATOR)
 
 }  // namespace partition_alloc

@@ -14,6 +14,7 @@
 #include "partition_alloc/address_space_randomization.h"
 #include "partition_alloc/build_config.h"
 #include "partition_alloc/buildflags.h"
+#include "partition_alloc/linux_name_region.h"
 #include "partition_alloc/page_allocator_constants.h"
 #include "partition_alloc/partition_alloc_base/compiler_specific.h"
 #include "partition_alloc/partition_alloc_base/cpu.h"
@@ -46,7 +47,7 @@
 #endif
 #endif  // PA_BUILDFLAG(HAS_MEMORY_TAGGING)
 
-#if !defined(MEMORY_TOOL_REPLACES_ALLOCATOR)
+#if !PA_BUILDFLAG(MEMORY_TOOL_REPLACES_ALLOCATOR)
 
 #if PA_BUILDFLAG(IS_IOS)
 #include <sys/sysctl.h>
@@ -760,4 +761,4 @@ TEST(PartitionAllocPageAllocatorTest, MAYBE_AllocReadWriteExecute) {
 
 }  // namespace partition_alloc::internal
 
-#endif  // !defined(MEMORY_TOOL_REPLACES_ALLOCATOR)
+#endif  // !PA_BUILDFLAG(MEMORY_TOOL_REPLACES_ALLOCATOR)

@@ -30,6 +30,7 @@
 #include "src/objects/slots.h"
 #include "src/objects/smi.h"
 #include "src/objects/string.h"
+#include "src/sandbox/check.h"
 #include "src/sandbox/external-pointer-inl.h"
 #include "src/sandbox/indirect-pointer-tag.h"
 #include "src/sandbox/js-dispatch-table-inl.h"
@@ -264,7 +265,7 @@ void MarkingVisitorBase<ConcreteVisitor>::VisitExternalPointer(
                   : heap_->old_external_pointer_space();
     }
   }
-  table->Mark(space, handle, slot.address());
+  table->Mark(space, handle, slot.address(), slot.tag_range());
   if (slot.tag_range() != kArrayBufferExtensionTag) {
     return;
   }
@@ -279,6 +280,12 @@ void MarkingVisitorBase<ConcreteVisitor>::VisitExternalPointer(
     ArrayBufferExtension* extension =
         reinterpret_cast<ArrayBufferExtension*>(maybe_extension);
     extension->InitializationBarrier();
+#ifdef V8_COMPRESS_POINTERS
+    SBXCHECK_EQ(space == heap_->young_external_pointer_space()
+                    ? ArrayBufferExtension::Age::kYoung
+                    : ArrayBufferExtension::Age::kOld,
+                extension->age());
+#endif  // V8_COMPRESS_POINTERS
     extension->Mark();
   }
 }
@@ -550,47 +557,30 @@ bool MarkingVisitorBase<ConcreteVisitor>::ShouldFlushCode(
 template <typename ConcreteVisitor>
 bool MarkingVisitorBase<ConcreteVisitor>::IsOld(
     Tagged<SharedFunctionInfo> sfi) const {
-  if (v8_flags.flush_code_based_on_time) {
-    return sfi->age() >= v8_flags.bytecode_old_time;
-  } else if (v8_flags.flush_code_based_on_tab_visibility) {
-    return isolate_in_background_ ||
-           V8_UNLIKELY(sfi->age() == SharedFunctionInfo::kMaxAge);
-  } else {
-    return sfi->age() >= v8_flags.bytecode_old_age;
-  }
+  return sfi->age() >= v8_flags.bytecode_old_time;
 }
 
 template <typename ConcreteVisitor>
 void MarkingVisitorBase<ConcreteVisitor>::MakeOlder(
     Tagged<SharedFunctionInfo> sfi) const {
-  if (v8_flags.flush_code_based_on_time) {
-    if (code_flushing_increase_ == 0) {
-      return;
-    }
-
-    uint16_t current_age;
-    uint16_t updated_age;
-    do {
-      current_age = sfi->age();
-      // When the age is 0, it was reset by the function prologue in
-      // Ignition/Sparkplug. But that might have been some time after the last
-      // full GC. So in this case we don't increment the value like we normally
-      // would but just set the age to 1. All non-0 values can be incremented as
-      // expected (we add the number of seconds since the last GC) as they were
-      // definitely last executed before the last full GC.
-      updated_age = current_age == 0
-                        ? 1
-                        : SaturateAdd(current_age, code_flushing_increase_);
-    } while (sfi->CompareExchangeAge(current_age, updated_age) != current_age);
-  } else if (v8_flags.flush_code_based_on_tab_visibility) {
-    // No need to increment age.
-  } else {
-    uint16_t age = sfi->age();
-    if (age < v8_flags.bytecode_old_age) {
-      sfi->CompareExchangeAge(age, age + 1);
-    }
-    DCHECK_LE(sfi->age(), v8_flags.bytecode_old_age);
+  if (code_flushing_increase_ == 0) {
+    return;
   }
+
+  uint16_t current_age;
+  uint16_t updated_age;
+  do {
+    current_age = sfi->age();
+    // When the age is 0, it was reset by the function prologue in
+    // Ignition/Sparkplug. But that might have been some time after the last
+    // full GC. So in this case we don't increment the value like we normally
+    // would but just set the age to 1. All non-0 values can be incremented as
+    // expected (we add the number of seconds since the last GC) as they were
+    // definitely last executed before the last full GC.
+    updated_age = current_age == 0
+                      ? 1
+                      : SaturateAdd(current_age, code_flushing_increase_);
+  } while (sfi->CompareExchangeAge(current_age, updated_age) != current_age);
 }
 
 template <typename ConcreteVisitor>

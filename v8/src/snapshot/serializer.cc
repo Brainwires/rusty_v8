@@ -24,6 +24,7 @@
 #include "src/objects/slots-inl.h"
 #include "src/objects/slots.h"
 #include "src/objects/smi.h"
+#include "src/sandbox/check.h"
 #include "src/sandbox/js-dispatch-table-inl.h"
 #include "src/snapshot/embedded/embedded-data.h"
 #include "src/snapshot/serializer-deserializer.h"
@@ -286,6 +287,10 @@ void Serializer::PutRoot(RootIndex root) {
     PrintF("\n");
   }
 
+  SBXCHECK_IMPLIES(RootsTable::IsInTrustedObjectMapList(root),
+                   RootsTable::IsInSerializableTrustedObjectMapList(root) ||
+                       allow_serializing_all_trusted_objects());
+
   // Assert that the first 32 root array items are a conscious choice. They are
   // chosen so that the most common ones can be encoded more efficiently.
   static_assert(static_cast<int>(RootIndex::kArgumentsMarker) ==
@@ -536,6 +541,7 @@ void Serializer::ObjectSerializer::SerializePrologue(SnapshotSpace space,
     // initialized before the pending reference is resolved. Otherwise, the
     // object cannot be referenced.
     if (V8_ENABLE_SANDBOX_BOOL && IsExposedTrustedObject(*object_)) {
+      SBXCHECK_EQ(space, SnapshotSpace::kTrusted);
       sink_->Put(kInitializeSelfIndirectPointer,
                  "InitializeSelfIndirectPointer");
     }
@@ -612,54 +618,44 @@ uint32_t Serializer::ObjectSerializer::SerializeBackingStore(
 }
 
 void Serializer::ObjectSerializer::SerializeJSTypedArray() {
+  uint32_t ref = kEmptyBackingStoreRefSentinel;
   {
     DisallowGarbageCollection no_gc;
     Tagged<JSTypedArray> typed_array = Cast<JSTypedArray>(*object_);
-    if (typed_array->is_on_heap()) {
-      typed_array->RemoveExternalPointerCompensationForSerialization(isolate());
-    } else {
-      if (!typed_array->IsDetachedOrOutOfBounds()) {
-        // Explicitly serialize the backing store now.
-        Tagged<JSArrayBuffer> buffer =
-            Cast<JSArrayBuffer>(typed_array->buffer());
-        // We cannot store byte_length or max_byte_length larger than uint32
-        // range in the snapshot.
-        size_t byte_length_size = buffer->GetByteLength();
-        CHECK_LE(byte_length_size,
-                 size_t{std::numeric_limits<uint32_t>::max()});
-        uint32_t byte_length = static_cast<uint32_t>(byte_length_size);
-        Maybe<uint32_t> max_byte_length = Nothing<uint32_t>();
-        if (buffer->is_resizable_by_js()) {
-          CHECK_LE(buffer->max_byte_length(),
-                   std::numeric_limits<uint32_t>::max());
-          max_byte_length =
-              Just(static_cast<uint32_t>(buffer->max_byte_length()));
-        }
-        size_t byte_offset = typed_array->byte_offset();
-
-        // We need to calculate the backing store from the data pointer
-        // because the ArrayBuffer may already have been serialized.
-        void* backing_store = reinterpret_cast<void*>(
-            reinterpret_cast<Address>(typed_array->DataPtr()) - byte_offset);
-
-        uint32_t ref =
-            SerializeBackingStore(backing_store, byte_length, max_byte_length);
-        typed_array->SetExternalBackingStoreRefForSerialization(ref);
-      } else {
-        typed_array->SetExternalBackingStoreRefForSerialization(0);
+    if (!typed_array->is_on_heap() && !typed_array->IsDetachedOrOutOfBounds()) {
+      // Explicitly serialize the backing store now.
+      Tagged<JSArrayBuffer> buffer = Cast<JSArrayBuffer>(typed_array->buffer());
+      // We cannot store byte_length or max_byte_length larger than uint32
+      // range in the snapshot.
+      size_t byte_length_size = buffer->GetByteLength();
+      CHECK_LE(byte_length_size, size_t{std::numeric_limits<uint32_t>::max()});
+      uint32_t byte_length = static_cast<uint32_t>(byte_length_size);
+      Maybe<uint32_t> max_byte_length = Nothing<uint32_t>();
+      if (buffer->is_resizable_by_js()) {
+        CHECK_LE(buffer->max_byte_length(),
+                 std::numeric_limits<uint32_t>::max());
+        max_byte_length =
+            Just(static_cast<uint32_t>(buffer->max_byte_length()));
       }
+      size_t byte_offset = typed_array->byte_offset();
+
+      // We need to calculate the backing store from the data pointer
+      // because the ArrayBuffer may already have been serialized.
+      void* backing_store = reinterpret_cast<void*>(
+          reinterpret_cast<Address>(typed_array->DataPtr()) - byte_offset);
+
+      ref = SerializeBackingStore(backing_store, byte_length, max_byte_length);
     }
   }
   SerializeObject();
+  sink_->PutUint30(ref, "BackingStoreRef");
 }
 
 void Serializer::ObjectSerializer::SerializeJSArrayBuffer() {
-  ArrayBufferExtension* extension;
-  void* backing_store;
+  uint32_t ref = kEmptyBackingStoreRefSentinel;
   {
     DisallowGarbageCollection no_gc;
     Tagged<JSArrayBuffer> buffer = Cast<JSArrayBuffer>(*object_);
-    backing_store = buffer->backing_store();
     // We cannot store byte_length or max_byte_length larger than uint32 range
     // in the snapshot.
     size_t byte_length_size = buffer->GetByteLength();
@@ -670,27 +666,15 @@ void Serializer::ObjectSerializer::SerializeJSArrayBuffer() {
       CHECK_LE(buffer->max_byte_length(), std::numeric_limits<uint32_t>::max());
       max_byte_length = Just(static_cast<uint32_t>(buffer->max_byte_length()));
     }
-    extension = buffer->extension();
 
     // Only serialize non-empty backing stores.
-    if (buffer->IsEmpty()) {
-      buffer->SetBackingStoreRefForSerialization(kEmptyBackingStoreRefSentinel);
-    } else {
-      uint32_t ref =
-          SerializeBackingStore(backing_store, byte_length, max_byte_length);
-      buffer->SetBackingStoreRefForSerialization(ref);
+    if (!buffer->IsEmpty()) {
+      ref = SerializeBackingStore(buffer->backing_store(), byte_length,
+                                  max_byte_length);
     }
-
-    // Ensure deterministic output by setting extension to null during
-    // serialization.
-    buffer->set_extension(nullptr);
   }
   SerializeObject();
-  {
-    Tagged<JSArrayBuffer> buffer = Cast<JSArrayBuffer>(*object_);
-    buffer->set_backing_store(isolate(), backing_store);
-    buffer->set_extension(extension);
-  }
+  sink_->PutUint30(ref, "BackingStoreRef");
 }
 
 void Serializer::ObjectSerializer::SerializeNativeContext() {
@@ -703,26 +687,16 @@ void Serializer::ObjectSerializer::SerializeNativeContext() {
 }
 
 void Serializer::ObjectSerializer::SerializeExternalString() {
-  // For external strings with known resources, we replace the resource field
-  // with the encoded external reference, which we restore upon deserialize.
-  // For the rest we serialize them to look like ordinary sequential strings.
+  // For external strings with known resources, their external pointer slots
+  // are serialized via VisitExternalPointer. For the rest we serialize them
+  // to look like ordinary sequential strings.
   auto string = Cast<ExternalString>(object_);
   Address resource = string->resource_as_address(isolate());
   ExternalReferenceEncoder::Value reference;
   if (serializer_->external_reference_encoder_.TryEncode(resource).To(
           &reference)) {
     DCHECK(reference.is_from_api());
-#ifdef V8_ENABLE_SANDBOX
-    uint32_t external_pointer_entry =
-        string->GetResourceRefForDeserialization();
-#endif
-    string->SetResourceRefForSerialization(reference.index());
     SerializeObject();
-#ifdef V8_ENABLE_SANDBOX
-    string->SetResourceRefForSerialization(external_pointer_entry);
-#else
-    string->set_address_as_resource(isolate(), resource);
-#endif
   } else {
     SerializeExternalStringAsSequentialString();
   }
@@ -1141,12 +1115,14 @@ void Serializer::ObjectSerializer::VisitCppHeapPointer(
 
   PtrComprCageBase cage_base(isolate());
   // Currently there's only very limited support for CppHeapPointerSlot
-  // serialization as it's only used for API wrappers.
+  // serialization.
   //
   // We serialize the slot as initialized-but-unused slot.  The actual API
   // wrapper serialization is implemented in
   // `ContextSerializer::SerializeApiWrapperFields()`.
-  DCHECK(IsJSApiWrapperObjectMap(object_->map()) || IsNativeContext(*object_));
+  DCHECK(IsJSApiWrapperObjectMap(object_->map()) || IsNativeContext(*object_) ||
+         IsCppGCManagedBase(*object_) ||
+         IsEmbedderDataArray(*object_));
   static_assert(kCppHeapPointerSlotSize % kTaggedSize == 0);
   sink_->Put(
       FixedRawDataWithSize::Encode(kCppHeapPointerSlotSize >> kTaggedSizeLog2),
@@ -1163,48 +1139,41 @@ void Serializer::ObjectSerializer::VisitExternalPointer(
       InstanceTypeChecker::IsJSExternalObject(instance_type) ||
       InstanceTypeChecker::IsAccessorInfo(instance_type) ||
       InstanceTypeChecker::IsInterceptorInfo(instance_type) ||
-      InstanceTypeChecker::IsFunctionTemplateInfo(instance_type)) {
+      InstanceTypeChecker::IsFunctionTemplateInfo(instance_type) ||
+      InstanceTypeChecker::IsJSArrayBuffer(instance_type) ||
+      InstanceTypeChecker::IsExternalString(instance_type)) {
     // If necessary, output any raw data preceding this slot.
     OutputRawData(slot.address());
-    Address value = slot.load(isolate());
 #ifdef V8_ENABLE_SANDBOX
+    ExternalPointerHandle handle = slot.Relaxed_LoadHandle();
+    const ExternalPointerTable& table =
+        IsolateForSandbox(isolate()).GetExternalPointerTableFor(
+            slot.tag_range());
+    Address value = table.Get(handle, slot.tag_range());
     // We need to load the actual tag from the table here since the slot may
     // use a generic tag (e.g. kAnyExternalPointerTag) if the concrete tag is
     // unknown by the visitor (for example the case for Foreigns).
-    ExternalPointerHandle handle = slot.Relaxed_LoadHandle();
-    ExternalPointerTag tag = isolate()->external_pointer_table().GetTag(handle);
+    ExternalPointerTag tag = table.GetTag(handle);
 #else
+    Address value = slot.load(isolate());
     ExternalPointerTag tag = kExternalPointerNullTag;
 #endif  // V8_ENABLE_SANDBOX
+    if (slot.tag_range() == kExternalStringResourceDataTag ||
+        slot.tag_range() == kArrayBufferExtensionTag) {
+      // resource_data_ is initialized in PostProcessExternalString, and
+      // extension_ in PostProcessNewJSReceiver. Serializing them as null also
+      // keeps the snapshot deterministic, as both hold values that are only
+      // meaningful within the serializing isolate.
+      value = kNullAddress;
+      tag = kExternalPointerNullTag;
+    }
     const bool sandboxify = V8_ENABLE_SANDBOX_BOOL;
     OutputExternalReference(value, kSystemPointerSize, sandboxify, tag);
     bytes_processed_so_far_ += kExternalPointerSlotSize;
-
-#ifndef V8_CPPGC_MICROTASK_QUEUE
-  } else if (InstanceTypeChecker::IsNativeContext(instance_type)) {
-    // If necessary, output any raw data preceding this slot.
-    OutputRawData(slot.address());
-    // Serialize MicrotaskQueue* value as nullptr (it'll be set to correct
-    // value during deserialization anyway).
-    const bool sandboxify = V8_ENABLE_SANDBOX_BOOL;
-    OutputExternalReference(kNullAddress, kSystemPointerSize, sandboxify,
-                            kNativeContextMicrotaskQueueTag);
-    bytes_processed_so_far_ += kExternalPointerSlotSize;
-#endif  // V8_CPPGC_MICROTASK_QUEUE
-
   } else {
     // Serialization of external references in other objects is handled
     // elsewhere or not supported.
     DCHECK(
-        // Serialization of external pointers stored in EmbedderDataArray
-        // is not supported yet, mostly because it's not used.
-        InstanceTypeChecker::IsEmbedderDataArray(instance_type) ||
-        // See ObjectSerializer::SerializeJSTypedArray().
-        InstanceTypeChecker::IsJSTypedArray(instance_type) ||
-        // See ObjectSerializer::SerializeJSArrayBuffer().
-        InstanceTypeChecker::IsJSArrayBuffer(instance_type) ||
-        // See ObjectSerializer::SerializeExternalString().
-        InstanceTypeChecker::IsExternalString(instance_type) ||
         // Serialization of external pointers stored in
         // JSSynchronizationPrimitive is not supported.
         // TODO(v8:12547): JSSynchronizationPrimitives should also be sanitized
@@ -1340,13 +1309,13 @@ void Serializer::ObjectSerializer::VisitJSDispatchTableEntry(
     // Currently we cannot see pending objects here, but we may need to support
     // them in the future. They should already be supported by the deserializer.
     Handle<Code> code(jdt.GetCode(handle), isolate());
+    SBXCHECK(code->is_builtin());
     CHECK(!serializer_->SerializePendingObject(*code));
     serializer_->SerializeObject(code, SlotType::kAnySlot);
   } else {
     sink_->Put(kJSDispatchEntry, "JSDispatchEntry");
     sink_->PutUint30(it->second, "EntryID");
   }
-
 }
 namespace {
 
@@ -1414,13 +1383,31 @@ void Serializer::ObjectSerializer::OutputRawData(Address up_to) {
       OutputRawWithCustomField(sink_, object_start, base, bytes_to_output,
                                Code::kInstructionStartOffset,
                                sizeof(field_value), field_value);
+    } else if (IsJSTypedArray(*object_)) {
+      // The external_pointer field contains a raw value that will be
+      // recomputed after deserialization, so write zeros to keep the snapshot
+      // deterministic.
+      static uint8_t field_value[kSystemPointerSize] = {0};
+      OutputRawWithCustomField(sink_, object_start, base, bytes_to_output,
+                               offsetof(JSTypedArray, external_pointer_),
+                               sizeof(field_value), field_value);
+    } else if (IsJSArrayBuffer(*object_)) {
+      // The backing_store field contains a raw value that will be
+      // recomputed after deserialization, so write zeros to keep the snapshot
+      // deterministic.
+      static uint8_t field_value[kSystemPointerSize] = {0};
+      OutputRawWithCustomField(sink_, object_start, base, bytes_to_output,
+                               offsetof(JSArrayBuffer, backing_store_),
+                               sizeof(field_value), field_value);
     } else if (IsSeqString(*object_)) {
       // SeqStrings may contain padding. Serialize the padding bytes as 0s to
       // make the snapshot content deterministic.
       SeqString::DataAndPaddingSizes sizes =
           Cast<SeqString>(*object_)->GetDataAndPaddingSizes();
-      DCHECK_EQ(bytes_to_output, sizes.data_size - base + sizes.padding_size);
+      SBXCHECK_EQ(bytes_to_output, sizes.data_size - base + sizes.padding_size);
       int data_bytes_to_output = sizes.data_size - base;
+      SBXCHECK_GE(data_bytes_to_output, 0);
+      SBXCHECK_GE(sizes.padding_size, 0);
       sink_->PutRaw(reinterpret_cast<uint8_t*>(object_start + base),
                     data_bytes_to_output, "SeqStringData");
       sink_->PutN(sizes.padding_size, 0, "SeqStringPadding");

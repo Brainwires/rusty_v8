@@ -66,11 +66,10 @@ class ConsoleHelper {
   int contextId() const { return InspectedContext::contextId(context()); }
   int groupId() const { return m_inspector->contextGroupId(contextId()); }
 
-  InjectedScript* injectedScript(int sessionId) {
-    std::shared_ptr<InspectedContext> context =
-        m_inspector->getContext(groupId(), contextId());
-    if (!context) return nullptr;
-    return context->getInjectedScript(sessionId);
+  std::shared_ptr<InjectedScript> injectedScript(int sessionId) {
+    m_inspectedContext = m_inspector->getContext(groupId(), contextId());
+    if (!m_inspectedContext) return nullptr;
+    return m_inspectedContext->getInjectedScript(sessionId);
   }
 
   V8InspectorSessionImpl* session(int sessionId) {
@@ -210,6 +209,7 @@ class ConsoleHelper {
   const v8::debug::ConsoleCallArguments& m_info;
   const v8::debug::ConsoleContext& m_consoleContext;
   V8InspectorImpl* m_inspector;
+  std::shared_ptr<InspectedContext> m_inspectedContext;
 };
 
 void createBoundFunctionProperty(
@@ -389,7 +389,9 @@ void V8Console::Profile(const v8::debug::ConsoleCallArguments& info,
   String16 title =
       toProtocolString(m_inspector->isolate(), helper.firstArgToString());
   helper.forEachSession([&title](V8InspectorSessionImpl* session) {
-    session->profilerAgent()->consoleProfile(title);
+    if (session->profilerAgent()) {
+      session->profilerAgent()->consoleProfile(title);
+    }
   });
   TRACE_EVENT_END(TRACE_DISABLED_BY_DEFAULT("v8.inspector"), "title",
                   title.utf8().c_str());
@@ -403,7 +405,9 @@ void V8Console::ProfileEnd(const v8::debug::ConsoleCallArguments& info,
   String16 title =
       toProtocolString(m_inspector->isolate(), helper.firstArgToString());
   helper.forEachSession([&title](V8InspectorSessionImpl* session) {
-    session->profilerAgent()->consoleProfileEnd(title);
+    if (session->profilerAgent()) {
+      session->profilerAgent()->consoleProfileEnd(title);
+    }
   });
   TRACE_EVENT_END(TRACE_DISABLED_BY_DEFAULT("v8.inspector"), "title",
                   title.utf8().c_str());
@@ -557,8 +561,11 @@ v8::Local<v8::ObjectTemplate> V8Console::taskTemplate() {
   v8::Local<v8::FunctionTemplate> consTemplate =
       v8::FunctionTemplate::New(isolate);
   v8::Local<v8::ObjectTemplate> taskTemplate = consTemplate->InstanceTemplate();
+  v8::Local<v8::Signature> signature =
+      v8::Signature::New(isolate, consTemplate);
   v8::Local<v8::FunctionTemplate> funcTemplate =
-      v8::FunctionTemplate::New(isolate, &TaskInfo::runTask);
+      v8::FunctionTemplate::New(isolate, &TaskInfo::runTask,
+                                v8::Local<v8::Value>(), signature);
   taskTemplate->Set(isolate, "run", funcTemplate);
 
   m_taskTemplate.Reset(isolate, taskTemplate);
@@ -590,10 +597,6 @@ void TaskInfo::runTask(const v8::FunctionCallbackInfo<v8::Value>& info) {
   v8::Local<v8::Function> function = info[0].As<v8::Function>();
 
   v8::Local<v8::Object> task = info.This();
-  if (!task->IsApiWrapper()) {
-    isolate->ThrowError("'run' called with illegal receiver.");
-    return;
-  }
   TaskInfo* taskInfo =
       v8::Object::Unwrap<TaskInfo::kPointerTag, TaskInfo>(isolate, task);
   if (!taskInfo) {
@@ -761,7 +764,8 @@ void V8Console::lastEvaluationResultCallback(
     const v8::FunctionCallbackInfo<v8::Value>& info, int sessionId) {
   v8::debug::ConsoleCallArguments args(info);
   ConsoleHelper helper(args, v8::debug::ConsoleContext(), m_inspector);
-  InjectedScript* injectedScript = helper.injectedScript(sessionId);
+  std::shared_ptr<InjectedScript> injectedScript =
+      helper.injectedScript(sessionId);
   if (!injectedScript) return;
   info.GetReturnValue().Set(injectedScript->lastEvaluationResult());
 }
@@ -774,7 +778,8 @@ static void inspectImpl(const v8::FunctionCallbackInfo<v8::Value>& info,
 
   v8::debug::ConsoleCallArguments args(info);
   ConsoleHelper helper(args, v8::debug::ConsoleContext(), inspector);
-  InjectedScript* injectedScript = helper.injectedScript(sessionId);
+  std::shared_ptr<InjectedScript> injectedScript =
+      helper.injectedScript(sessionId);
   if (!injectedScript) return;
   std::unique_ptr<protocol::Runtime::RemoteObject> wrappedObject;
   protocol::Response response = injectedScript->wrapObject(
@@ -978,7 +983,7 @@ static bool isCommandLineAPIGetter(const String16& name) {
 void V8Console::CommandLineAPIScope::accessorGetterCallback(
     v8::Local<v8::Name> name, const v8::PropertyCallbackInfo<v8::Value>& info) {
   v8::Local<v8::Context> context = info.GetIsolate()->GetCurrentContext();
-  v8::Local<v8::Array> data = info.Data().As<v8::Array>();
+  v8::Local<v8::Array> data = info.DataV2().As<v8::Value>().As<v8::Array>();
   v8::Local<v8::Value> data0;
   if (!data->Get(context, kCommandLineAPIIndex).ToLocal(&data0) ||
       !data0->IsObject()) {
@@ -1008,7 +1013,7 @@ void V8Console::CommandLineAPIScope::accessorSetterCallback(
     v8::Local<v8::Name> name, v8::Local<v8::Value> value,
     const v8::PropertyCallbackInfo<v8::Boolean>& info) {
   v8::Local<v8::Context> context = info.GetIsolate()->GetCurrentContext();
-  v8::Local<v8::Array> data = info.Data().As<v8::Array>();
+  v8::Local<v8::Array> data = info.DataV2().As<v8::Value>().As<v8::Array>();
   v8::Local<v8::Value> data0;
   if (!data->Get(context, kCommandLineAPIIndex).ToLocal(&data0) ||
       !data0->IsObject()) {
@@ -1042,9 +1047,27 @@ DEFINE_LAZY_LEAKY_OBJECT_GETTER(std::set<std::string_view>,
                                     "debug", "undebug", "monitor", "unmonitor",
                                     "inspect", "copy", "queryObjects"})
 
-bool IsUnsafeCommandLineAPIFn(v8::Local<v8::Value> name, v8::Isolate* isolate) {
+bool IsUnsafeCommandLineAPIFn(v8::Local<v8::Context> context,
+                              v8::Local<v8::Object> commandLineAPI,
+                              v8::Local<v8::Name> name, v8::Isolate* isolate) {
   std::string nameStr = toProtocolStringWithTypeCheck(isolate, name).utf8();
-  return UnsafeCommandLineAPIFns()->count(nameStr) > 0;
+  if (UnsafeCommandLineAPIFns()->count(nameStr) > 0) return true;
+
+  v8::Local<v8::Value> descriptor_val;
+  if (!commandLineAPI->GetOwnPropertyDescriptor(context, name)
+           .ToLocal(&descriptor_val) ||
+      !descriptor_val->IsObject()) {
+    return false;
+  }
+  v8::Local<v8::Object> descriptor = descriptor_val.As<v8::Object>();
+  v8::Local<v8::Value> value;
+  if (!descriptor
+           ->Get(context, v8::String::NewFromUtf8Literal(isolate, "value"))
+           .ToLocal(&value)) {
+    return false;
+  }
+
+  return v8::debug::IsAPIFunctionWithSideEffects(value);
 }
 
 }  // namespace
@@ -1070,7 +1093,8 @@ V8Console::CommandLineAPIScope::CommandLineAPIScope(
     if (global->Has(context, name).FromMaybe(true)) continue;
 
     const v8::SideEffectType get_accessor_side_effect_type =
-        IsUnsafeCommandLineAPIFn(name, isolate())
+        IsUnsafeCommandLineAPIFn(context, commandLineAPI, name.As<v8::Name>(),
+                                 isolate())
             ? v8::SideEffectType::kHasSideEffect
             : v8::SideEffectType::kHasNoSideEffect;
     if (!global

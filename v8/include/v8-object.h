@@ -202,9 +202,10 @@ using AccessorNameSetterCallbackV2 =
     void (*)(Local<Name> property, Local<Value> value,
              const PropertyCallbackInfo<Boolean>& info);
 // TODO(https://crbug.com/348660658): deprecate and remove.
-using AccessorNameSetterCallback =
-    void (*)(Local<Name> property, Local<Value> value,
-             const PropertyCallbackInfo<void>& info);
+using AccessorNameSetterCallback  //
+    V8_DEPRECATE_SOON("Use AccessorNameSetterCallbackV2 instead.") =
+        void (*)(Local<Name> property, Local<Value> value,
+                 const PropertyCallbackInfo<void>& info);
 
 /**
  * Property filter bits. They can be or'ed to build a composite filter.
@@ -406,30 +407,11 @@ class V8_EXPORT Object : public Value {
    */
   V8_WARN_UNUSED_RESULT Maybe<bool> SetNativeDataProperty(
       Local<Context> context, Local<Name> name,
-      AccessorNameGetterCallback getter, AccessorNameSetterCallbackV2 setter,
+      AccessorNameGetterCallback getter,
+      AccessorNameSetterCallbackV2 setter = nullptr,
       Local<Value> data = Local<Value>(), PropertyAttribute attributes = None,
       SideEffectType getter_side_effect_type = SideEffectType::kHasSideEffect,
       SideEffectType setter_side_effect_type = SideEffectType::kHasSideEffect);
-  V8_DEPRECATED("Use AccessorNameSetterCallbackV2 setter instead")
-  V8_WARN_UNUSED_RESULT Maybe<bool> SetNativeDataProperty(
-      Local<Context> context, Local<Name> name,
-      AccessorNameGetterCallback getter, AccessorNameSetterCallback setter,
-      Local<Value> data = Local<Value>(), PropertyAttribute attributes = None,
-      SideEffectType getter_side_effect_type = SideEffectType::kHasSideEffect,
-      SideEffectType setter_side_effect_type = SideEffectType::kHasSideEffect);
-  // TODO(https://crbug.com/348660658): remove once AccessorNameSetterCallback
-  // is removed.
-  V8_WARN_UNUSED_RESULT Maybe<bool> SetNativeDataProperty(
-      Local<Context> context, Local<Name> name,
-      AccessorNameGetterCallback getter, std::nullptr_t setter = nullptr,
-      Local<Value> data = Local<Value>(), PropertyAttribute attributes = None,
-      SideEffectType getter_side_effect_type = SideEffectType::kHasSideEffect,
-      SideEffectType setter_side_effect_type = SideEffectType::kHasSideEffect) {
-    return SetNativeDataProperty(
-        context, name, getter,
-        static_cast<AccessorNameSetterCallbackV2>(setter), data, attributes,
-        getter_side_effect_type, setter_side_effect_type);
-  }
 
   /**
    * Attempts to create a property with the given name which behaves like a data
@@ -494,9 +476,6 @@ class V8_EXPORT Object : public Value {
    * This does not consult the security handler.
    */
   Local<Value> GetPrototype();
-  // TODO(http://crbug.com/333672197): deprecate and remove.
-  V8_DEPRECATED("Use GetPrototype().")
-  inline Local<Value> GetPrototypeV2() { return GetPrototype(); }
 
   /**
    * Set the prototype object (same as calling Object.setPrototypeOf(..)).
@@ -504,12 +483,6 @@ class V8_EXPORT Object : public Value {
    */
   V8_WARN_UNUSED_RESULT Maybe<bool> SetPrototype(Local<Context> context,
                                                  Local<Value> prototype);
-  // TODO(http://crbug.com/333672197): deprecate and remove.
-  V8_DEPRECATED("Use SetPrototype().")
-  V8_WARN_UNUSED_RESULT Maybe<bool> SetPrototypeV2(Local<Context> context,
-                                                   Local<Value> prototype) {
-    return SetPrototype(context, prototype);
-  }
 
   /**
    * Finds an instance of the given function template in the prototype
@@ -837,6 +810,8 @@ class V8_EXPORT Object : public Value {
   void* GetAlignedPointerFromEmbedderDataInCreationContext(
       int index, EmbedderDataTypeTag tag);
 
+  void* GetAlignedPointerFromEmbedderDataInCreationContext(
+      v8::Isolate* isolate, int index, CppHeapPointerTag tag);
   /**
    * Checks whether a callback is set by the
    * ObjectTemplate::SetCallAsFunctionHandler method.
@@ -951,11 +926,15 @@ Local<Data> Object::GetInternalField(int index) {
   if (I::CanHaveInternalField(instance_type)) {
     int offset = I::kJSAPIObjectWithEmbedderSlotsHeaderSize +
                  (I::kEmbedderDataSlotSize * index);
-    A value = I::ReadRawField<A>(obj, offset);
 #ifdef V8_COMPRESS_POINTERS
-    // We read the full pointer value and then decompress it in order to avoid
-    // dealing with potential endianness issues.
-    value = I::DecompressTaggedField(obj, static_cast<uint32_t>(value));
+    // The tagged payload lives in the low kTaggedSize half of the slot (at
+    // kTaggedPayloadOffset == 0). Read it as a 32-bit field so the correct half
+    // is picked on both little and big endian targets. A full width read plus
+    // truncation would return the CppHeap pointer half on big endian.
+    uint32_t compressed = I::ReadRawField<uint32_t>(obj, offset);
+    A value = I::DecompressTaggedField(obj, compressed);
+#else
+    A value = I::ReadRawField<A>(obj, offset);
 #endif
 
     auto* isolate = I::GetCurrentIsolate();
@@ -968,44 +947,11 @@ Local<Data> Object::GetInternalField(int index) {
 void* Object::GetAlignedPointerFromInternalField(v8::Isolate* isolate,
                                                  int index,
                                                  EmbedderDataTypeTag tag) {
-#if !defined(V8_ENABLE_CHECKS)
-  using A = internal::Address;
-  using I = internal::Internals;
-  A obj = internal::ValueHelper::ValueAsAddress(this);
-  // Fast path: If the object is a plain JSObject, which is the common case, we
-  // know where to find the internal fields and can return the value directly.
-  auto instance_type = I::GetInstanceType(obj);
-  if (V8_LIKELY(I::CanHaveInternalField(instance_type))) {
-    int offset = I::kJSAPIObjectWithEmbedderSlotsHeaderSize +
-                 (I::kEmbedderDataSlotSize * index) +
-                 I::kEmbedderDataSlotExternalPointerOffset;
-    A value = I::ReadExternalPointerField(isolate, obj, offset,
-                                          ToExternalPointerTag(tag));
-    return reinterpret_cast<void*>(value);
-  }
-#endif
   return SlowGetAlignedPointerFromInternalField(isolate, index, tag);
 }
 
 void* Object::GetAlignedPointerFromInternalField(int index,
                                                  EmbedderDataTypeTag tag) {
-#if !defined(V8_ENABLE_CHECKS)
-  using A = internal::Address;
-  using I = internal::Internals;
-  A obj = internal::ValueHelper::ValueAsAddress(this);
-  // Fast path: If the object is a plain JSObject, which is the common case, we
-  // know where to find the internal fields and can return the value directly.
-  auto instance_type = I::GetInstanceType(obj);
-  if (V8_LIKELY(I::CanHaveInternalField(instance_type))) {
-    int offset = I::kJSAPIObjectWithEmbedderSlotsHeaderSize +
-                 (I::kEmbedderDataSlotSize * index) +
-                 I::kEmbedderDataSlotExternalPointerOffset;
-    Isolate* isolate = I::GetCurrentIsolateForSandbox();
-    A value = I::ReadExternalPointerField(isolate, obj, offset,
-                                          ToExternalPointerTag(tag));
-    return reinterpret_cast<void*>(value);
-  }
-#endif
   return SlowGetAlignedPointerFromInternalField(index, tag);
 }
 

@@ -6,11 +6,13 @@
 #ifndef PARTITION_ALLOC_PARTITION_PAGE_H_
 #define PARTITION_ALLOC_PARTITION_PAGE_H_
 
+#include <bit>
 #include <cstddef>
 #include <cstdint>
 
 #include "partition_alloc/build_config.h"
 #include "partition_alloc/buildflags.h"
+#include "partition_alloc/internal/partition_root_internal_forward.h"
 #include "partition_alloc/partition_freelist_entry.h"
 #include "partition_alloc/partition_page_constants.h"
 #include "partition_alloc/partition_superpage_extent_entry.h"
@@ -82,9 +84,8 @@ struct SlotSpanMetadata {
   uint16_t in_empty_cache_ : 1;
   // Index of the page in the empty cache. This is in the range
   // [0, `kMaxEmptySlotSpanRingSize - 1`] so it fits in
-  // `BitWidth(kMaxEmptySlotSpanRingSize - 1)`.
-  uint16_t empty_cache_index_
-      : internal::base::bits::BitWidth(kMaxEmptySlotSpanRingSize - 1);
+  // `std::bit_width(kMaxEmptySlotSpanRingSize - 1)`.
+  uint16_t empty_cache_index_ : std::bit_width(kMaxEmptySlotSpanRingSize - 1);
   // Can use only 48 bits (6B) in this bitfield, as this structure is embedded
   // in PartitionPage which has 2B worth of fields and must fit in 32B.
 

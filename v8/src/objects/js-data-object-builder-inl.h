@@ -17,6 +17,7 @@
 #include "src/objects/heap-object-set-map-inl.h"
 #include "src/objects/js-objects-inl.h"
 #include "src/objects/map-updater.h"
+#include "src/objects/object-conversions-inl.h"
 #include "src/objects/objects-inl.h"
 #include "src/objects/transitions-inl.h"
 
@@ -417,7 +418,12 @@ bool JSDataObjectBuilder::TryFastTransitionToPropertyKey(
                        descriptor_index)),
                isolate_);
     target_map = expected_final_map_;
-  } else {
+  } else if (key_chars.data() != nullptr) {
+    // The byte-compare transition fast path is only valid when `key_chars`
+    // faithfully represent the decoded key. Callers that cannot provide valid
+    // chars (the JSON parser passes an empty vector for escaped keys, whose raw
+    // source bytes differ from the decoded key) fall through to the
+    // decode-then-FindTransitionToField path below.
     TransitionsAccessor transitions(isolate_, *map_);
     auto expected_transition = transitions.ExpectedTransition(key_chars);
     if (!expected_transition.first.is_null()) {

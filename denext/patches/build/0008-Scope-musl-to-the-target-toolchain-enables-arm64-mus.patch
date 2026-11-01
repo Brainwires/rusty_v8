@@ -1,0 +1,63 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Bartek=20Iwa=C5=84czuk?= <biwanczuk@gmail.com>
+Date: Wed, 15 Jul 2026 20:30:53 +0200
+Subject: [PATCH 8/8] Scope musl to the target toolchain (enables arm64 musl
+ cross builds) (#206)
+
+Tighten the use_musl guards from !toolchain_for_rust_host_build_tools to
+current_toolchain == default_toolchain, so musl applies only to the target
+toolchain. For cross builds (e.g. x64 host -> arm64 target) this keeps the x64
+host and snapshot toolchains (clang_x64_v8_arm64) on glibc automatically,
+without needing per-arch glibc toolchain variants. x86_64 musl is unchanged
+(its host is already the non-default clang_x64_glibc).
+---
+ config/c++/BUILD.gn | 2 +-
+ config/rust.gni     | 7 ++++---
+ config/sysroot.gni  | 2 +-
+ 3 files changed, 6 insertions(+), 5 deletions(-)
+
+diff --git a/config/c++/BUILD.gn b/config/c++/BUILD.gn
+index 61025db..436f71f 100644
+--- a/config/c++/BUILD.gn
++++ b/config/c++/BUILD.gn
+@@ -23,7 +23,7 @@ config("runtime_library") {
+   # V8's bundled libc++ gates its ctype rune table on __GLIBC__, which
+   # musl doesn't define; use libc++'s portable default rune table and
+   # flag musl for the remaining locale differences. Target only.
+-  if (use_musl && !toolchain_for_rust_host_build_tools) {
++  if (use_musl && current_toolchain == default_toolchain) {
+     defines += [
+       "_LIBCPP_PROVIDES_DEFAULT_RUNE_TABLE",
+       "_LIBCPP_HAS_MUSL_LIBC",
+diff --git a/config/rust.gni b/config/rust.gni
+index 84c774b..8ba36c2 100644
+--- a/config/rust.gni
++++ b/config/rust.gni
+@@ -346,10 +346,11 @@ if (is_linux || is_chromeos) {
+ 
+ # When targeting musl, rewrite the gnu triple to its musl counterpart
+ # (x86_64-unknown-linux-gnu -> x86_64-unknown-linux-musl, etc.) so V8's
+-# internal Rust crates + libstd are built for musl. The host build-tools
+-# toolchain must stay glibc, so exclude it.
++# internal Rust crates + libstd are built for musl. Only the default (target)
++# toolchain is musl; host and snapshot toolchains (which build executable build
++# tools that run on the glibc build host) stay glibc.
+ if (use_musl && rust_abi_target != "" &&
+-    !toolchain_for_rust_host_build_tools) {
++    current_toolchain == default_toolchain) {
+   rust_abi_target = string_replace(rust_abi_target, "-gnu", "-musl")
+ }
+ 
+diff --git a/config/sysroot.gni b/config/sysroot.gni
+index cbbd3da..b8d97a9 100644
+--- a/config/sysroot.gni
++++ b/config/sysroot.gni
+@@ -24,7 +24,7 @@ declare_args() {
+ if (sysroot == "") {
+   if (current_os == target_os && current_cpu == target_cpu &&
+       target_sysroot != "" && use_musl &&
+-      !toolchain_for_rust_host_build_tools) {
++      current_toolchain == default_toolchain) {
+     sysroot = target_sysroot
+   } else if (is_android) {
+     import("//build/config/android/config.gni")

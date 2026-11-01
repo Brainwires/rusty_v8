@@ -188,7 +188,7 @@ static void VisitSimdShift(InstructionSelector* selector, ArchOpcode opcode,
                            OpIndex node) {
   RiscvOperandGenerator g(selector);
   const Operation& op = selector->Get(node);
-  OpIndex rhs = op.input(0);
+  OpIndex rhs = op.input(1);
   if (selector->Get(rhs).TryCast<ConstantOp>()) {
     selector->Emit(opcode, g.DefineAsRegister(node), g.UseRegister(op.input(0)),
                    g.UseImmediate(op.input(1)));
@@ -348,84 +348,84 @@ void InstructionSelector::VisitLoadTransform(OpIndex node) {
     case Simd128LoadTransformOp::TransformKind::k8Splat:
       opcode = kRiscvS128LoadSplat | EncodeElementWidth(E8);
       if (is_trapping) {
-        opcode |= AccessModeField::encode(kMemoryAccessTrappingMemOutOfBounds);
+        opcode |= AccessModeField::encode(kMemoryAccessTrapping);
       }
       EmitS128Load(this, node, opcode);
       break;
     case Simd128LoadTransformOp::TransformKind::k16Splat:
       opcode = kRiscvS128LoadSplat | EncodeElementWidth(E16);
       if (is_trapping) {
-        opcode |= AccessModeField::encode(kMemoryAccessTrappingMemOutOfBounds);
+        opcode |= AccessModeField::encode(kMemoryAccessTrapping);
       }
       EmitS128Load(this, node, opcode);
       break;
     case Simd128LoadTransformOp::TransformKind::k32Splat:
       opcode = kRiscvS128LoadSplat | EncodeElementWidth(E32);
       if (is_trapping) {
-        opcode |= AccessModeField::encode(kMemoryAccessTrappingMemOutOfBounds);
+        opcode |= AccessModeField::encode(kMemoryAccessTrapping);
       }
       EmitS128Load(this, node, opcode);
       break;
     case Simd128LoadTransformOp::TransformKind::k64Splat:
       opcode = kRiscvS128LoadSplat | EncodeElementWidth(E64);
       if (is_trapping) {
-        opcode |= AccessModeField::encode(kMemoryAccessTrappingMemOutOfBounds);
+        opcode |= AccessModeField::encode(kMemoryAccessTrapping);
       }
       EmitS128Load(this, node, opcode);
       break;
     case Simd128LoadTransformOp::TransformKind::k8x8S:
       opcode = kRiscvS128Load64ExtendS | EncodeElementWidth(E16);
       if (is_trapping) {
-        opcode |= AccessModeField::encode(kMemoryAccessTrappingMemOutOfBounds);
+        opcode |= AccessModeField::encode(kMemoryAccessTrapping);
       }
       EmitS128Load(this, node, opcode);
       break;
     case Simd128LoadTransformOp::TransformKind::k8x8U:
       opcode = kRiscvS128Load64ExtendU | EncodeElementWidth(E16);
       if (is_trapping) {
-        opcode |= AccessModeField::encode(kMemoryAccessTrappingMemOutOfBounds);
+        opcode |= AccessModeField::encode(kMemoryAccessTrapping);
       }
       EmitS128Load(this, node, opcode);
       break;
     case Simd128LoadTransformOp::TransformKind::k16x4S:
       opcode = kRiscvS128Load64ExtendS | EncodeElementWidth(E32);
       if (is_trapping) {
-        opcode |= AccessModeField::encode(kMemoryAccessTrappingMemOutOfBounds);
+        opcode |= AccessModeField::encode(kMemoryAccessTrapping);
       }
       EmitS128Load(this, node, opcode);
       break;
     case Simd128LoadTransformOp::TransformKind::k16x4U:
       opcode = kRiscvS128Load64ExtendU | EncodeElementWidth(E32);
       if (is_trapping) {
-        opcode |= AccessModeField::encode(kMemoryAccessTrappingMemOutOfBounds);
+        opcode |= AccessModeField::encode(kMemoryAccessTrapping);
       }
       EmitS128Load(this, node, opcode);
       break;
     case Simd128LoadTransformOp::TransformKind::k32x2S:
       opcode = kRiscvS128Load64ExtendS | EncodeElementWidth(E64);
       if (is_trapping) {
-        opcode |= AccessModeField::encode(kMemoryAccessTrappingMemOutOfBounds);
+        opcode |= AccessModeField::encode(kMemoryAccessTrapping);
       }
       EmitS128Load(this, node, opcode);
       break;
     case Simd128LoadTransformOp::TransformKind::k32x2U:
       opcode = kRiscvS128Load64ExtendU | EncodeElementWidth(E64);
       if (is_trapping) {
-        opcode |= AccessModeField::encode(kMemoryAccessTrappingMemOutOfBounds);
+        opcode |= AccessModeField::encode(kMemoryAccessTrapping);
       }
       EmitS128Load(this, node, opcode);
       break;
     case Simd128LoadTransformOp::TransformKind::k32Zero:
       opcode = kRiscvS128Load32Zero;
       if (is_trapping) {
-        opcode |= AccessModeField::encode(kMemoryAccessTrappingMemOutOfBounds);
+        opcode |= AccessModeField::encode(kMemoryAccessTrapping);
       }
       EmitS128Load(this, node, opcode);
       break;
     case Simd128LoadTransformOp::TransformKind::k64Zero:
       opcode = kRiscvS128Load64Zero;
       if (is_trapping) {
-        opcode |= AccessModeField::encode(kMemoryAccessTrappingMemOutOfBounds);
+        opcode |= AccessModeField::encode(kMemoryAccessTrapping);
       }
       EmitS128Load(this, node, opcode);
       break;
@@ -447,8 +447,11 @@ static Instruction* VisitCompare(InstructionSelector* selector,
   inputs[input_count++] = left;
   inputs[input_count++] = right;
   if (cont->IsSelect()) {
-    inputs[input_count++] = g.UseRegisterOrImmediateZero(cont->true_value());
-    inputs[input_count++] = g.UseRegisterOrImmediateZero(cont->false_value());
+    // Keep the values live until the end so that we can use operations that
+    // write registers to generate the condition, without accidentally
+    // overwriting the inputs.
+    inputs[input_count++] = g.UseRegisterAtEnd(cont->true_value());
+    inputs[input_count++] = g.UseRegisterAtEnd(cont->false_value());
   }
 #ifdef V8_COMPRESS_POINTERS
   if (opcode == kRiscvCmp32) {
@@ -605,8 +608,8 @@ void EmitWordCompareZero(InstructionSelector* selector, OpIndex value,
   InstructionOperand inputs[4];
   inputs[input_count++] = g.UseRegisterOrImmediateZero(value);
   if (cont->IsSelect()) {
-    inputs[input_count++] = g.UseRegisterOrImmediateZero(cont->true_value());
-    inputs[input_count++] = g.UseRegisterOrImmediateZero(cont->false_value());
+    inputs[input_count++] = g.UseRegisterAtEnd(cont->true_value());
+    inputs[input_count++] = g.UseRegisterAtEnd(cont->false_value());
   }
   selector->EmitWithContinuation(kRiscvCmpZero, 0, nullptr, input_count, inputs,
                                  cont);
@@ -622,8 +625,8 @@ void EmitWord32CompareZero(InstructionSelector* selector, OpIndex value,
   inputs[input_count++] = g.UseRegisterOrImmediateZero(value);
   InstructionOperand temps[] = {g.TempRegister()};
   if (cont->IsSelect()) {
-    inputs[input_count++] = g.UseRegisterOrImmediateZero(cont->true_value());
-    inputs[input_count++] = g.UseRegisterOrImmediateZero(cont->false_value());
+    inputs[input_count++] = g.UseRegisterAtEnd(cont->true_value());
+    inputs[input_count++] = g.UseRegisterAtEnd(cont->false_value());
   }
   selector->EmitWithContinuation(kRiscvCmpZero32, 0, nullptr, input_count,
                                  inputs, arraysize(temps), temps, cont);
@@ -1178,7 +1181,7 @@ void InstructionSelector::VisitS128Const(OpIndex node) {
   uint32_t val[kUint32Immediates];
   const turboshaft::Simd128ConstantOp& constant =
       this->Get(node).template Cast<turboshaft::Simd128ConstantOp>();
-  memcpy(val, constant.value, kSimd128Size);
+  memcpy(val, constant.value.data(), kSimd128Size);
   // If all bytes are zeros or ones, avoid emitting code for generic constants
   bool all_zeros = !(val[0] || val[1] || val[2] || val[3]);
   bool all_ones = val[0] == UINT32_MAX && val[1] == UINT32_MAX &&

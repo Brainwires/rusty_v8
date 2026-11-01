@@ -212,6 +212,14 @@ void AccessorAssembler::TryHomomorphicCase(TNode<Object> lookup_start_object,
     CSA_DCHECK(this,
                Word32BitwiseNot(IsDictionaryMap(lookup_start_object_map)));
 
+    // Reject special receivers. Access checks and named interceptors imply
+    // special receiver.
+    GotoIf(IsSpecialReceiverMap(lookup_start_object_map), miss);
+    CSA_DCHECK(this, Word32BinaryNot(IsSetWord32(
+                         LoadMapBitField(lookup_start_object_map),
+                         Map::Bits1::HasNamedInterceptorBit::kMask |
+                             Map::Bits1::IsAccessCheckNeededBit::kMask)));
+
     // Load the descriptor at the index and verify that the key matches the
     // loaded name.
     TNode<DescriptorArray> descriptors =
@@ -1145,7 +1153,7 @@ void AccessorAssembler::HandleLoadICSmiHandlerLoadNamedCase(
     // The handler is only installed for exports that exist.
     TNode<Object> value = LoadCellValue(cell);
     Label is_the_hole(this, Label::kDeferred);
-    GotoIf(IsTheHole(value), &is_the_hole);
+    GotoIf(IsTdzHole(value), &is_the_hole);
     exit_point->Return(value);
 
     BIND(&is_the_hole);
@@ -3929,7 +3937,7 @@ void AccessorAssembler::ScriptContextTableLookup(
     TNode<IntPtrT> var_index = IntPtrAdd(
         IntPtrConstant(Context::MIN_CONTEXT_SLOTS), context_local_index);
     TNode<Object> result = LoadContextElement(script_context, var_index);
-    GotoIf(IsTheHole(result), found_hole);
+    GotoIf(IsTdzHole(result), found_hole);
     Return(result);
   }
 }

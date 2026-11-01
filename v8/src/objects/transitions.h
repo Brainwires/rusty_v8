@@ -185,8 +185,13 @@ class V8_EXPORT_PRIVATE TransitionsAccessor {
   static bool PutPrototypeTransition(Isolate* isolate, DirectHandle<Map>,
                                      DirectHandle<Object> prototype,
                                      DirectHandle<Map> target_map);
-  static std::optional<Tagged<Map>> GetPrototypeTransition(
+
+  std::optional<Tagged<Map>> GetPrototypeTransition(Tagged<Object> prototype);
+  // Convenient helper for calling from the main thread, for other cases
+  // use the instance method above.
+  static inline std::optional<Tagged<Map>> GetPrototypeTransition(
       Isolate* isolate, Tagged<Map> map, Tagged<Object> prototype);
+
   bool HasPrototypeTransitions();
 
   // During the first-time Map::Update and Map::TryUpdate, the migration target
@@ -267,8 +272,7 @@ class V8_EXPORT_PRIVATE TransitionsAccessor {
   static void SetPrototypeTransitions(
       Isolate* isolate, DirectHandle<Map> map,
       DirectHandle<WeakFixedArray> proto_transitions);
-  static Tagged<WeakFixedArray> GetPrototypeTransitions(Isolate* isolate,
-                                                        Tagged<Map> map);
+  Tagged<WeakFixedArray> GetPrototypeTransitions();
 
   static void InsertHelper(Isolate* isolate, DirectHandle<Map> map,
                            DirectHandle<Name> name, DirectHandle<Map> target,
@@ -312,6 +316,8 @@ class V8_EXPORT_PRIVATE TransitionsAccessor {
 // TODO(olivf): The slots for prototype transitions and side-steps could be
 // shared.
 V8_OBJECT class TransitionArray : public WeakFixedArray {
+  V8_IT_NO_AUTO_DISPATCH;
+
  public:
   // Do linear search for small arrays, and for searches in the background
   // thread.

@@ -62,7 +62,7 @@ MergePointInterpreterFrameState* MergePointInterpreterFrameState::New(
     const MaglevCompilationUnit& info, const InterpreterFrameState& state,
     int merge_offset, int predecessor_count, BasicBlock* predecessor,
     const compiler::BytecodeLivenessState* liveness,
-    compiler::OptionalScopeInfoRef context_scope_info) {
+    ContextScopeInfo context_scope_info) {
   MergePointInterpreterFrameState* merge_state =
       info.zone()->New<MergePointInterpreterFrameState>(
           info, merge_offset, predecessor_count, 1,
@@ -91,7 +91,7 @@ MergePointInterpreterFrameState* MergePointInterpreterFrameState::New(
 }
 
 void MergePointInterpreterFrameState::set_context_scope_info(
-    compiler::OptionalScopeInfoRef scope_info) {
+    ContextScopeInfo scope_info) {
   if (v8_flags.trace_maglev_scope_info) {
     if (scope_info.has_value()) {
       std::cout << "  [ScopeInfo] set_context_scope_info: "
@@ -112,20 +112,19 @@ void MergePointInterpreterFrameState::set_is_resumable_loop(Graph* graph) {
 }
 
 // static
-MergePointInterpreterFrameState* MergePointInterpreterFrameState::NewForLoop(
-    const InterpreterFrameState& start_state, const MaglevCompilationUnit& info,
-    bool is_inline, Graph* graph, int merge_offset, int predecessor_count,
+LoopMergePointInterpreterFrameState*
+MergePointInterpreterFrameState::NewForLoop(
+    const MaglevCompilationUnit& info, bool is_inline, Graph* graph,
+    int merge_offset, int predecessor_count,
     const compiler::BytecodeLivenessState* liveness,
     const compiler::LoopInfo* loop_info, bool has_been_peeled) {
-  MergePointInterpreterFrameState* state =
-      info.zone()->New<MergePointInterpreterFrameState>(
+  LoopMergePointInterpreterFrameState* state =
+      info.zone()->New<LoopMergePointInterpreterFrameState>(
           info, merge_offset, predecessor_count, 0,
-          info.zone()->AllocateArray<BasicBlock*>(predecessor_count),
-          BasicBlockType::kLoopHeader, liveness, std::nullopt);
+          info.zone()->AllocateArray<BasicBlock*>(predecessor_count), liveness);
 
   state->bitfield_ =
       kIsLoopWithPeeledIterationBit::update(state->bitfield_, has_been_peeled);
-  state->loop_metadata_ = LoopMetadata{loop_info, nullptr};
   if (loop_info->resumable() && !is_inline && !graph->is_osr()) {
     // Note that inlined and OSR'd loops are never resumable:
     //
@@ -156,8 +155,10 @@ MergePointInterpreterFrameState* MergePointInterpreterFrameState::NewForLoop(
         if (assignments.ContainsParameter(reg.ToParameterIndex())) {
           entry = state->NewLoopPhi(info.zone(), reg);
         } else if (state->is_resumable_loop()) {
-          // Copy initial values out of the start state.
-          entry = start_state.get(reg);
+          // Copy initial values out of the graph parameters. Resumable loops
+          // are never inlined, so those are the function's own parameters.
+          DCHECK(!is_inline);
+          entry = graph->parameters()[reg.ToParameterIndex()];
           // Initialise the alternatives list for this value.
           new (&state->per_predecessor_alternatives_[i]) Alternatives::List();
           DCHECK(entry->Is<InitialValue>());
@@ -212,7 +213,7 @@ MergePointInterpreterFrameState::NewForCatchBlock(
     const MaglevCompilationUnit& unit,
     const compiler::BytecodeLivenessState* liveness, int handler_offset,
     bool was_used, interpreter::Register context_register, Graph* graph,
-    compiler::OptionalScopeInfoRef context_scope_info) {
+    ContextScopeInfo context_scope_info) {
   Zone* const zone = unit.zone();
   MergePointInterpreterFrameState* state =
       zone->New<MergePointInterpreterFrameState>(
@@ -241,18 +242,19 @@ MergePointInterpreterFrameState::MergePointInterpreterFrameState(
     const MaglevCompilationUnit& info, int merge_offset, int predecessor_count,
     int predecessors_so_far, BasicBlock** predecessors, BasicBlockType type,
     const compiler::BytecodeLivenessState* liveness,
-    compiler::OptionalScopeInfoRef context_scope_info)
-    : merge_offset_(merge_offset),
-      unit_(&info),
+    ContextScopeInfo context_scope_info)
+    : unit_(&info),
       predecessor_count_(predecessor_count),
       predecessors_so_far_(predecessors_so_far),
       bitfield_(kBasicBlockTypeBits::encode(type) |
                 kIsInline::encode(info.is_inline())),
+      merge_offset_(merge_offset),
       predecessors_(predecessors),
       frame_state_(info, liveness),
       context_scope_info_(context_scope_info),
       per_predecessor_alternatives_(
-          type == BasicBlockType::kExceptionHandlerStart
+          type == BasicBlockType::kExceptionHandlerStart ||
+                  type == BasicBlockType::kUnusedExceptionHandlerStart
               ? nullptr
               : info.zone()->AllocateArray<Alternatives::List>(
                     frame_state_.size(info))) {}
@@ -429,8 +431,8 @@ void MergePointInterpreterFrameState::MergeVirtualObjects(
 void MergePointInterpreterFrameState::InitializeLoop(
     Graph* graph, bool is_tracing, MaglevCompilationUnit& compilation_unit,
     InterpreterFrameState& unmerged, BasicBlock* predecessor,
-    compiler::OptionalScopeInfoRef context_scope_info,
-    bool optimistic_initial_state, LoopEffects* loop_effects) {
+    ContextScopeInfo context_scope_info, bool optimistic_initial_state,
+    LoopEffects* loop_effects) {
   DCHECK(is_unmerged_loop());
   context_scope_info_ = context_scope_info;
   DCHECK_IMPLIES(optimistic_initial_state,
@@ -444,6 +446,7 @@ void MergePointInterpreterFrameState::InitializeLoop(
   DCHECK_EQ(predecessors_so_far_, 0);
   known_node_aspects_ = unmerged.known_node_aspects()->CloneForLoopHeader(
       optimistic_initial_state, loop_effects, graph->zone());
+  AsLoopHeader()->InitializeLoopEffectEpoch(*known_node_aspects_);
   unmerged.virtual_objects().Snapshot();
   const MaglevCompilationInfo* info = compilation_unit.info();
   TRACE(TraceColor::kInfo << "Initializing "
@@ -465,7 +468,7 @@ void MergePointInterpreterFrameState::InitializeWithBasicBlock(
 void MergePointInterpreterFrameState::Merge(
     Graph* graph, bool is_tracing, MaglevCompilationUnit& compilation_unit,
     InterpreterFrameState& unmerged, BasicBlock* predecessor,
-    compiler::OptionalScopeInfoRef context_scope_info) {
+    ContextScopeInfo context_scope_info) {
   DCHECK_GT(predecessor_count_, 1);
   DCHECK_LT(predecessors_so_far_, predecessor_count_);
 
@@ -495,7 +498,7 @@ void MergePointInterpreterFrameState::Merge(
   DCHECK_LE(predecessors_so_far_, predecessor_count_);
 }
 
-void MergePointInterpreterFrameState::MergeLoop(
+void LoopMergePointInterpreterFrameState::MergeLoop(
     Graph* graph, bool is_tracing, MaglevCompilationUnit& compilation_unit,
     InterpreterFrameState& loop_end_state, BasicBlock* loop_end_block,
     DeoptFrame* backedge_deopt_frame) {
@@ -523,25 +526,9 @@ void MergePointInterpreterFrameState::MergeLoop(
   });
   predecessors_so_far_++;
   DCHECK_EQ(predecessors_so_far_, predecessor_count_);
-
-  // We have to clear the LoopInfo (which is used to record more precise use
-  // hints for Phis) for 2 reasons:
-  //
-  //  - Phi::RecordUseReprHint checks if a use is inside the loop defining the
-  //    Phi by checking if the LoopInfo of the loop Phi "Contains" the current
-  //    bytecode offset, but this will be wrong if the Phi is in a function that
-  //    was inlined (because the LoopInfo contains the first and last bytecode
-  //    offset of the loop **in its own function**).
-  //
-  //  - LoopInfo is obtained from the {header_to_info_} member of
-  //    BytecodeAnalysis, but the BytecodeAnalysis is a member of the
-  //    MaglevGraphBuilder, and thus gets destructed when the MaglevGraphBuilder
-  //    created for inlining is destructed. LoopInfo would then become a stale
-  //    pointer.
-  ClearLoopInfo();
 }
 
-bool MergePointInterpreterFrameState::TryMergeLoop(
+bool LoopMergePointInterpreterFrameState::TryMergeLoop(
     compiler::JSHeapBroker* broker, Graph* graph, bool is_tracing,
     MaglevCompilationUnit& compilation_unit,
     InterpreterFrameState& loop_end_state,
@@ -559,7 +546,6 @@ bool MergePointInterpreterFrameState::TryMergeLoop(
           *known_node_aspects_)) {
     const MaglevCompilationInfo* info = compilation_unit.info();
     TRACE(TraceColor::kRed << "Merging failed, peeling loop instead... ");
-    ClearLoopInfo();
     return false;
   }
 
@@ -586,7 +572,6 @@ bool MergePointInterpreterFrameState::TryMergeLoop(
     }
   });
   if (!phis_can_merge) {
-    ClearLoopInfo();
     return false;
   }
 
@@ -614,21 +599,7 @@ bool MergePointInterpreterFrameState::TryMergeLoop(
   });
   predecessors_so_far_++;
   DCHECK_EQ(predecessors_so_far_, predecessor_count_);
-  ClearLoopInfo();
   return true;
-}
-
-void MergePointInterpreterFrameState::set_loop_effects(
-    LoopEffects* loop_effects) {
-  DCHECK(is_loop());
-  DCHECK(loop_metadata_.has_value());
-  loop_metadata_->loop_effects = loop_effects;
-}
-
-const LoopEffects* MergePointInterpreterFrameState::loop_effects() {
-  DCHECK(is_loop());
-  DCHECK(loop_metadata_.has_value());
-  return loop_metadata_->loop_effects;
 }
 
 void MergePointInterpreterFrameState::MergeThrow(

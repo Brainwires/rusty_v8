@@ -99,6 +99,7 @@ int V8InspectorImpl::resolveUniqueContextId(
 
 v8::MaybeLocal<v8::Value> V8InspectorImpl::compileAndRunInternalScript(
     v8::Local<v8::Context> context, v8::Local<v8::String> source) {
+  v8::Isolate::AllowJavascriptExecutionScope allow_script(m_isolate);
   v8::Local<v8::UnboundScript> unboundScript;
   if (!v8::debug::CompileInspectorScript(m_isolate, source)
            .ToLocal(&unboundScript)) {
@@ -131,12 +132,14 @@ V8ConsoleMessageStorage* V8InspectorImpl::ensureConsoleMessageStorage(
     int contextGroupId) {
   auto storageIt = m_consoleStorageMap.find(contextGroupId);
   if (storageIt == m_consoleStorageMap.end()) {
-    storageIt = m_consoleStorageMap
-                    .insert(std::make_pair(
-                        contextGroupId,
-                        std::unique_ptr<V8ConsoleMessageStorage>(
-                            new V8ConsoleMessageStorage(this, contextGroupId))))
-                    .first;
+    storageIt =
+        m_consoleStorageMap
+            .insert(std::make_pair(
+                contextGroupId,
+                std::unique_ptr<V8ConsoleMessageStorage>(
+                    new V8ConsoleMessageStorage(this, contextGroupId,
+                                                m_nextConsoleStorageId++))))
+            .first;
   }
   return storageIt->second.get();
 }

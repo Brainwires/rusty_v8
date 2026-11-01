@@ -193,6 +193,13 @@ class Range {
   static Range Mul(Range r1, Range r2) {
     if (r1.is_empty() || r2.is_empty()) return Range::Empty();
     if (r1.is_all() || r2.is_all()) return Range::All();
+
+    // Multiplication by infinity can produce NaN if the other operand can be 0.
+    if (((r1.min_ == kInfMin || r1.max_ == kInfMax) && r2.contains(0)) ||
+        ((r2.min_ == kInfMin || r2.max_ == kInfMax) && r1.contains(0))) {
+      return Range::All();
+    }
+
     int64_t results[4];
     if (base::bits::SignedMulOverflow64(r1.min_, r2.min_, &results[0])) {
       return Range::All();
@@ -210,6 +217,26 @@ class Range {
     int64_t max = *std::ranges::max_element(results);
     if (!IsSafeInteger(min)) min = kInfMin;
     if (!IsSafeInteger(max)) max = kInfMax;
+    return Range(min, max);
+  }
+
+  // [a, b] % [c, d]: the result has the sign of the lhs and a magnitude
+  // strictly smaller than the largest divisor magnitude.
+  static Range Mod(Range r1, Range r2) {
+    if (r1.is_empty() || r2.is_empty()) return Range::Empty();
+    int64_t bound = kInfMax;
+    if (r2.min_ != kInfMin && r2.max_ != kInfMax) {
+      int64_t divisor_max = std::max(std::abs(r2.min_), std::abs(r2.max_));
+      // A zero divisor deopts, so no value flows out of the node.
+      if (divisor_max == 0) return Range::Empty();
+      bound = divisor_max - 1;
+    }
+    int64_t min = r1.min_ == kInfMin ? kInfMin : std::min<int64_t>(r1.min_, 0);
+    int64_t max = r1.max_ == kInfMax ? kInfMax : std::max<int64_t>(r1.max_, 0);
+    if (bound != kInfMax) {
+      min = std::max(min, -bound);
+      max = std::min(max, bound);
+    }
     return Range(min, max);
   }
 

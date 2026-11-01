@@ -5,6 +5,7 @@
 #ifndef V8_COMPILER_TURBOSHAFT_ASSEMBLER_H_
 #define V8_COMPILER_TURBOSHAFT_ASSEMBLER_H_
 
+#include <array>
 #include <cstring>
 #include <iomanip>
 #include <iterator>
@@ -3498,10 +3499,15 @@ class AssemblerOpInterface : public Next {
 
   void JSStackCheck(V<Context> context, OptionalV<LazyFrameState> frame_state,
                     JSStackCheckOp::Kind kind) {
+    if (V8_UNLIKELY(v8_flags.disable_loop_stack_checks &&
+                    kind == JSStackCheckOp::Kind::kLoop)) {
+      return;
+    }
     ReduceIfReachableJSStackCheck(context, frame_state, kind);
   }
 
   void JSLoopStackCheck(V<Context> context, V<LazyFrameState> frame_state) {
+    if (V8_UNLIKELY(v8_flags.disable_loop_stack_checks)) return;
     JSStackCheck(context, frame_state, JSStackCheckOp::Kind::kLoop);
   }
   void JSFunctionEntryStackCheck(V<Context> context,
@@ -4029,7 +4035,7 @@ class AssemblerOpInterface : public Next {
                      lazy_deopt_on_throw, !compiling_builtins);
     return returns_t::CastIfNeeded(
         Call(CEntryStubConstant(isolate, result_size), frame_state,
-             base::VectorOf(arguments), desc));
+             base::VectorOf(arguments), desc, Desc::kEffects));
   }
 
   template <typename Desc>
@@ -4818,6 +4824,10 @@ class AssemblerOpInterface : public Next {
                                 Word64AddSub128BinopOp::Kind::kSub);
   }
 
+  V<Word64Pair> Word64Add3(V<Word64> a, V<Word64> b, V<Word64> c) {
+    return ReduceIfReachableWord64Add3(a, b, c);
+  }
+
   V<Word64Pair> Word64MulWide(V<Word64> left, V<Word64> right,
                               Word64MulWideOp::Kind kind) {
     return ReduceIfReachableWord64MulWide(left, right, kind);
@@ -5404,10 +5414,18 @@ class AssemblerOpInterface : public Next {
     return ReduceIfReachableStringPrepareForGetCodeUnit(string);
   }
 
+  V<Object> LoadWasmTypeInfo(V<Map> map) {
+    int offset = offsetof(Map, constructor_or_back_pointer_or_native_context_);
+    return Load(map, LoadOp::Kind::TaggedBase().Immutable(),
+                MemoryRepresentation::TaggedPointer(), offset);
+  }
 #endif  // V8_ENABLE_WEBASSEMBLY
 
 #ifdef V8_ENABLE_SIMD128
   V<Simd128> Simd128Constant(const uint8_t value[kSimd128Size]) {
+    return ReduceIfReachableSimd128Constant(value);
+  }
+  V<Simd128> Simd128Constant(const std::array<uint8_t, kSimd128Size>& value) {
     return ReduceIfReachableSimd128Constant(value);
   }
 
@@ -5485,6 +5503,11 @@ class AssemblerOpInterface : public Next {
                             const uint8_t shuffle[kSimd128Size]) {
     return ReduceIfReachableSimd128Shuffle(left, right, kind, shuffle);
   }
+  V<Simd128> Simd128Shuffle(V<Simd128> left, V<Simd128> right,
+                            Simd128ShuffleOp::Kind kind,
+                            const std::array<uint8_t, kSimd128Size>& shuffle) {
+    return ReduceIfReachableSimd128Shuffle(left, right, kind, shuffle);
+  }
 
   V<Simd256> Simd128LoadPairDeinterleave(
       V<WordPtr> base, V<WordPtr> index, LoadOp::Kind load_kind,
@@ -5496,6 +5519,9 @@ class AssemblerOpInterface : public Next {
   // SIMD256
 #if V8_ENABLE_SIMD256
   V<Simd256> Simd256Constant(const uint8_t value[kSimd256Size]) {
+    return ReduceIfReachableSimd256Constant(value);
+  }
+  V<Simd256> Simd256Constant(const std::array<uint8_t, kSimd256Size>& value) {
     return ReduceIfReachableSimd256Constant(value);
   }
 

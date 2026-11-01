@@ -8,6 +8,9 @@
 #include <utility>
 
 #include "src/api/api-inl.h"
+#include "src/ast/ast.h"
+#include "src/ast/scopes.h"
+#include "src/ast/variables.h"
 #include "src/base/vector.h"
 #include "src/builtins/builtins.h"
 #include "src/codegen/assembler-inl.h"
@@ -45,14 +48,22 @@
 #include "src/objects/js-regexp-inl.h"
 #include "src/objects/js-weak-refs-inl.h"
 #include "src/objects/literal-objects-inl.h"
+#include "src/objects/managed-inl.h"
 #include "src/objects/map-inl.h"
 #include "src/objects/name-inl.h"
+#include "src/objects/object-conversions-inl.h"
+#include "src/objects/objects-body-descriptors-inl.h"
 #include "src/objects/objects-inl.h"
 #include "src/objects/prototype.h"
+#include "src/objects/scope-info.h"
 #include "src/objects/slots-inl.h"
 #include "src/objects/struct-inl.h"
 #include "src/objects/transitions-inl.h"
 #include "src/objects/visitors.h"
+#include "src/parsing/parse-info.h"
+#include "src/parsing/parser.h"
+#include "src/parsing/parsing.h"
+#include "src/parsing/scanner-character-streams.h"
 #include "src/profiler/allocation-tracker.h"
 #include "src/profiler/heap-profiler.h"
 #include "src/profiler/output-stream-writer.h"
@@ -67,6 +78,101 @@
 #endif  // V8_ENABLE_WEBASSEMBLY
 
 namespace v8::internal {
+
+namespace {
+
+void CollectScopeTree(Scope* scope, int depth, HeapEntry* script_entry,
+                      StringsStorage* names, HeapSnapshot* snapshot) {
+  SourceScopeInfo info;
+  info.script_entry = script_entry;
+  info.scope_id = scope->UniqueIdInScript();
+  // We use the depth here to encode the tree hierarchy. The more natural way
+  // would be to use the scope id of the parent scope. However, the scope id can
+  // be negative (currently -1 or -2) or zero, the values we would usually as
+  // "no parent" marker for the root scope. Using depth avois defining such a
+  // magic marker as e.g. -3 or kMaxInt.
+  info.depth = depth;
+
+  std::vector<Variable*> context_vars;
+
+  if (scope->is_class_scope()) {
+    // Class scopes contain private fields and methods for which uses across
+    // closures are currently not tracked. Omit context variables to disable
+    // dead context analysis.
+  } else if (scope->inner_scope_calls_eval()) {
+    // If this scope or any of its inner scopes contains a direct eval call,
+    // variables might be dynamically accessed at runtime. Omit context
+    // variables to disable dead context analysis.
+  } else {
+    // In all other cases record the context-allocated variables.
+    for (Variable* var : *scope->locals()) {
+      if (var->IsContextSlot()) {
+        context_vars.push_back(var);
+      }
+    }
+    std::sort(context_vars.begin(), context_vars.end(),
+              [](Variable* a, Variable* b) { return a->index() < b->index(); });
+  }
+
+  info.scope_context_vars_count = static_cast<uint32_t>(context_vars.size());
+  for (Variable* var : context_vars) {
+    snapshot->AddSourceScopeContextVar(names->GetCopy(var->raw_name()));
+  }
+
+  // Collect all uses of context variables in this scope. Each use is a pair of
+  // declaring scope id and context slot index.
+  size_t uses_start = snapshot->source_scope_uses().size();
+
+  // `this` references are tracked on DeclarationScope via has_this_reference()
+  // rather than remaining in unresolved_list(). If this declaration scope
+  // accesses `this` and it was allocated to a context slot by the receiver
+  // scope, record it as a context variable use.
+  if (scope->is_declaration_scope() &&
+      scope->AsDeclarationScope()->has_this_reference()) {
+    DeclarationScope* receiver_scope =
+        scope->AsDeclarationScope()->GetReceiverScope();
+    Variable* receiver_var = receiver_scope->receiver();
+    if (receiver_var != nullptr && receiver_var->IsContextSlot() &&
+        receiver_var->scope() != nullptr) {
+      Scope* decl_scope = receiver_var->scope();
+      int slot_index =
+          receiver_var->index() - decl_scope->ContextHeaderLength();
+      snapshot->AddSourceScopeUse({decl_scope->UniqueIdInScript(), slot_index});
+    }
+  }
+
+  for (VariableProxy* proxy : scope->unresolved_list()) {
+    if (proxy->is_removed_from_unresolved()) continue;
+    if (proxy->is_resolved() && proxy->var() != nullptr) {
+      Variable* var = proxy->var();
+      // Lookups passing through an intervening scope (e.g. a `with` scope)
+      // are resolved dynamically, but track the outer local variable via
+      // local_if_not_shadowed(). Use the underlying local variable to record
+      // the context use.
+      if (var->is_dynamic() && var->has_local_if_not_shadowed()) {
+        var = var->local_if_not_shadowed();
+      }
+      if (var->IsContextSlot() && var->scope() != nullptr) {
+        Scope* decl_scope = var->scope();
+        int slot_index = var->index() - decl_scope->ContextHeaderLength();
+        snapshot->AddSourceScopeUse(
+            {decl_scope->UniqueIdInScript(), slot_index});
+      }
+    }
+  }
+  info.scope_uses_count =
+      static_cast<uint32_t>(snapshot->source_scope_uses().size() - uses_start);
+
+  snapshot->AddSourceScope(info);
+
+  // Recurse children
+  for (Scope* child = scope->inner_scope(); child != nullptr;
+       child = child->sibling()) {
+    CollectScopeTree(child, depth + 1, script_entry, names, snapshot);
+  }
+}
+
+}  // namespace
 
 #ifdef V8_ENABLE_HEAP_SNAPSHOT_VERIFY
 bool ShouldVerifyReferenceTo(Isolate* isolate, Tagged<HeapObject> obj) {
@@ -779,9 +885,12 @@ void HeapObjectsMap::AddMergedNativeEntry(NativeObject addr,
                           ComputeAddressHash(canonical_addr));
   auto result = merged_native_entries_map_.insert(
       {addr, reinterpret_cast<size_t>(entry->value)});
-  if (!result.second) {
-    result.first->second = reinterpret_cast<size_t>(entry->value);
-  }
+  DCHECK(result.second);
+  USE(result);
+}
+
+void HeapObjectsMap::ClearMergedNativeEntries() {
+  merged_native_entries_map_.clear();
 }
 
 void HeapObjectsMap::StopHeapObjectsTracking() { time_intervals_.clear(); }
@@ -798,6 +907,7 @@ void HeapObjectsMap::UpdateHeapObjectsMap() {
        obj = iterator.Next()) {
     FindOrAddEntry(obj.address(), SizeForSnapshot(obj));
     if (v8_flags.heap_profiler_trace_objects) {
+      if (IsInaccessible(obj)) continue;
       int object_size = obj->Size();
       PrintF("Update object      : %p %6d. Next address is %p\n",
              reinterpret_cast<void*>(obj.address()), object_size,
@@ -997,6 +1107,9 @@ void V8HeapExplorer::ExtractLocationForJSFunction(HeapEntry* entry,
 }
 
 HeapEntry* V8HeapExplorer::AddEntry(Tagged<HeapObject> object) {
+  if (IsWasmNull(object)) {
+    return AddEntry(object, HeapEntry::kNative, "null (wasm)");
+  }
   InstanceType instance_type = object->map()->instance_type();
   if (InstanceTypeChecker::IsJSObject(instance_type)) {
     if (InstanceTypeChecker::IsJSFunction(instance_type)) {
@@ -1063,8 +1176,9 @@ HeapEntry* V8HeapExplorer::AddEntry(Tagged<HeapObject> object) {
     } else if (IsSlicedString(string)) {
       return AddEntry(object, HeapEntry::kSlicedString, "(sliced string)");
     } else {
-      return AddEntry(object, HeapEntry::kString,
-                      names_->GetName(Cast<String>(object)));
+      const char* name = IsScriptSource(string) ? names_->GetUntruncated(string)
+                                                : names_->GetName(string);
+      return AddEntry(object, HeapEntry::kString, name);
     }
   } else if (InstanceTypeChecker::IsSymbol(instance_type)) {
     if (Cast<Symbol>(object)->is_any_private()) {
@@ -1136,6 +1250,23 @@ HeapEntry* V8HeapExplorer::AddEntry(Tagged<HeapObject> object) {
   }
 #endif  // V8_ENABLE_WEBASSEMBLY
 
+  if (InstanceTypeChecker::IsCppGCManagedBase(instance_type)) {
+    size_t size = SizeForSnapshot(object);
+    Tagged<CppGCManagedBase> managed = Cast<CppGCManagedBase>(object);
+    const char* tag_name = ToString(managed->GetWrapper()->type_id());
+    const char* name =
+        names_->GetFormatted("system / CppGCManaged (%s)", tag_name);
+#if V8_ENABLE_WEBASSEMBLY
+    if (managed->GetWrapper()->type_id() == ManagedTypeId::kWasmNativeModule) {
+      DisallowGarbageCollection no_gc;
+      size = Cast<CppGCManaged<wasm::NativeModule>>(managed)
+                 ->raw(no_gc)
+                 ->EstimateCurrentMemoryConsumption();
+    }
+#endif  // V8_ENABLE_WEBASSEMBLY
+    return AddEntry(object.address(), HeapEntry::kNative, name, size);
+  }
+
   if (InstanceTypeChecker::IsForeign(instance_type)) {
     Tagged<Foreign> foreign = Cast<Foreign>(object);
     ExternalPointerTag tag = foreign->GetTag();
@@ -1146,14 +1277,6 @@ HeapEntry* V8HeapExplorer::AddEntry(Tagged<HeapObject> object) {
     if (kAnyManagedExternalPointerTagRange.Contains(tag)) {
       const char* tag_name = ToString(tag);
       name = names_->GetFormatted("system / Managed (%s)", tag_name);
-#if V8_ENABLE_WEBASSEMBLY
-      if (tag == kWasmNativeModuleTag) {
-        DisallowGarbageCollection no_gc;
-        size = Cast<Managed<wasm::NativeModule>>(foreign)
-                   ->raw(no_gc)
-                   ->EstimateCurrentMemoryConsumption();
-      }
-#endif  // V8_ENABLE_WEBASSEMBLY
     } else if (kAnyForeignExternalPointerTagRange.Contains(tag)) {
       // Only sandbox configurations set tags properly, so we cannot CHECK here
       // but merely improve the tag if present.
@@ -1217,10 +1340,8 @@ const char* V8HeapExplorer::GetSystemEntryName(Tagged<HeapObject> object) {
     // The following lists include every non-String instance type.
     // This includes a few types that already have non-"system" names assigned
     // by AddEntry, but this is a convenient way to avoid manual upkeep here.
-    TORQUE_INSTANCE_CHECKERS_SINGLE_FULLY_DEFINED(MAKE_TORQUE_CASE)
-    TORQUE_INSTANCE_CHECKERS_MULTIPLE_FULLY_DEFINED(MAKE_TORQUE_CASE)
-    TORQUE_INSTANCE_CHECKERS_SINGLE_ONLY_DECLARED(MAKE_TORQUE_CASE)
-    TORQUE_INSTANCE_CHECKERS_MULTIPLE_ONLY_DECLARED(MAKE_TORQUE_CASE)
+    INSTANCE_TYPE_LIST_SINGLE(MAKE_TORQUE_CASE)
+    INSTANCE_TYPE_LIST_MULTIPLE(MAKE_TORQUE_CASE)
 #undef MAKE_TORQUE_CASE
 
     // Strings were already handled by AddEntry.
@@ -1229,6 +1350,11 @@ const char* V8HeapExplorer::GetSystemEntryName(Tagged<HeapObject> object) {
     UNREACHABLE();
     STRING_TYPE_LIST(MAKE_STRING_CASE)
 #undef MAKE_STRING_CASE
+
+#if V8_ENABLE_WEBASSEMBLY
+    case WASM_NULL_TYPE:
+      return "system / WasmNull";
+#endif  // V8_ENABLE_WEBASSEMBLY
   }
 
   // Avoid undefined behavior for enum values not handled by the exhaustive
@@ -1304,6 +1430,30 @@ void V8HeapExplorer::PopulateLineEnds() {
   }
 }
 
+void V8HeapExplorer::RecordScriptSources() {
+  Script::Iterator iterator(isolate());
+  for (Tagged<Script> script = iterator.Next(); !script.is_null();
+       script = iterator.Next()) {
+    Tagged<Object> source = script->source();
+    if (!IsString(source)) continue;
+    // While script sources are flattened, the source isn't guaranteed to be a
+    // sequential string. A ConsString for example flattens to
+    // ConsString(<flattened>, "").
+    Tagged<String> current = Cast<String>(source);
+    while (script_sources_.insert(current).second) {
+      if (IsConsString(current)) {
+        current = Cast<ConsString>(current)->first();
+      } else if (IsSlicedString(current)) {
+        current = Cast<SlicedString>(current)->parent();
+      } else if (IsThinString(current)) {
+        current = Cast<ThinString>(current)->actual();
+      } else {
+        break;
+      }
+    }
+  }
+}
+
 uint32_t V8HeapExplorer::EstimateObjectsCount() {
   CombinedHeapObjectIterator it(heap_, HeapObjectIterator::kNoFiltering);
   uint32_t objects_count = 0;
@@ -1367,24 +1517,6 @@ class IndexedReferencesExtractor : public ObjectVisitorWithCageBases {
   void VisitInstructionStreamPointer(Tagged<Code> host,
                                      InstructionStreamSlot slot) override {
     VisitSlotImpl(code_cage_base(), slot);
-  }
-
-  void VisitCodeTarget(Tagged<InstructionStream> host,
-                       RelocInfo* rinfo) override {
-    Tagged<InstructionStream> target =
-        InstructionStream::FromTargetAddress(rinfo->target_address());
-    VisitHeapObjectImpl(target, -1);
-  }
-
-  void VisitEmbeddedPointer(Tagged<InstructionStream> host,
-                            RelocInfo* rinfo) override {
-    Tagged<HeapObject> object = rinfo->target_object();
-    Tagged<Code> code = UncheckedCast<Code>(host->raw_code(kAcquireLoad));
-    if (code->IsWeakObject(object)) {
-      generator_->SetWeakReference(parent_, next_index_++, object, {});
-    } else {
-      VisitHeapObjectImpl(object, -1);
-    }
   }
 
   void VisitIndirectPointer(Tagged<HeapObject> host, IndirectPointerSlot slot,
@@ -1566,6 +1698,8 @@ void V8HeapExplorer::ExtractReferences(HeapEntry* entry,
     ExtractScopeInfoReferences(entry, Cast<ScopeInfo>(obj));
   } else if (IsCppHeapExternalObject(obj)) {
     ExtractCppHeapExternalReferences(entry, Cast<CppHeapExternalObject>(obj));
+  } else if (IsCppGCManagedBase(obj)) {
+    ExtractCppGCManagedBaseReferences(entry, Cast<CppGCManagedBase>(obj));
 #if V8_ENABLE_WEBASSEMBLY
   } else if (IsWasmStruct(obj)) {
     ExtractWasmStructReferences(Cast<WasmStruct>(obj), entry);
@@ -1737,7 +1871,7 @@ class ExternalStringRecorder
 void V8HeapExplorer::ExtractStringReferences(HeapEntry* entry,
                                              Tagged<String> string) {
   AddIntEdge(entry, HeapGraphEdge::kInternal, "length", string->length());
-  if (names_->NeedsTruncation(string->length())) {
+  if (names_->NeedsTruncation(string->length()) && !IsScriptSource(string)) {
     AddBoolEdge(entry, HeapGraphEdge::kInternal, "truncated", true);
     AddIntEdge(entry, HeapGraphEdge::kInternal, "hash",
                static_cast<int>(string->EnsureHash()));
@@ -1844,7 +1978,7 @@ static const struct {
 void V8HeapExplorer::ExtractContextReferences(HeapEntry* entry,
                                               Tagged<Context> context) {
   DisallowGarbageCollection no_gc;
-  if (!IsNativeContext(context) && context->is_declaration_context()) {
+  if (!IsNativeContext(context)) {
     Tagged<ScopeInfo> scope_info = context->scope_info();
     // Add context allocated locals.
     for (auto it : ScopeInfo::IterateLocalNames(scope_info, no_gc)) {
@@ -1999,6 +2133,12 @@ void V8HeapExplorer::ExtractMapReferences(HeapEntry* entry, Tagged<Map> map) {
 void V8HeapExplorer::ExtractSharedFunctionInfoReferences(
     HeapEntry* entry, Tagged<SharedFunctionInfo> shared) {
   TagObject(shared, "(shared function info)");
+#if V8_ENABLE_WEBASSEMBLY
+  // Wasm functions store their wrapper Code on the JSFunction's
+  // JSDispatchTable entry rather than on the SharedFunctionInfo, so
+  // SharedFunctionInfo::GetCode is not applicable to WasmFunctionData.
+  if (!shared->HasWasmFunctionData(isolate()))
+#endif  // V8_ENABLE_WEBASSEMBLY
   {
     std::unique_ptr<char[]> name = shared->DebugNameCStr();
     Tagged<Code> code = shared->GetCode(isolate());
@@ -2041,6 +2181,8 @@ void V8HeapExplorer::ExtractSharedFunctionInfoReferences(
              shared->EndPosition());
   AddIntEdge(entry, HeapGraphEdge::kInternal, "function_literal_id",
              shared->function_literal_id(kRelaxedLoad));
+  AddIntEdge(entry, HeapGraphEdge::kInternal, "scope_id",
+             shared->UniqueIdInScript());
   if (shared->HasBuiltinId()) {
     AddIntEdge(entry, HeapGraphEdge::kInternal, "builtin_id",
                static_cast<int>(shared->builtin_id()));
@@ -2049,8 +2191,42 @@ void V8HeapExplorer::ExtractSharedFunctionInfoReferences(
   }
 }
 
+void V8HeapExplorer::ParseScriptScopes(HeapEntry* entry,
+                                       Tagged<Script> script) {
+#if V8_ENABLE_WEBASSEMBLY
+  if (script->type() == Script::Type::kWasm) return;
+#endif
+  if (!IsString(script->source())) return;
+  Tagged<String> source_str = Cast<String>(script->source());
+  if (source_str->length() == 0) return;
+
+  HandleScope handle_scope(isolate());
+  DirectHandle<Script> script_handle(script, isolate());
+
+  UnoptimizedCompileFlags flags =
+      UnoptimizedCompileFlags::ForScriptCompile(isolate(), *script_handle);
+  flags.set_allow_lazy_parsing(false);
+  flags.set_is_eager(true);
+  flags.set_is_reparse(true);
+  flags.set_allow_heap_allocation(false);
+
+  UnoptimizedCompileState compile_state;
+  ReusableUnoptimizedCompileState reusable_state(isolate());
+  ParseInfo info(isolate(), flags, &compile_state, &reusable_state);
+
+  if (parsing::ParseProgram(&info, script_handle, isolate(),
+                            parsing::ReportStatisticsMode{false})) {
+    if (info.literal() != nullptr && info.literal()->scope() != nullptr) {
+      CollectScopeTree(info.literal()->scope(), 0, entry, names_, snapshot_);
+    }
+  }
+}
+
 void V8HeapExplorer::ExtractScriptReferences(HeapEntry* entry,
                                              Tagged<Script> script) {
+  // Parse the script and add its scopes to the heap snapshot.
+  ParseScriptScopes(entry, script);
+
   AddIntEdge(entry, HeapGraphEdge::kInternal, "id", script->id());
   AddIntEdge(entry, HeapGraphEdge::kInternal, "line_offset",
              script->line_offset());
@@ -2060,10 +2236,10 @@ void V8HeapExplorer::ExtractScriptReferences(HeapEntry* entry,
              static_cast<int>(script->type()));
   AddStringEdge(entry, HeapGraphEdge::kInternal, "script_type_name",
                 ToString(script->type()));
-  AddIntEdge(entry, HeapGraphEdge::kInternal, "compilation_type",
-             static_cast<int>(script->compilation_type()));
-  AddStringEdge(entry, HeapGraphEdge::kInternal, "compilation_type_name",
-                ToString(script->compilation_type()));
+  AddIntEdge(entry, HeapGraphEdge::kInternal, "compilation_kind",
+             static_cast<int>(script->compilation_kind()));
+  AddStringEdge(entry, HeapGraphEdge::kInternal, "compilation_kind_name",
+                ToString(script->compilation_kind()));
   AddIntEdge(entry, HeapGraphEdge::kInternal, "compilation_state",
              static_cast<int>(script->compilation_state()));
   AddStringEdge(entry, HeapGraphEdge::kInternal, "compilation_state_name",
@@ -2238,6 +2414,29 @@ void V8HeapExplorer::ExtractInstructionStreamReferences(
             HeapEntry::kCode);
   SetInternalReference(entry, "relocation_info", istream->relocation_info(),
                        InstructionStream::kRelocationInfoOffset);
+
+  if (istream->IsFullyInitialized()) {
+    int reloc_index = 0;
+    for (RelocIterator it(istream,
+                          InstructionStream::BodyDescriptor::kRelocModeMask);
+         !it.done(); it.next()) {
+      RelocInfo* rinfo = it.rinfo();
+      if (RelocInfo::IsCodeTargetMode(rinfo->rmode())) {
+        Tagged<InstructionStream> target =
+            InstructionStream::FromTargetAddress(rinfo->target_address());
+        SetHiddenReference(istream, entry, reloc_index++, target,
+                           -1 * kTaggedSize);
+      } else if (RelocInfo::IsEmbeddedObjectMode(rinfo->rmode())) {
+        Tagged<HeapObject> object = rinfo->target_object();
+        if (code->IsWeakObject(object)) {
+          SetWeakReference(entry, reloc_index++, object, {});
+        } else {
+          SetHiddenReference(istream, entry, reloc_index++, object,
+                             -1 * kTaggedSize);
+        }
+      }
+    }
+  }
 }
 
 void V8HeapExplorer::ExtractCellReferences(HeapEntry* entry,
@@ -2338,6 +2537,8 @@ void V8HeapExplorer::ExtractJSGeneratorObjectReferences(
   SetInternalReference(entry, "parameters_and_registers",
                        generator->parameters_and_registers(),
                        offsetof(JSGeneratorObject, parameters_and_registers_));
+  AddIntEdge(entry, HeapGraphEdge::kInternal, "continuation",
+             generator->continuation());
 }
 
 void V8HeapExplorer::ExtractFixedArrayReferences(HeapEntry* entry,
@@ -2394,6 +2595,8 @@ void V8HeapExplorer::ExtractScopeInfoReferences(HeapEntry* entry,
   AddIntEdge(entry, HeapGraphEdge::kInternal, "scope_type", info->scope_type());
   AddStringEdge(entry, HeapGraphEdge::kInternal, "scope_type_name",
                 ToString(info->scope_type()));
+  AddIntEdge(entry, HeapGraphEdge::kInternal, "scope_id",
+             info->UniqueIdInScript());
   AddIntEdge(entry, HeapGraphEdge::kInternal, "context_local_count",
              info->ContextLocalCount());
   AddIntEdge(entry, HeapGraphEdge::kInternal, "parameter_count",
@@ -2402,12 +2605,10 @@ void V8HeapExplorer::ExtractScopeInfoReferences(HeapEntry* entry,
     SetInternalReference(entry, "outer_scope_info", info->OuterScopeInfo(),
                          info->OuterScopeInfoOffset());
   }
-  if (info->HasPositionInfo()) {
-    AddIntEdge(entry, HeapGraphEdge::kInternal, "start_position",
-               info->StartPosition());
-    AddIntEdge(entry, HeapGraphEdge::kInternal, "end_position",
-               info->EndPosition());
-  }
+  AddIntEdge(entry, HeapGraphEdge::kInternal, "start_position",
+             info->StartPosition());
+  AddIntEdge(entry, HeapGraphEdge::kInternal, "end_position",
+             info->EndPosition());
   if (!info->HasInlinedLocalNames()) {
     TagObject(info->context_local_names_hashtable(), "(context local names)",
               HeapEntry::kCode);
@@ -2604,6 +2805,11 @@ void V8HeapExplorer::ExtractInternalReferences(Tagged<JSObject> js_obj,
 
 void V8HeapExplorer::ExtractCppHeapExternalReferences(
     HeapEntry* entry, Tagged<CppHeapExternalObject> obj) {
+  generator_->GetCppHeapWrappers().insert(obj);
+}
+
+void V8HeapExplorer::ExtractCppGCManagedBaseReferences(
+    HeapEntry* entry, Tagged<CppGCManagedBase> obj) {
   generator_->GetCppHeapWrappers().insert(obj);
 }
 
@@ -2834,6 +3040,9 @@ bool V8HeapExplorer::IterateAndExtractReferences(
        obj = iterator.Next(), progress_->ProgressStep()) {
     if (interrupted) continue;
 
+    // There's nothing interesting to see for inaccessible objects anyway.
+    if (IsInaccessible(obj)) continue;
+
     max_pointers_ = obj->Size() / kTaggedSize;
     if (max_pointers_ > visited_fields_.size()) {
       // Reallocate to right size.
@@ -2887,8 +3096,8 @@ bool V8HeapExplorer::IsEssentialObject(Tagged<Object> object) {
   }
   Isolate* isolate = heap_->isolate();
   ReadOnlyRoots roots(isolate);
-  return !IsAnyHole(object) && !IsOddball(object) &&
-         object != roots.empty_byte_array() &&
+  return !IsInaccessible(Cast<HeapObject>(object)) && !IsAnyHole(object) &&
+         !IsOddball(object) && object != roots.empty_byte_array() &&
          object != roots.empty_fixed_array() &&
          object != roots.empty_weak_fixed_array() &&
          object != roots.empty_descriptor_array() &&
@@ -3512,11 +3721,14 @@ bool NativeObjectsExplorer::IterateAndExtractReferences(
   DisallowGarbageCollection no_gc;
   HandleScope scope(isolate_);
 
-  if (isolate_->heap()->cpp_heap()) {
-    CppGraphBuilder::Run(
-        v8::internal::CppHeap::From(isolate_->heap()->cpp_heap()), generator_,
-        generator_->TakeCppHeapWrappers());
-  }
+  // Native objects can be replaced while their JS wrapper survives.
+  // Rebuild these associations each snapshot instead of retaining
+  // stale native addresses for live wrapper entries.
+  heap_object_map_->ClearMergedNativeEntries();
+
+  CppGraphBuilder::Run(
+      *v8::internal::CppHeap::From(isolate_->heap()->cpp_heap()), generator_,
+      generator_->TakeCppHeapWrappers());
 
   if (v8_flags.heap_profiler_use_embedder_graph &&
       snapshot_->profiler()->HasBuildEmbedderGraphCallback()) {
@@ -3676,6 +3888,7 @@ bool HeapSnapshotGenerator::GenerateSnapshot() {
   snapshot_->AddSyntheticRootEntries();
 
   v8_heap_explorer_.PopulateLineEnds();
+  v8_heap_explorer_.RecordScriptSources();
   if (!FillReferences()) return false;
 
   snapshot_->FillChildren();
@@ -3711,6 +3924,7 @@ bool HeapSnapshotGenerator::GenerateSnapshotAfterGC() {
       std::move(temporary_native_context_tags));
   snapshot_->AddSyntheticRootEntries();
   v8_heap_explorer_.PopulateLineEnds();
+  v8_heap_explorer_.RecordScriptSources();
   if (!FillReferences()) return false;
   snapshot_->FillChildren();
   snapshot_->RememberLastJSObjectId();
@@ -3826,6 +4040,21 @@ void HeapSnapshotJSONSerializer::SerializeImpl() {
 
   writer_->AddString("\"locations\":[");
   SerializeLocations();
+  if (writer_->aborted()) return;
+  writer_->AddString("],\n");
+
+  writer_->AddString("\"scopes\":[");
+  SerializeScopes();
+  if (writer_->aborted()) return;
+  writer_->AddString("],\n");
+
+  writer_->AddString("\"scope_context_vars\":[");
+  SerializeScopeContextVars();
+  if (writer_->aborted()) return;
+  writer_->AddString("],\n");
+
+  writer_->AddString("\"scope_uses\":[");
+  SerializeScopeUses();
   if (writer_->aborted()) return;
   writer_->AddString("],\n");
 
@@ -3983,7 +4212,18 @@ void HeapSnapshotJSONSerializer::SerializeSnapshot() {
         JSON_S("script_id") ","
         JSON_S("script_object_index") ","
         JSON_S("line") ","
-        JSON_S("column"))
+        JSON_S("column")) ","
+    JSON_S("scope_fields") ":" JSON_A(
+        JSON_S("script_node_index") ","
+        JSON_S("scope_id") ","
+        JSON_S("depth") ","
+        JSON_S("scope_context_vars_count") ","
+        JSON_S("scope_uses_count")) ","
+    JSON_S("scope_context_var_fields") ":" JSON_A(
+        JSON_S("name")) ","
+    JSON_S("scope_use_fields") ":" JSON_A(
+        JSON_S("declaring_scope_id") ","
+        JSON_S("slot_index"))
   "}");
 // clang-format on
 #undef JSON_S
@@ -4100,6 +4340,42 @@ void HeapSnapshotJSONSerializer::SerializeLocations() {
   for (size_t i = 0; i < locations.size(); i++) {
     if (i > 0) writer_->AddCharacter(',');
     SerializeLocation(locations[i]);
+    if (writer_->aborted()) return;
+  }
+}
+
+void HeapSnapshotJSONSerializer::SerializeScopes() {
+  for (size_t i = 0; i < snapshot_->source_scopes().size(); ++i) {
+    if (i > 0) writer_->AddCharacter(',');
+    const auto& scope = snapshot_->source_scopes()[i];
+    writer_->AddNumber(to_node_index(scope.script_entry));
+    writer_->AddCharacter(',');
+    writer_->AddNumber(scope.scope_id);
+    writer_->AddCharacter(',');
+    writer_->AddNumber(scope.depth);
+    writer_->AddCharacter(',');
+    writer_->AddNumber(scope.scope_context_vars_count);
+    writer_->AddCharacter(',');
+    writer_->AddNumber(scope.scope_uses_count);
+    if (writer_->aborted()) return;
+  }
+}
+
+void HeapSnapshotJSONSerializer::SerializeScopeContextVars() {
+  for (size_t i = 0; i < snapshot_->source_scope_context_vars().size(); ++i) {
+    if (i > 0) writer_->AddCharacter(',');
+    writer_->AddNumber(GetStringId(snapshot_->source_scope_context_vars()[i]));
+    if (writer_->aborted()) return;
+  }
+}
+
+void HeapSnapshotJSONSerializer::SerializeScopeUses() {
+  for (size_t i = 0; i < snapshot_->source_scope_uses().size(); ++i) {
+    if (i > 0) writer_->AddCharacter(',');
+    const auto& use = snapshot_->source_scope_uses()[i];
+    writer_->AddNumber(use.declaring_scope_id);
+    writer_->AddCharacter(',');
+    writer_->AddNumber(use.slot_index);
     if (writer_->aborted()) return;
   }
 }

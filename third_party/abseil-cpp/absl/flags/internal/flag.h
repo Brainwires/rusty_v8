@@ -25,6 +25,7 @@
 #include <string>
 #include <type_traits>
 #include <typeinfo>
+#include <utility>
 
 #include "absl/base/attributes.h"
 #include "absl/base/call_once.h"
@@ -43,7 +44,7 @@
 #include "absl/synchronization/mutex.h"
 #include "absl/utility/utility.h"
 
-namespace absl {
+    namespace absl {
 ABSL_NAMESPACE_BEGIN
 
 ///////////////////////////////////////////////////////////////////////////////
@@ -283,8 +284,7 @@ constexpr T InitDefaultValue(EmptyBraces) {
 }
 
 template <typename ValueT, typename GenT,
-          typename std::enable_if<std::is_integral<ValueT>::value, int>::type =
-              ((void)GenT{}, 0)>
+          std::enable_if_t<std::is_integral_v<ValueT>, int> = ((void)GenT{}, 0)>
 constexpr FlagDefaultArg DefaultArg(int) {
   return {FlagDefaultSrc(GenT{}.value), FlagDefaultKind::kOneWord};
 }
@@ -300,19 +300,16 @@ constexpr FlagDefaultArg DefaultArg(char) {
 
 template <typename T>
 using FlagUseValueAndInitBitStorage =
-    std::integral_constant<bool, std::is_trivially_copyable<T>::value &&
-                                     std::is_default_constructible<T>::value &&
-                                     (sizeof(T) < 8)>;
+    std::bool_constant<std::is_trivially_copyable_v<T> &&
+                       std::is_default_constructible_v<T> && (sizeof(T) < 8)>;
 
 template <typename T>
 using FlagUseOneWordStorage =
-    std::integral_constant<bool, std::is_trivially_copyable<T>::value &&
-                                     (sizeof(T) <= 8)>;
+    std::bool_constant<std::is_trivially_copyable_v<T> && (sizeof(T) <= 8)>;
 
 template <class T>
 using FlagUseSequenceLockStorage =
-    std::integral_constant<bool, std::is_trivially_copyable<T>::value &&
-                                     (sizeof(T) > 8)>;
+    std::bool_constant<std::is_trivially_copyable_v<T> && (sizeof(T) > 8)>;
 
 enum class FlagValueStorageKind : uint8_t {
   kValueAndInitBit = 0,
@@ -609,16 +606,16 @@ class FlagImpl final : public CommandLineFlag {
   }
   template <typename T,
             std::enable_if_t<flags_internal::StorageKind<T>() ==
-                                  FlagValueStorageKind::kOneWordAtomic,
-                              int> = 0>
+                                 FlagValueStorageKind::kOneWordAtomic,
+                             int> = 0>
   void Read(T* value) const ABSL_LOCKS_EXCLUDED(DataGuard()) {
     int64_t v = ReadOneWord();
     std::memcpy(value, static_cast<const void*>(&v), sizeof(T));
   }
   template <typename T,
-            typename std::enable_if<flags_internal::StorageKind<T>() ==
-                                        FlagValueStorageKind::kValueAndInitBit,
-                                    int>::type = 0>
+            std::enable_if_t<flags_internal::StorageKind<T>() ==
+                                 FlagValueStorageKind::kValueAndInitBit,
+                             int> = 0>
   void Read(T* value) const ABSL_LOCKS_EXCLUDED(DataGuard()) {
     *value = absl::bit_cast<FlagValueAndInitBit<T>>(ReadOneWord()).value;
   }

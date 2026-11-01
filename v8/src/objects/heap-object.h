@@ -61,6 +61,8 @@ using InSharedSpace = base::StrongAlias<struct InSharedSpaceTag, bool>;
 // HeapObject is the superclass for all classes describing heap allocated
 // objects.
 V8_OBJECT class HeapObject {
+  V8_IT_ABSTRACT;
+
  public:
   // [map]: Contains a map which contains the object's reflective
   // information.
@@ -430,6 +432,9 @@ IS_TYPE_FUNCTION_DECL(AnyHole)
   V8_INLINE bool Is##Type(Tagged<HeapObject> obj);
 ODDBALL_LIST(IS_TYPE_FUNCTION_DECL)
 HOLE_LIST(IS_TYPE_FUNCTION_DECL)
+#ifndef V8_ENABLE_TDZ_HOLE
+IS_TYPE_FUNCTION_DECL(TdzHole)
+#endif
 IS_TYPE_FUNCTION_DECL(UndefinedContextCell)
 IS_TYPE_FUNCTION_DECL(NullOrUndefined)
 #undef IS_TYPE_FUNCTION_DECL

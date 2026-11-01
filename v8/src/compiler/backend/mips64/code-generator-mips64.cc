@@ -240,8 +240,7 @@ class OutOfLineTrap final : public OutOfLineCode {
     // Just encode the stub index. This will be patched when the code
     // is added to the native module and copied into wasm code space.
     __ Call(static_cast<Address>(trap_id), RelocInfo::WASM_STUB_CALL);
-    ReferenceMap* reference_map = gen_->zone()->New<ReferenceMap>(gen_->zone());
-    gen_->RecordSafepoint(reference_map);
+    gen_->RecordSafepointWithoutTaggedSlots();
     if (v8_flags.debug_code) {
       __ stop();
     }
@@ -1021,6 +1020,22 @@ CodeGenerator::CodeGenResult CodeGenerator::AssembleArchInstruction(
       __ DaddOverflow(i.OutputRegister(), i.InputRegister(0), i.InputOperand(1),
                       kScratchReg);
       break;
+    case kMips64Add64_3: {
+      Register low = i.OutputRegister(0);
+      UseScratchRegisterScope temps(masm());
+      Register scratch = temps.Acquire();
+      __ Daddu(scratch, i.InputRegister(0), i.InputOperand(1));
+      if (instr->OutputCount() > 1) {
+        Register high = i.OutputRegister(1);
+        __ Sltu(high, scratch, i.InputRegister(0));
+        __ Daddu(low, scratch, i.InputOperand(2));
+        __ Sltu(scratch, low, scratch);
+        __ Daddu(high, high, scratch);
+      } else {
+        __ Daddu(low, scratch, i.InputOperand(2));
+      }
+      break;
+    }
     case kMips64Add128: {
       UseScratchRegisterScope temps(masm());
       Register scratch = temps.Acquire();
@@ -4316,7 +4331,9 @@ void CodeGenerator::AssembleConstructFrame() {
   if (required_slots > 0) {
     DCHECK(frame_access_state()->has_frame());
 #if V8_ENABLE_WEBASSEMBLY
-    if (info()->IsWasm() && required_slots * kSystemPointerSize > 4 * KB) {
+    int32_t stack_space =
+        required_slots * kSystemPointerSize + GetStackCheckOffset();
+    if (info()->IsWasm() && stack_space > 4 * KB) {
       // For WebAssembly functions with big frames we have to do the stack
       // overflow check before we construct the frame. Otherwise we may not
       // have enough space on the stack to call the runtime for the stack
@@ -4326,11 +4343,10 @@ void CodeGenerator::AssembleConstructFrame() {
       // If the frame is bigger than the stack, we throw the stack overflow
       // exception unconditionally. Thereby we can avoid the integer overflow
       // check in the condition code.
-      if (required_slots * kSystemPointerSize < v8_flags.stack_size * KB) {
+      if (stack_space < v8_flags.stack_size * KB) {
         __ LoadStackLimit(kScratchReg,
                           MacroAssembler::StackLimitKind::kRealStackLimit);
-        __ Daddu(kScratchReg, kScratchReg,
-                 Operand(required_slots * kSystemPointerSize));
+        __ Daddu(kScratchReg, kScratchReg, Operand(stack_space));
         __ Branch(&done, uge, sp, Operand(kScratchReg));
       }
 
@@ -4338,8 +4354,7 @@ void CodeGenerator::AssembleConstructFrame() {
               RelocInfo::WASM_STUB_CALL);
       // The call does not return, hence we can ignore any references and just
       // define an empty safepoint.
-      ReferenceMap* reference_map = zone()->New<ReferenceMap>(zone());
-      RecordSafepoint(reference_map);
+      RecordSafepointWithoutTaggedSlots();
       if (v8_flags.debug_code) __ stop();
 
       __ bind(&done);

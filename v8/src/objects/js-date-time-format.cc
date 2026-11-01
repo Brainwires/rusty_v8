@@ -9,11 +9,13 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
 #include "src/base/bit-field.h"
 #include "src/base/logging.h"
+#include "src/base/small-map.h"
 #include "src/date/date.h"
 #include "src/execution/isolate.h"
 #include "src/heap/factory.h"
@@ -25,6 +27,7 @@
 #include "temporal_rs/Instant.hpp"
 #endif  // V8_TEMPORAL_SUPPORT
 #include "src/objects/managed-inl.h"
+#include "src/objects/object-conversions-inl.h"
 #include "src/objects/option-utils.h"
 #include "unicode/calendar.h"
 #include "unicode/dtitvfmt.h"
@@ -200,7 +203,11 @@ static std::vector<PatternItem> BuildPatternItems() {
                   {{"GGGGG", "narrow"}, {"GGGG", "long"}, {"GGG", "short"}},
                   kNarrowLongShort),
       PatternItem(Year::kShift, DateTimeProperty::kYear,
-                  {{"yy", "2-digit"}, {"y", "numeric"}}, k2DigitNumeric)};
+                  {{"yy", "2-digit"},
+                   {"y", "numeric"},
+                   {"YY", "2-digit"},
+                   {"Y", "numeric"}},
+                  k2DigitNumeric)};
   // Sometimes we get L instead of M for month - standalone name.
   items.push_back(PatternItem(Month::kShift, DateTimeProperty::kMonth,
                               {{"MMMMM", "narrow"},
@@ -467,7 +474,7 @@ std::string ToTitleCaseTimezoneLocation(const std::string& input) {
       // Special case Au/Es/Of to be lower case.
       if (word_length == 2) {
         size_t pos = title_cased.length() - 2;
-        std::string substr = title_cased.substr(pos, 2);
+        std::string_view substr = std::string_view(title_cased).substr(pos, 2);
         if (substr == "Of" || substr == "Es" || substr == "Au") {
           title_cased[pos] = LocaleIndependentAsciiToLower(title_cased[pos]);
         }
@@ -1224,7 +1231,7 @@ Maybe<DateTimeValueRecord> HandleDateTimeValue(
   return HandleDateTimeOthers(isolate, date_time_format, x, method_name);
 }
 
-char16_t EqualventSkeletonchar(char16_t in) {
+char16_t EquivalentSkeletonChar(char16_t in) {
   switch (in) {
     case 'L':
       return 'M';
@@ -1240,6 +1247,10 @@ char16_t EqualventSkeletonchar(char16_t in) {
       return 'z';
     case 'v':
       return 'z';
+    case 'r':
+      return 'y';
+    case 'U':
+      return 'y';
     default:
       return '\0';
   }
@@ -1250,7 +1261,7 @@ icu::UnicodeString AdjustDateTimeStyleFormat(
     const std::set<char16_t>& allowed_options) {
   std::set<char16_t> allowed(allowed_options);
   for (int ch : allowed_options) {
-    auto also = EqualventSkeletonchar(ch);
+    auto also = EquivalentSkeletonChar(ch);
     if (also) {
       allowed.emplace(also);
     }
@@ -1342,7 +1353,7 @@ icu::UnicodeString GetDateTimeFormat(const icu::UnicodeString& options,
     char16_t ch = options.charAt(i);
     if (required_options.find(ch) != required_options.end()) {
       to_be_added.erase(ch);
-      auto also = EqualventSkeletonchar(ch);
+      auto also = EquivalentSkeletonChar(ch);
       if (also) {
         to_be_added.erase(also);
       }
@@ -1393,6 +1404,9 @@ std::set<char16_t> ExplicitComponentsSet(int32_t components) {
   }
   if (Year::decode(components)) {
     result.insert('y');
+    result.insert('r');
+    result.insert('U');
+    result.insert('G');
   }
   if (Month::decode(components)) {
     result.insert('M');
@@ -1484,7 +1498,7 @@ icu::UnicodeString GetSkeletonForPatternKind(
             best_format,
             // Allowed options:  [[weekday]], [[era]], [[year]], [[month]],
             // [[day]]
-            {'E', 'c', 'G', 'y', 'M', 'L', 'd'});
+            {'E', 'c', 'G', 'y', 'r', 'U', 'M', 'L', 'd'});
       }
       // ii. Set dateTimeFormat.[[TemporalPlainYearMonthFormat]] to
       // AdjustDateTimeStyleFormat(formats, bestFormat, formatMatcher, «
@@ -1495,7 +1509,7 @@ icu::UnicodeString GetSkeletonForPatternKind(
         // [[era]], [[year]], [[month]] »).
         return AdjustDateTimeStyleFormat(best_format,
                                          // Allowed options: [[year]], [[month]]
-                                         {'G', 'y', 'M', 'L'});
+                                         {'G', 'y', 'r', 'U', 'M', 'L'});
       }
       if (kind == PatternKind::kPlainMonthDay) {
         // iii. Set dateTimeFormat.[[TemporalPlainMonthDayFormat]] to
@@ -1533,8 +1547,8 @@ icu::UnicodeString GetSkeletonForPatternKind(
             // [[weekday]], [[era]], [[year]], [[month]],
             // [[day]], [[hour]], [[minute]], [[second]], [[dayPeriod]],
             // [[fractionalSecondDigits]]
-            {'E', 'c', 'G', 'y', 'M', 'L', 'd', 'h', 'H', 'k', 'K', 'j', 'm',
-             's', 'B', 'b', 'a', 'S'});
+            {'E', 'c', 'G', 'y', 'r', 'U', 'M', 'L', 'd', 'h', 'H', 'k', 'K',
+             'j', 'm', 's', 'B', 'b', 'a', 'S'});
       case PatternKind::kInstant:
         // k. Set dateTimeFormat.[[TemporalInstantFormat]] to bestFormat.
         return best_format;
@@ -1549,7 +1563,7 @@ icu::UnicodeString GetSkeletonForPatternKind(
     //    b. Let requiredOptions be « "weekday", "year", "month", "day",
     //    "dayPeriod", "hour", "minute", "second", "fractionalSecondDigits" ».
     static const std::initializer_list<char16_t> kRequiredAny{
-        'E', 'c', 'G', 'y', 'M', 'L', 'd', 'h', 'H',
+        'E', 'c', 'G', 'y', 'r', 'U', 'M', 'L', 'd', 'h', 'H',
         'k', 'K', 'j', 'm', 's', 'B', 'b', 'a', 'S'};
     // 10. Else,
     //     a. Assert: defaults is zoned-date-time or all.
@@ -1564,7 +1578,7 @@ icu::UnicodeString GetSkeletonForPatternKind(
         // const std::set<char16_t> kRequireddate({{'E', 'c', 'G', 'y', 'M',
         // 'L', 'd'}});
         static const std::initializer_list<char16_t> kRequiredDate{
-            'E', 'c', 'G', 'y', 'M', 'L', 'd'};
+            'E', 'c', 'G', 'y', 'r', 'U', 'M', 'L', 'd'};
         // 6. If defaults is date, then
         //   a. Let defaultOptions be « "year", "month", "day" ».
         static const std::initializer_list<char16_t> kDefaultsDate{'y', 'M',
@@ -1581,7 +1595,7 @@ icu::UnicodeString GetSkeletonForPatternKind(
         // 3. Else if required is year-month, then
         //    a. Let requiredOptions be « "year", "month" ».
         static const std::initializer_list<char16_t> kRequiredYearMonth{
-            'G', 'y', 'M', 'L'};
+            'G', 'y', 'r', 'U', 'M', 'L'};
         // 8. Else if defaults is year-month, then
         //    a. Let defaultOptions be « "year", "month" ».
         static const std::initializer_list<char16_t> kDefaultsYearMonth{'y',
@@ -1682,11 +1696,16 @@ std::unique_ptr<icu::SimpleDateFormat> GetSimpleDateTimeForTemporal(
     JSDateTimeFormat::DateTimeStyle time_style,
     bool has_to_locale_string_time_zone) {
   DCHECK_NE(kind, PatternKind::kDate);
+  icu::UnicodeString original_skeleton = SkeletonFromDateFormat(date_format);
   icu::UnicodeString skeleton = GetSkeletonForPatternKind(
-      SkeletonFromDateFormat(date_format), explicit_components_in_options, kind,
-      date_style, time_style, has_to_locale_string_time_zone);
+      original_skeleton, explicit_components_in_options, kind, date_style,
+      time_style, has_to_locale_string_time_zone);
   if (skeleton.length() == 0) {
     return nullptr;
+  }
+  if (skeleton == original_skeleton) {
+    return std::unique_ptr<icu::SimpleDateFormat>(
+        static_cast<icu::SimpleDateFormat*>(date_format.clone()));
   }
   UErrorCode status = U_ZERO_ERROR;
   std::unique_ptr<icu::SimpleDateFormat> result(
@@ -2118,6 +2137,19 @@ std::unique_ptr<icu::TimeZone> JSDateTimeFormat::CreateTimeZone(
 
 namespace {
 
+constexpr size_t kMaxCacheSize = 9;
+
+template <typename T>
+using IntlCacheMap = base::SmallMap<std::map<std::string, std::unique_ptr<T>>,
+                                    kMaxCacheSize, std::equal_to<std::string>>;
+
+template <typename T>
+void ClearCacheIfFull(IntlCacheMap<T>& map) {
+  if (map.size() >= kMaxCacheSize) {
+    map.clear();
+  }
+}
+
 class CalendarCache {
  public:
   icu::Calendar* CreateCalendar(const icu::Locale& locale, icu::TimeZone* tz) {
@@ -2153,15 +2185,13 @@ class CalendarCache {
       DCHECK(U_SUCCESS(status));
     }
 
-    if (map_.size() > 8) {  // Cache at most 8 calendars.
-      map_.clear();
-    }
+    ClearCacheIfFull(map_);
     map_[key] = std::move(calendar);
     return map_[key]->clone();
   }
 
  private:
-  std::map<std::string, std::unique_ptr<icu::Calendar>> map_;
+  IntlCacheMap<icu::Calendar> map_;
   base::Mutex mutex_;
 };
 
@@ -2271,9 +2301,7 @@ class DateFormatCache {
       return static_cast<icu::SimpleDateFormat*>(it->second->clone());
     }
 
-    if (map_.size() > 8) {  // Cache at most 8 DateFormats.
-      map_.clear();
-    }
+    ClearCacheIfFull(map_);
     std::unique_ptr<icu::SimpleDateFormat> instance(
         CreateICUDateFormat(icu_locale, skeleton, generator, hc));
     if (instance == nullptr) return nullptr;
@@ -2282,7 +2310,7 @@ class DateFormatCache {
   }
 
  private:
-  std::map<std::string, std::unique_ptr<icu::SimpleDateFormat>> map_;
+  IntlCacheMap<icu::SimpleDateFormat> map_;
   base::Mutex mutex_;
 };
 
@@ -2539,6 +2567,9 @@ class DateTimePatternGeneratorCache {
         orig = icu::DateTimePatternGenerator::createInstance("root", status);
       }
       if (U_SUCCESS(status) && orig != nullptr) {
+        if (v8_flags.intl_date_time_pattern_generator_cache_eviction) {
+          ClearCacheIfFull(map_);
+        }
         map_[key].reset(orig);
       } else {
         DCHECK(status == U_MEMORY_ALLOCATION_ERROR);
@@ -2555,7 +2586,7 @@ class DateTimePatternGeneratorCache {
   }
 
  private:
-  std::map<std::string, std::unique_ptr<icu::DateTimePatternGenerator>> map_;
+  IntlCacheMap<icu::DateTimePatternGenerator> map_;
   base::Mutex mutex_;
 };
 
@@ -3104,6 +3135,7 @@ DirectHandle<String> IcuDateFieldIdToDateType(int32_t field_id,
       return isolate->factory()->literal_string();
     case UDAT_YEAR_FIELD:
     case UDAT_EXTENDED_YEAR_FIELD:
+    case UDAT_YEAR_WOY_FIELD:
       return isolate->factory()->year_string();
     case UDAT_YEAR_NAME_FIELD:
       return isolate->factory()->yearName_string();

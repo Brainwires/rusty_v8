@@ -28,6 +28,11 @@ config("rusty_v8_config") {
     "//v8:external_config",
     "//v8:toolchain",
     "//v8:features",
+
+    # binding.cc includes ICU's headers (unicode/locid.h, ...). V8 15.6 no
+    # longer forwards ICU's public config to its dependents, so without this
+    # the compiler finds a system ICU's headers instead, if any.
+    "//third_party/icu:icu_config",
   ]
   cflags = []
   if (is_win) {

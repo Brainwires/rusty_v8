@@ -4,8 +4,10 @@
 
 #include "src/objects/js-array-buffer.h"
 
+#include "src/api/api-inl.h"
 #include "src/execution/protectors-inl.h"
 #include "src/logging/counters.h"
+#include "src/objects/cpp-heap-object-wrapper-inl.h"
 #include "src/objects/js-array-buffer-inl.h"
 #include "src/objects/property-descriptor.h"
 #include "src/sandbox/check.h"
@@ -217,14 +219,19 @@ bool JSArrayBuffer::TryDetachViews(DirectHandle<JSArrayBuffer> array_buffer,
 void JSArrayBuffer::DetachInternal(DirectHandle<JSArrayBuffer> array_buffer,
                                    bool force_for_wasm_memory,
                                    Isolate* isolate) {
-  ArrayBufferExtension* extension = array_buffer->extension();
-
-  if (extension) {
+  {
     DisallowGarbageCollection disallow_gc;
-    isolate->heap()->DetachArrayBufferExtension(extension);
-    std::shared_ptr<BackingStore> backing_store =
-        array_buffer->RemoveExtension();
-    CHECK_IMPLIES(force_for_wasm_memory, backing_store->is_wasm_memory());
+    ArrayBufferExtension* extension =
+        array_buffer->extract_extension(isolate, disallow_gc);
+    if (extension) {
+      isolate->heap()->DetachArrayBufferExtension(extension);
+      // Prevent concurrent detachment vs background copying if an attacker
+      // swapped the extension pointer to a shared buffer's extension.
+      SBXCHECK(!extension->is_shared());
+      std::shared_ptr<BackingStore> backing_store =
+          extension->RemoveBackingStore();
+      CHECK_IMPLIES(force_for_wasm_memory, backing_store->is_wasm_memory());
+    }
   }
 
   array_buffer->set_was_detached(true, kReleaseStore);
@@ -237,6 +244,16 @@ void JSArrayBuffer::DetachInternal(DirectHandle<JSArrayBuffer> array_buffer,
   DCHECK(!array_buffer->is_shared());
   array_buffer->set_backing_store(isolate, EmptyBackingStoreBuffer());
   array_buffer->set_byte_length(0);
+
+  if (isolate->array_buffer_detach_callback() != nullptr) {
+    if (CppHeapObjectWrapper(*array_buffer)
+            .GetCppHeapWrappable(isolate, kAnyCppHeapPointer)) {
+      HandleScope scope(isolate);
+      isolate->array_buffer_detach_callback()(
+          reinterpret_cast<v8::Isolate*>(isolate),
+          Utils::ToLocal(array_buffer));
+    }
+  }
 }
 
 void JSArrayBuffer::MakeImmutable(Isolate* isolate) {
@@ -329,19 +346,6 @@ ArrayBufferExtension* JSArrayBuffer::CreateExtension(
   set_extension(extension);
   isolate->heap()->AppendArrayBufferExtension(extension);
   return extension;
-}
-
-std::shared_ptr<BackingStore> JSArrayBuffer::RemoveExtension() {
-  ArrayBufferExtension* extension = this->extension();
-  DCHECK_NOT_NULL(extension);
-  // Prevent concurrent detachment vs background copying if an attacker
-  // swapped the extension pointer to a shared buffer's extension.
-  SBXCHECK(!extension->is_shared());
-  auto result = extension->RemoveBackingStore();
-  // Remove pointer to extension such that the next GC will free it
-  // automatically.
-  set_extension(nullptr);
-  return result;
 }
 
 Handle<JSArrayBuffer> JSTypedArray::GetBuffer(Isolate* isolate) {

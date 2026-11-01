@@ -122,7 +122,7 @@ V8_OBJECT class ScopeInfo : public HeapObject {
   // Parameters allocated in the context count as context allocated locals. If
   // no contexts are allocated for this scope ContextLength returns 0.
   int ContextLength() const;
-  int ContextHeaderLength() const;
+  V8_EXPORT_PRIVATE int ContextHeaderLength() const;
 
   // Returns true if the respective contexts have a context extension slot.
   V8_EXPORT_PRIVATE bool HasContextExtensionSlot() const;
@@ -169,9 +169,6 @@ V8_OBJECT class ScopeInfo : public HeapObject {
   V8_EXPORT_PRIVATE void SetFunctionName(Tagged<UnionOf<Smi, String>> name);
   V8_EXPORT_PRIVATE void SetInferredFunctionName(Tagged<String> name);
 
-  // Does this scope belong to a function?
-  bool HasPositionInfo() const;
-
   bool IsWrappedFunctionScope() const;
 
   // Return if contexts are allocated for this scope.
@@ -199,7 +196,7 @@ V8_OBJECT class ScopeInfo : public HeapObject {
   int EndPosition() const;
   void SetPositionInfo(int start, int end);
 
-  int UniqueIdInScript() const;
+  V8_EXPORT_PRIVATE int UniqueIdInScript() const;
 
   Tagged<SourceTextModuleInfo> ModuleDescriptorInfo() const;
 
@@ -217,7 +214,7 @@ V8_OBJECT class ScopeInfo : public HeapObject {
 
   // Return the name of a given context local.
   // It should only be used if inlined local names.
-  Tagged<String> ContextInlinedLocalName(int var) const;
+  V8_EXPORT_PRIVATE Tagged<String> ContextInlinedLocalName(int var) const;
 
   // Return the mode of the given context local.
   VariableMode ContextLocalMode(int var) const;
@@ -292,7 +289,7 @@ V8_OBJECT class ScopeInfo : public HeapObject {
   void SetIsDebugEvaluateScope();
 
   // Return the outer ScopeInfo if present.
-  Tagged<ScopeInfo> OuterScopeInfo() const;
+  V8_EXPORT_PRIVATE Tagged<ScopeInfo> OuterScopeInfo() const;
 
   bool is_script_scope() const;
 
@@ -304,20 +301,12 @@ V8_OBJECT class ScopeInfo : public HeapObject {
   // come from debug evaluate but are different to IsDebugEvaluateScope().
   bool IsReplModeScope() const;
 
-  // For LiveEdit we ignore:
-  //   - position info: "unchanged" functions are allowed to move in a script
-  //   - module info: SourceTextModuleInfo::Equals compares exact FixedArray
-  //     addresses which will never match for separate instances.
-  //   - outer scope info: LiveEdit already analyses outer scopes of unchanged
-  //     functions. Also checking it here will break in really subtle cases
-  //     e.g. changing a let to a const in an outer function, which is fine.
-  bool Equals(Tagged<ScopeInfo> other, bool is_live_edit_compare = false,
+  bool Equals(Tagged<ScopeInfo> other,
               int* out_last_checked_field = nullptr) const;
 
   template <typename IsolateT>
   static Handle<ScopeInfo> Create(IsolateT* isolate, Zone* zone, Scope* scope,
-                                  MaybeDirectHandle<ScopeInfo> outer_scope,
-                                  FunctionKind closure_function_kind);
+                                  MaybeDirectHandle<ScopeInfo> outer_scope);
   V8_EXPORT_PRIVATE static DirectHandle<ScopeInfo> CreateForWithScope(
       Isolate* isolate, MaybeDirectHandle<ScopeInfo> outer_scope);
   V8_EXPORT_PRIVATE static DirectHandle<ScopeInfo> CreateForEmptyFunction(
@@ -421,6 +410,19 @@ V8_OBJECT class ScopeInfo : public HeapObject {
   inline int module_variables_properties(int i) const;
   inline void set_module_variables_properties(int i, int value);
 
+  // Present only for module scopes with at least
+  // kScopeInfoMaxInlinedLocalNamesSize module variables: maps a module
+  // variable's name to its entry index in module_variables, so ModuleIndex()
+  // does not have to scan the entries linearly. (Bundlers routinely emit
+  // modules with hundreds of imported/exported bindings, and every free
+  // variable of every lazily compiled function inside them is resolved
+  // through ModuleIndex().)
+  inline bool HasModuleVariablesHashtable() const;
+  inline Tagged<NameToIndexHashTable> module_variables_hashtable() const;
+  inline void set_module_variables_hashtable(
+      Tagged<NameToIndexHashTable> value,
+      WriteBarrierMode mode = UPDATE_WRITE_BARRIER);
+
   inline Tagged<DependentCode> dependent_code() const;
   inline void set_dependent_code(Tagged<DependentCode> value,
                                  WriteBarrierMode mode = UPDATE_WRITE_BARRIER);
@@ -441,6 +443,7 @@ V8_OBJECT class ScopeInfo : public HeapObject {
   inline int OuterScopeInfoOffset() const;
   inline int ModuleInfoOffset() const;
   inline int ModuleVariablesOffset() const;
+  inline int ModuleVariablesHashtableOffset() const;
   inline int DependentCodeOffset() const;
   inline int UnusedParameterBitsOffset() const;
 
@@ -489,6 +492,7 @@ V8_OBJECT class ScopeInfo : public HeapObject {
   int ModuleInfoIndex() const;
   int ModuleVariableCountIndex() const;
   int ModuleVariablesIndex() const;
+  int ModuleVariablesHashtableIndex() const;
   int DependentCodeIndex() const;
   int UnusedParameterBitsIndex() const;
 
@@ -546,7 +550,6 @@ V8_OBJECT class ScopeInfo : public HeapObject {
   friend class ScopeIterator;
   friend class CodeStubAssembler;
   friend class TorqueGeneratedBitFieldAsserts;
-  friend std::ostream& operator<<(std::ostream& os, VariableAllocationInfo var);
 
  public:
   // Relaxed-atomic flags word (ScopeFlags bit layout).
@@ -590,7 +593,8 @@ inline constexpr int ScopeInfo::ConvertOffsetToIndex(int offset) {
   return index;
 }
 
-std::ostream& operator<<(std::ostream& os, VariableAllocationInfo var);
+V8_EXPORT_PRIVATE std::ostream& operator<<(std::ostream& os,
+                                           VariableAllocationInfo var);
 
 }  // namespace internal
 }  // namespace v8

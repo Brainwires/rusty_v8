@@ -55,6 +55,14 @@ class ExternalPointerMember {
     store<kTagRange.first>(isolate, value);
   }
 
+  template <ExternalPointerTag tag>
+  inline Address exchange(IsolateForSandbox isolate, Address value);
+  inline Address exchange(IsolateForSandbox isolate, Address value)
+    requires(kTagRange.Size() == 1)
+  {
+    return exchange<kTagRange.first>(isolate, value);
+  }
+
   inline ExternalPointer_t load_encoded() const;
   inline void store_encoded(ExternalPointer_t value);
 
@@ -131,14 +139,12 @@ V8_INLINE void InitLazyExternalPointerField(Address field_address);
 // Creates and initializes an entry in the external pointer table and writes the
 // handle for that entry to the field.
 template <ExternalPointerTag tag>
-V8_INLINE void InitExternalPointerField(Address host_address,
-                                        Address field_address,
-                                        IsolateForSandbox isolate,
-                                        Address value);
-V8_INLINE void InitExternalPointerField(Address host_address,
-                                        Address field_address,
-                                        IsolateForSandbox isolate,
-                                        ExternalPointerTag tag, Address value);
+V8_INLINE ExternalPointerHandle
+InitExternalPointerField(Address host_address, Address field_address,
+                         IsolateForSandbox isolate, Address value);
+V8_INLINE ExternalPointerHandle InitExternalPointerField(
+    Address host_address, Address field_address, IsolateForSandbox isolate,
+    ExternalPointerTag tag, Address value);
 
 // If the sandbox is enabled: reads the ExternalPointerHandle from the field and
 // loads the corresponding external pointer from the external pointer table. If
@@ -167,6 +173,11 @@ V8_INLINE void WriteExternalPointerField(Address field_address,
 V8_INLINE void WriteExternalPointerField(Address field_address,
                                          IsolateForSandbox isolate,
                                          ExternalPointerTag tag, Address value);
+
+template <ExternalPointerTag tag>
+V8_INLINE Address ExchangeExternalPointerField(Address field_address,
+                                               IsolateForSandbox isolate,
+                                               Address value);
 
 }  // namespace internal
 }  // namespace v8

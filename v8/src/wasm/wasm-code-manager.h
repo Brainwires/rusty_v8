@@ -46,6 +46,7 @@ namespace internal {
 class CodeDesc;
 class InstructionStream;
 class Isolate;
+class WritableJitAllocation;
 
 namespace wasm {
 
@@ -641,7 +642,7 @@ class WasmCodeAllocator {
 
 class V8_EXPORT_PRIVATE NativeModule final {
  public:
-  static constexpr ExternalPointerTag kManagedTag = kWasmNativeModuleTag;
+  static constexpr ManagedTypeId kTypeID = ManagedTypeId::kWasmNativeModule;
 
 #if V8_TARGET_ARCH_X64 || V8_TARGET_ARCH_S390X || V8_TARGET_ARCH_ARM64 || \
     V8_TARGET_ARCH_PPC64 || V8_TARGET_ARCH_LOONG64 ||                     \
@@ -706,8 +707,9 @@ class V8_EXPORT_PRIVATE NativeModule final {
       base::Vector<const uint8_t> deopt_data, WasmCode::Kind kind,
       ExecutionTier tier, base::Vector<const uint8_t> effect_handlers);
 
-  // Adds anonymous code for testing purposes.
-  WasmCode* AddCodeForTesting(DirectHandle<Code> code,
+  // Adds anonymous code for testing purposes. Requires an active
+  // {WasmCodeRefScope} and a successful {result} without assumptions.
+  WasmCode* AddCodeForTesting(const WasmCompilationResult& result,
                               uint64_t signature_hash) V8_LIFETIME_BOUND;
 
   // Allocates and initializes the {lazy_compile_table_} and initializes the
@@ -1014,6 +1016,16 @@ class V8_EXPORT_PRIVATE NativeModule final {
                             const CodeSpaceData&, uint32_t slot_index,
                             Address target);
 
+  // Apply relocations to newly copied code in {dst_code_bytes}.
+  // {reserved_code} is the pre-allocated memory for the {WasmCode} object,
+  // needed for self-referential WASM_CODE_POINTER relocations. Does not require
+  // {allocation_mutex_}.
+  void ApplyRelocations(WritableJitAllocation& jit_allocation,
+                        base::Vector<uint8_t> dst_code_bytes,
+                        base::Vector<const uint8_t> reloc_info,
+                        const CodeDesc& desc, const JumpTablesRef& jump_tables,
+                        WasmCode* reserved_code) const;
+
   // Called by the {WasmCodeAllocator} to register a new code space.
   void AddCodeSpaceLocked(base::AddressRegion);
 
@@ -1037,10 +1049,6 @@ class V8_EXPORT_PRIVATE NativeModule final {
   // access the engine (like the code allocator), so that it's destructor runs
   // last.
   OperationsBarrier::Token engine_scope_;
-
-  // {WasmCodeAllocator} manages all code reservations and allocations for this
-  // {NativeModule}.
-  WasmCodeAllocator code_allocator_;
 
   // Features enabled for this module. We keep a copy of the features that
   // were enabled at the time of the creation of this native module,
@@ -1133,6 +1141,12 @@ class V8_EXPORT_PRIVATE NativeModule final {
 
   std::unique_ptr<NamesProvider> names_provider_;
 
+  // {WasmCodeAllocator} manages all code reservations and allocations for this
+  // {NativeModule}. It must be declared after {owned_code_} so that its
+  // destructor runs before {owned_code_}, removing memory ranges from the
+  // global {WasmCodeManager::lookup_map_} before code objects are freed.
+  WasmCodeAllocator code_allocator_;
+
   DebugState debug_state_ = kNotDebugging;
 
   // End of fields protected by {allocation_mutex_}.
@@ -1164,7 +1178,7 @@ class V8_EXPORT_PRIVATE NativeModule final {
   // The stack wrappers are compiled lazily and shared across modules, but the
   // cache itself only holds weak pointers. Keep strong pointers in the module
   // to keep them alive.
-  base::Mutex stack_wrapper_mutex_;
+  mutable base::Mutex stack_wrapper_mutex_;
   std::unordered_set<std::shared_ptr<WasmWrapperHandle>> stack_entry_wrappers_;
 };
 

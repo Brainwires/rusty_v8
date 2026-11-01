@@ -57,10 +57,10 @@ class V8InspectorSessionImpl : public V8InspectorSession,
   int sessionId() const { return m_sessionId; }
 
   Response findInjectedScript(
-      int contextId, InjectedScript*&,
+      int contextId, std::shared_ptr<InjectedScript>&,
       std::shared_ptr<InspectedContext>* inspectedContext = nullptr);
   Response findInjectedScript(
-      RemoteObjectIdBase*, InjectedScript*&,
+      RemoteObjectIdBase*, std::shared_ptr<InjectedScript>&,
       std::shared_ptr<InspectedContext>* inspectedContext = nullptr);
   void reset();
   void discardInjectedScripts();
@@ -105,6 +105,7 @@ class V8InspectorSessionImpl : public V8InspectorSession,
   void cancelPauseOnNextStatement() override;
   void breakProgram(StringView breakReason, StringView breakDetails) override;
   void setSkipAllPauses(bool) override;
+  void setSkipAllPausesForInternalUse(bool) override;
   void resume(bool terminateOnResume = false) override;
   void stepOver() override;
   std::vector<std::unique_ptr<protocol::Debugger::API::SearchMatch>>

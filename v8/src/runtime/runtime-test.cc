@@ -37,6 +37,7 @@
 #include "src/objects/abstract-code-inl.h"
 #include "src/objects/bytecode-array.h"
 #include "src/objects/js-collection-inl.h"
+#include "src/objects/object-conversions-inl.h"
 #include "src/profiler/heap-profiler.h"
 #include "src/sandbox/bytecode-verifier.h"
 #include "src/utils/utils.h"
@@ -99,8 +100,7 @@ V8_WARN_UNUSED_RESULT bool CheckMarkedForManualOptimization(
     PrintF(
         " should be prepared for optimization with "
         "%%PrepareFunctionForOptimization before  "
-        "%%OptimizeFunctionOnNextCall / %%OptimizeMaglevOnNextCall / "
-        "%%OptimizeOsr ");
+        "%%OptimizeFunctionOnNextCall / %%OptimizeMaglevOnNextCall");
     return false;
   }
   return true;
@@ -254,7 +254,8 @@ RUNTIME_FUNCTION(Runtime_DeoptimizeFunction) {
   }
 
   if (function->HasAttachedOptimizedCode(isolate)) {
-    Deoptimizer::DeoptimizeFunction(*function, LazyDeoptimizeReason::kTesting);
+    Deoptimizer::DeoptimizeFunction(*function, LazyDeoptimizeReason::kTesting,
+                                    function->code(isolate));
   }
 
   return ReadOnlyRoots(isolate).undefined_value();
@@ -271,7 +272,8 @@ RUNTIME_FUNCTION(Runtime_DeoptimizeNow) {
   CHECK_UNLESS_FUZZING(!function.is_null());
 
   if (function->HasAttachedOptimizedCode(isolate)) {
-    Deoptimizer::DeoptimizeFunction(*function, LazyDeoptimizeReason::kTesting);
+    Deoptimizer::DeoptimizeFunction(*function, LazyDeoptimizeReason::kTesting,
+                                    function->code(isolate));
   }
 
   return ReadOnlyRoots(isolate).undefined_value();
@@ -657,13 +659,12 @@ namespace {
 
 void FinalizeOptimization(Isolate* isolate) {
   DCHECK(isolate->concurrent_recompilation_enabled());
-  isolate->optimizing_compile_dispatcher()->WaitUntilCompilationJobsDone();
+  isolate->WaitForConcurrentOptimizationJobs();
   isolate->optimizing_compile_dispatcher()->InstallOptimizedFunctions();
   isolate->optimizing_compile_dispatcher()->set_finalize(true);
 
 #if V8_ENABLE_MAGLEV
   if (isolate->maglev_concurrent_dispatcher()->is_enabled()) {
-    isolate->maglev_concurrent_dispatcher()->AwaitCompileJobs();
     isolate->maglev_concurrent_dispatcher()->FinalizeFinishedJobs();
   }
 #endif  // V8_ENABLE_MAGLEV
@@ -742,10 +743,15 @@ RUNTIME_FUNCTION(Runtime_OptimizeOsr) {
 
   CHECK_UNLESS_FUZZING(!function->shared()->all_optimization_disabled());
 
-  // If we're fuzzing, allow having not marked the function for manual
-  // optimization (if the steps below succeed).
-  if (!v8_flags.fuzzing) {
-    CHECK(CheckMarkedForManualOptimization(isolate, *function));
+  if (!v8_flags.fuzzing &&
+      !ManualOptimizationTable::IsMarkedForManualOptimization(isolate,
+                                                              *function)) {
+    PrintF("Warning: Function ");
+    ShortPrint(*function);
+    PrintF(
+        " might have to be prepared for optimization with "
+        "%%PrepareFunctionForOptimization before  "
+        "%%OptimizeOsr");
   }
 
   if (function->HasAvailableOptimizedCode(isolate) &&
@@ -911,7 +917,8 @@ RUNTIME_FUNCTION(Runtime_GetOptimizationStatus) {
   if (!isolate->use_optimizer()) {
     status |= static_cast<int>(OptimizationStatus::kNeverOptimize);
   }
-  if (v8_flags.deopt_every_n_times) {
+  if (v8_flags.deopt_every_n_times || v8_flags.stress_flush_code ||
+      v8_flags.gc_interval > 0 || v8_flags.random_gc_interval > 0) {
     status |= static_cast<int>(OptimizationStatus::kMaybeDeopted);
   }
   if (v8_flags.optimize_on_next_call_optimizes_to_maglev) {
@@ -1027,14 +1034,7 @@ RUNTIME_FUNCTION(Runtime_DisableOptimizationFinalization) {
 }
 
 RUNTIME_FUNCTION(Runtime_WaitForBackgroundOptimization) {
-  if (isolate->concurrent_recompilation_enabled()) {
-    isolate->optimizing_compile_dispatcher()->WaitUntilCompilationJobsDone();
-#if V8_ENABLE_MAGLEV
-    if (isolate->maglev_concurrent_dispatcher()->is_enabled()) {
-      isolate->maglev_concurrent_dispatcher()->AwaitCompileJobs();
-    }
-#endif  // V8_ENABLE_MAGLEV
-  }
+  isolate->WaitForConcurrentOptimizationJobs();
   return ReadOnlyRoots(isolate).undefined_value();
 }
 
@@ -1095,7 +1095,7 @@ void call_as_function(const v8::FunctionCallbackInfo<v8::Value>& info) {
   v8::Isolate* isolate = info.GetIsolate();
   auto context = isolate->GetCurrentContext();
   auto global = context->Global();
-  auto target_function_name = info.Data().As<v8::String>();
+  auto target_function_name = info.DataV2().As<v8::Value>().As<v8::String>();
   v8::Local<v8::Function> target;
   {
     Local<Value> result;
@@ -1200,6 +1200,23 @@ RUNTIME_FUNCTION(Runtime_SetAllocationTimeout) {
   return ReadOnlyRoots(isolate).undefined_value();
 }
 
+RUNTIME_FUNCTION(Runtime_SetDispatchTableGCInterval) {
+  SealHandleScope shs(isolate);
+  CHECK_UNLESS_FUZZING(args.length() == 1);
+#ifdef V8_ENABLE_ALLOCATION_TIMEOUT
+  CONVERT_INT32_ARG_FUZZ_SAFE(interval, 0);
+  isolate->heap()->set_dispatch_table_gc_interval(interval);
+#else   // !V8_ENABLE_ALLOCATION_TIMEOUT
+  static std::atomic_flag printed_warning = ATOMIC_FLAG_INIT;
+  if (!printed_warning.test_and_set()) {
+    base::OS::PrintError(
+        "Warning: %%SetDispatchTableGCInterval has no effect in this build. "
+        "Set the `v8_enable_test_features` GN arg to enable it.\n");
+  }
+#endif  // !V8_ENABLE_ALLOCATION_TIMEOUT
+  return ReadOnlyRoots(isolate).undefined_value();
+}
+
 namespace {
 
 int FixedArrayLenFromSize(int size) {
@@ -1294,7 +1311,7 @@ static void DebugPrintImpl(Tagged<MaybeObject> maybe_object, std::ostream& os) {
     os << "DebugPrint: ";
     if (weak) os << "[weak] ";
     Print(object, os);
-    if (IsHeapObject(object)) {
+    if (IsHeapObject(object) && !IsInaccessible(Cast<HeapObject>(object))) {
       Print(Cast<HeapObject>(object)->map(), os);
     }
 #else
@@ -1850,6 +1867,25 @@ RUNTIME_FUNCTION(Runtime_RegexpHasNativeCode) {
   return isolate->heap()->ToBoolean(result);
 }
 
+// Returns true iff the regexp cannot match a string starting with |c|,
+// according to the quick-check filters.  Lets tests assert that a filter was
+// actually built, which exec results alone cannot show.
+RUNTIME_FUNCTION(Runtime_RegexpQuickCheckRejects) {
+  SealHandleScope shs(isolate);
+  CHECK_UNLESS_FUZZING(args.length() == 2);
+  CHECK_UNLESS_FUZZING(IsJSRegExp(args[0]));
+  CHECK_UNLESS_FUZZING(IsString(args[1]));
+  auto regexp = args.at<JSRegExp>(0);
+  auto string = args.at<String>(1);
+  CHECK_UNLESS_FUZZING(string->length() == 1);
+  if (!regexp->has_data()) return ReadOnlyRoots(isolate).false_value();
+  DisallowGarbageCollection no_gc;
+  String::FlatContent content = string->GetFlatContent(no_gc);
+  if (!content.IsOneByte()) return ReadOnlyRoots(isolate).false_value();
+  return isolate->heap()->ToBoolean(
+      regexp->data(isolate)->QuickCheckRejects(content.ToOneByteVector(), 0));
+}
+
 RUNTIME_FUNCTION(Runtime_RegexpTypeTag) {
   HandleScope shs(isolate);
   CHECK_UNLESS_FUZZING(args.length() == 1);
@@ -2131,8 +2167,8 @@ RUNTIME_FUNCTION(Runtime_EnableCodeLoggingForTesting) {
                              DirectHandle<SharedFunctionInfo> shared) final {}
     void CodeDeoptEvent(DirectHandle<Code> code, DeoptimizeKind kind,
                         Address pc, int fp_to_sp_delta) final {}
-    void CodeDependencyChangeEvent(DirectHandle<Code> code,
-                                   DirectHandle<SharedFunctionInfo> shared,
+    void CodeDependencyChangeEvent(Tagged<Code> code,
+                                   Tagged<SharedFunctionInfo> shared,
                                    const char* reason) final {}
     void WeakCodeClearEvent() final {}
 
@@ -2436,6 +2472,12 @@ RUNTIME_FUNCTION(Runtime_GetFeedback) {
       } else if (interpreter::Bytecodes::IsBinaryOpWithEmbeddedFeedback(
                      bytecode)) {
         out << "BinaryOp";
+        feedback_value.slot_kind_ = out.str();
+        out << ":" << it.GetEmbeddedOperationHint<BinaryOperationFeedback>();
+        feedback_value.details_ = out.str();
+      } else if (interpreter::Bytecodes::IsUnaryOpWithEmbeddedFeedback(
+                     bytecode)) {
+        out << "UnaryOp";
         feedback_value.slot_kind_ = out.str();
         out << ":" << it.GetEmbeddedOperationHint<BinaryOperationFeedback>();
         feedback_value.details_ = out.str();
@@ -2836,7 +2878,8 @@ RUNTIME_FUNCTION(Runtime_InstallBytecode) {
   shared->set_bytecode_array(*new_bytecode);
 
   if (function->HasAttachedOptimizedCode(isolate)) {
-    Deoptimizer::DeoptimizeFunction(*function, LazyDeoptimizeReason::kTesting);
+    Deoptimizer::DeoptimizeFunction(*function, LazyDeoptimizeReason::kTesting,
+                                    function->code(isolate));
   }
   function->UpdateCode(isolate,
                        *BUILTIN_CODE(isolate, InterpreterEntryTrampoline));

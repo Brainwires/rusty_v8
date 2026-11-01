@@ -45,6 +45,7 @@
 
 #include "absl/algorithm/container.h"
 #include "absl/base/attributes.h"
+#include "absl/base/config.h"
 #include "absl/container/hash_container_defaults.h"
 #include "absl/container/internal/container_memory.h"
 #include "absl/container/internal/node_slot_policy.h"
@@ -167,11 +168,18 @@ class ABSL_ATTRIBUTE_OWNER node_hash_map
   //   // Move is guaranteed efficient
   //   absl::node_hash_map<int, std::string> map5(std::move(map4));
   //
+  //   // After the move, map4 is in a valid but unspecified state. The only
+  //   // operations guaranteed to be safe on a moved-from map are destruction,
+  //   // assignment, and clear(). Any other operation (e.g. size(), empty(),
+  //   // iteration) results in undefined behavior.
+  //
   // * Move assignment operator
   //
   //   // May be efficient if allocators are compatible
   //   absl::node_hash_map<int, std::string> map6;
   //   map6 = std::move(map5);
+  //
+  //   // Same moved-from guarantees apply to map5 after this operation.
   //
   // * Range constructor
   //
@@ -421,10 +429,6 @@ class ABSL_ATTRIBUTE_OWNER node_hash_map
   //   `node_hash_map` does not contain an element with a matching key, this
   //   function returns an empty node handle.
   //
-  // NOTE: when compiled in an earlier version of C++ than C++17,
-  // `node_type::key()` returns a const reference to the key instead of a
-  // mutable reference. We cannot safely return a mutable reference without
-  // std::launder (which is not available before C++17).
   using Base::extract;
 
   // node_hash_map::merge()
@@ -678,11 +682,11 @@ class NodeHashMapPolicy
   static Value& value(value_type* elem) { return elem->second; }
   static const Value& value(const value_type* elem) { return elem->second; }
 
-  template <class Hash, bool kIsDefault>
+  template <class Hash, bool kIsAbsl, size_t kSeedShift>
   static constexpr HashSlotFn get_hash_slot_fn() {
     return memory_internal::IsLayoutCompatible<Key, Value>::value
                ? &TypeErasedDerefAndApplyToSlotFirstFn<Hash, value_type,
-                                                       kIsDefault>
+                                                       kIsAbsl, kSeedShift>
                : nullptr;
   }
 };

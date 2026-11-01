@@ -245,8 +245,6 @@ class CordTestPeer {
 ABSL_NAMESPACE_END
 }  // namespace absl
 
-
-
 // The CordTest fixture runs all tests with and without expected CRCs being set
 // on the subject Cords.
 class CordTest : public testing::TestWithParam<bool /*useCrc*/> {
@@ -278,9 +276,9 @@ INSTANTIATE_TEST_SUITE_P(WithParam, CordTest, testing::Bool(),
 
 TEST(CordRepFlat, AllFlatCapacities) {
   // Explicitly and redundantly assert built-in min/max limits
-  static_assert(absl::cord_internal::kFlatOverhead < 32, "");
-  static_assert(absl::cord_internal::kMinFlatSize == 32, "");
-  static_assert(absl::cord_internal::kMaxLargeFlatSize == 256 << 10, "");
+  static_assert(absl::cord_internal::kFlatOverhead < 32);
+  static_assert(absl::cord_internal::kMinFlatSize == 32);
+  static_assert(absl::cord_internal::kMaxLargeFlatSize == 256 << 10);
   EXPECT_EQ(absl::cord_internal::TagToAllocatedSize(FLAT), 32);
   EXPECT_EQ(absl::cord_internal::TagToAllocatedSize(MAX_FLAT_TAG), 256 << 10);
 
@@ -1630,8 +1628,8 @@ TEST_P(CordTest, CompareRandomComparisons) {
   for (int i = 0; i < kIters; i++) {
     absl::Cord c, d;
     for (int j = 0; j < (i % 7) + 1; j++) {
-      c.Append(a[GetUniformRandomUpTo(&rng, ABSL_ARRAYSIZE(a))]);
-      d.Append(a[GetUniformRandomUpTo(&rng, ABSL_ARRAYSIZE(a))]);
+      c.Append(a[GetUniformRandomUpTo(&rng, std::size(a))]);
+      d.Append(a[GetUniformRandomUpTo(&rng, std::size(a))]);
     }
     std::bernoulli_distribution coin_flip(0.5);
     MaybeHarden(c);
@@ -1649,8 +1647,8 @@ void CompareOperators() {
   EXPECT_TRUE(a == a);
   // For pointer type (i.e. `const char*`), operator== compares the address
   // instead of the string, so `a == const char*("a")` isn't necessarily true.
-  EXPECT_TRUE(std::is_pointer<T1>::value || a == T1("a"));
-  EXPECT_TRUE(std::is_pointer<T2>::value || a == T2("a"));
+  EXPECT_TRUE(std::is_pointer_v<T1> || a == T1("a"));
+  EXPECT_TRUE(std::is_pointer_v<T2> || a == T2("a"));
   EXPECT_FALSE(a == b);
 
   EXPECT_TRUE(a != b);
@@ -2365,37 +2363,30 @@ TEST_P(CordTest, MakeFragmentedCordFromVector) {
 }
 
 TEST_P(CordTest, CordChunkIteratorTraits) {
-  static_assert(std::is_copy_constructible<absl::Cord::ChunkIterator>::value,
-                "");
-  static_assert(std::is_copy_assignable<absl::Cord::ChunkIterator>::value, "");
+  static_assert(std::is_copy_constructible_v<absl::Cord::ChunkIterator>);
+  static_assert(std::is_copy_assignable_v<absl::Cord::ChunkIterator>);
 
   // Move semantics to satisfy swappable via std::swap
-  static_assert(std::is_move_constructible<absl::Cord::ChunkIterator>::value,
-                "");
-  static_assert(std::is_move_assignable<absl::Cord::ChunkIterator>::value, "");
+  static_assert(std::is_move_constructible_v<absl::Cord::ChunkIterator>);
+  static_assert(std::is_move_assignable_v<absl::Cord::ChunkIterator>);
 
   static_assert(
-      std::is_same<
+      std::is_same_v<
           std::iterator_traits<absl::Cord::ChunkIterator>::iterator_category,
-          std::input_iterator_tag>::value,
-      "");
+          std::input_iterator_tag>);
+  static_assert(std::is_same_v<
+                std::iterator_traits<absl::Cord::ChunkIterator>::value_type,
+                absl::string_view>);
   static_assert(
-      std::is_same<std::iterator_traits<absl::Cord::ChunkIterator>::value_type,
-                   absl::string_view>::value,
-      "");
-  static_assert(
-      std::is_same<
+      std::is_same_v<
           std::iterator_traits<absl::Cord::ChunkIterator>::difference_type,
-          ptrdiff_t>::value,
-      "");
+          ptrdiff_t>);
   static_assert(
-      std::is_same<std::iterator_traits<absl::Cord::ChunkIterator>::pointer,
-                   const absl::string_view*>::value,
-      "");
+      std::is_same_v<std::iterator_traits<absl::Cord::ChunkIterator>::pointer,
+                     const absl::string_view*>);
   static_assert(
-      std::is_same<std::iterator_traits<absl::Cord::ChunkIterator>::reference,
-                   absl::string_view>::value,
-      "");
+      std::is_same_v<std::iterator_traits<absl::Cord::ChunkIterator>::reference,
+                     absl::string_view>);
 }
 
 static void VerifyChunkIterator(const absl::Cord& cord,
@@ -2554,37 +2545,29 @@ TEST_P(CordTest, AdvanceAndReadOnSubstringDataEdge) {
 }
 
 TEST_P(CordTest, CharIteratorTraits) {
-  static_assert(std::is_copy_constructible<absl::Cord::CharIterator>::value,
-                "");
-  static_assert(std::is_copy_assignable<absl::Cord::CharIterator>::value, "");
+  static_assert(std::is_copy_constructible_v<absl::Cord::CharIterator>);
+  static_assert(std::is_copy_assignable_v<absl::Cord::CharIterator>);
 
   // Move semantics to satisfy swappable via std::swap
-  static_assert(std::is_move_constructible<absl::Cord::CharIterator>::value,
-                "");
-  static_assert(std::is_move_assignable<absl::Cord::CharIterator>::value, "");
+  static_assert(std::is_move_constructible_v<absl::Cord::CharIterator>);
+  static_assert(std::is_move_assignable_v<absl::Cord::CharIterator>);
 
   static_assert(
-      std::is_same<
+      std::is_same_v<
           std::iterator_traits<absl::Cord::CharIterator>::iterator_category,
-          std::input_iterator_tag>::value,
-      "");
+          std::input_iterator_tag>);
   static_assert(
-      std::is_same<std::iterator_traits<absl::Cord::CharIterator>::value_type,
-                   char>::value,
-      "");
+      std::is_same_v<std::iterator_traits<absl::Cord::CharIterator>::value_type,
+                     char>);
+  static_assert(std::is_same_v<
+                std::iterator_traits<absl::Cord::CharIterator>::difference_type,
+                ptrdiff_t>);
   static_assert(
-      std::is_same<
-          std::iterator_traits<absl::Cord::CharIterator>::difference_type,
-          ptrdiff_t>::value,
-      "");
+      std::is_same_v<std::iterator_traits<absl::Cord::CharIterator>::pointer,
+                     const char*>);
   static_assert(
-      std::is_same<std::iterator_traits<absl::Cord::CharIterator>::pointer,
-                   const char*>::value,
-      "");
-  static_assert(
-      std::is_same<std::iterator_traits<absl::Cord::CharIterator>::reference,
-                   const char&>::value,
-      "");
+      std::is_same_v<std::iterator_traits<absl::Cord::CharIterator>::reference,
+                     const char&>);
 }
 
 static void VerifyCharIterator(const absl::Cord& cord) {
@@ -3429,69 +3412,3 @@ TEST(CordThreeWayComparisonTest, CompareCordsAndStringViews) {
             std::strong_ordering::greater);
 #endif
 }
-
-#if defined(GTEST_HAS_DEATH_TEST) && defined(ABSL_INTERNAL_CORD_HAVE_SANITIZER)
-
-// Returns an expected poison / uninitialized death message expression.
-const char* MASanDeathExpr() {
-  return "(use-after-poison|use-of-uninitialized-value)";
-}
-
-TEST(CordSanitizerTest, SanitizesEmptyCord) {
-  absl::Cord cord;
-  const char* data = cord.Flatten().data();
-  EXPECT_DEATH(EXPECT_EQ(data[0], 0), MASanDeathExpr());
-}
-
-TEST(CordSanitizerTest, SanitizesSmallCord) {
-  absl::Cord cord("Hello");
-  const char* data = cord.Flatten().data();
-  EXPECT_DEATH(EXPECT_EQ(data[5], 0), MASanDeathExpr());
-}
-
-TEST(CordSanitizerTest, SanitizesCordOnSetSSOValue) {
-  absl::Cord cord("String that is too big to be an SSO value");
-  cord = "Hello";
-  const char* data = cord.Flatten().data();
-  EXPECT_DEATH(EXPECT_EQ(data[5], 0), MASanDeathExpr());
-}
-
-TEST(CordSanitizerTest, SanitizesCordOnCopyCtor) {
-  absl::Cord src("hello");
-  absl::Cord dst(src);
-  const char* data = dst.Flatten().data();
-  EXPECT_DEATH(EXPECT_EQ(data[5], 0), MASanDeathExpr());
-}
-
-TEST(CordSanitizerTest, SanitizesCordOnMoveCtor) {
-  absl::Cord src("hello");
-  absl::Cord dst(std::move(src));
-  const char* data = dst.Flatten().data();
-  EXPECT_DEATH(EXPECT_EQ(data[5], 0), MASanDeathExpr());
-}
-
-TEST(CordSanitizerTest, SanitizesCordOnAssign) {
-  absl::Cord src("hello");
-  absl::Cord dst;
-  dst = src;
-  const char* data = dst.Flatten().data();
-  EXPECT_DEATH(EXPECT_EQ(data[5], 0), MASanDeathExpr());
-}
-
-TEST(CordSanitizerTest, SanitizesCordOnMoveAssign) {
-  absl::Cord src("hello");
-  absl::Cord dst;
-  dst = std::move(src);
-  const char* data = dst.Flatten().data();
-  EXPECT_DEATH(EXPECT_EQ(data[5], 0), MASanDeathExpr());
-}
-
-TEST(CordSanitizerTest, SanitizesCordOnSsoAssign) {
-  absl::Cord src("hello");
-  absl::Cord dst("String that is too big to be an SSO value");
-  dst = src;
-  const char* data = dst.Flatten().data();
-  EXPECT_DEATH(EXPECT_EQ(data[5], 0), MASanDeathExpr());
-}
-
-#endif  // GTEST_HAS_DEATH_TEST && ABSL_INTERNAL_CORD_HAVE_SANITIZER

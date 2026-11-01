@@ -311,10 +311,16 @@ config("default_include_dirs") {
   ]
 }
 
-# Compiler instrumentation can introduce dependencies in DSOs to symbols in
-# the executable they are loaded into, so they are unresolved at link-time.
+# On platforms like Linux and ChromeOS, compiler instrumentation (e.g. ASan,
+# UBSan) can introduce dependencies in DSOs to sanitizer runtime symbols that
+# are statically linked into the main executable rather than each DSO. These
+# symbols are resolved dynamically at runtime by the executable, so they are
+# unresolved at DSO link time and require disabling -Wl,-z,defs.
+# On Android, DSOs link directly against the sanitizer runtime DSO (e.g.
+# libclang_rt.asan-*-android.so), so all sanitizer symbols are resolved at link
+# time and -Wl,-z,defs can safely remain enabled to catch missing symbols.
 config("no_unresolved_symbols") {
-  if (!using_sanitizer &&
+  if ((!using_sanitizer || is_android) &&
       (is_linux || is_chromeos || is_android || is_fuchsia)) {
     ldflags = [
       "-Wl,-z,defs",
@@ -502,6 +508,10 @@ config("compiler") {
         "_LARGEFILE_SOURCE",
         "_LARGEFILE64_SOURCE",
       ]
+    }
+
+    if (current_os == "aix") {
+      defines += [ "__LIBC_NO_CPP_MATH_OVERLOADS__" ]
     }
 
     if (exclude_unwind_tables) {
@@ -912,6 +922,8 @@ config("compiler") {
   if (compiler_timing) {
     if (is_clang) {
       cflags += [ "-ftime-trace" ]
+      c_additional_outputs =
+          [ "{{target_out_dir}}/{{label_name}}/{{source_name_part}}.json" ]
       if (use_lld && is_mac) {
         ldflags += [ "-Wl,--time-trace" ]
       }
@@ -1533,22 +1545,55 @@ config("clang_revision") {
 
     if (toolchain_has_rust && _perform_consistency_checks &&
         !rust_force_head_revision) {
-      # Ensure that the synced rust version matches what's in git.
-      _rust_revision_lines =
-          filter_include(read_file("//tools/rust/update_rust.py", "list lines"),
-                         [ "RUST_*REVISION = *" ])
-      _py_revision =
-          string_replace(_rust_revision_lines[0], "RUST_REVISION = '", "")
-      _py_revision = string_replace(_py_revision, "'", "")
-      _py_subrevision =
-          string_replace(_rust_revision_lines[1], "RUST_SUB_REVISION = ", "")
-      _expected_rust_revision = "$_py_revision-$_py_subrevision"
+      # Ensure that synced rust, crubit, and bindgen versions match what's in
+      # git.
+      _rust_update_lines =
+          read_file("//tools/rust/update_rust.py", "list lines")
+      _version_lines =
+          read_file("//third_party/rust-toolchain/VERSION", "list lines")
 
-      # Ensure the rust version matches the clang version.
-      assert(
-          filter_include([ rustc_revision ],
-                         [ "*-$_expected_rust_revision-*" ]) != [],
-          "rustc_revision=\"$rustc_revision\" but update_rust.py expected \"$_expected_rust_revision\". Run \"gclient sync\"?")
+      # The rust revision combines two lines of the file, so we need to do
+      # some preprocessing to combine them.
+      _lines = filter_include(_rust_update_lines, [ "RUST_*REVISION = *" ])
+      _rust_rev =
+          string_replace(string_replace(_lines[0], "RUST_REVISION = '", ""),
+                         "'",
+                         "")
+      _rust_subrev = string_replace(_lines[1], "RUST_SUB_REVISION = ", "")
+
+      _tools = [
+        {
+          name = "rustc"
+          expected_pattern = "rustc *$_rust_rev-$_rust_subrev-*"
+        },
+        {
+          name = "crubit"
+          update_variable = "CRUBIT_REVISION"
+        },
+        {
+          name = "bindgen"
+          update_variable = "BINDGEN_REVISION"
+        },
+      ]
+
+      foreach(_tool, _tools) {
+        if (defined(_tool.expected_pattern)) {
+          _expected = _tool.expected_pattern
+        } else {
+          _lines = []
+          _lines = filter_include(_rust_update_lines,
+                                  [ "${_tool.update_variable} = *" ])
+          _expected =
+              string_replace(string_replace(_lines[0],
+                                            "${_tool.update_variable} = '",
+                                            "${_tool.name}: "),
+                             "'",
+                             "")
+        }
+        assert(
+            filter_include(_version_lines, [ _expected ]) != [],
+            "${_tool.name} revision in //third_party/rust-toolchain/VERSION does not match update_rust.py. Run \"gclient sync\"?")
+      }
     }
 
     # This is here so that all files get recompiled after a clang roll and
@@ -1592,7 +1637,7 @@ config("clang_warning_suppression") {
 # See also: https://crbug.com/40891132#comment10
 ubsan_hardening("c_array_bounds") {
   sanitizer = "array-bounds"
-  condition = !(is_asan && target_cpu == "x86") && !is_wasm
+  condition = !(is_asan && target_cpu == "x86")
 
   # Because we've enabled array-bounds sanitizing we also want to suppress
   # the related warning about "unsafe-buffer-usage-in-static-sized-array",
@@ -1606,7 +1651,18 @@ ubsan_hardening("c_array_bounds") {
 # `NOTREACHED()` at the end of such functions.
 ubsan_hardening("return") {
   sanitizer = "return"
-  condition = !is_wasm
+}
+
+# Enable `-fsanitize=unreachable` to crash deterministically if control
+# flow hits an unreachable point.
+ubsan_hardening("unreachable") {
+  sanitizer = "unreachable"
+
+  # TODO(crbug.com/501143596):
+  # 1.  `fuchsia-binary-size` tells us that web_engine and
+  #     chrome_fuchsia both grow 32768 bytes (10x that, uncompressed).
+  # 2.  `headless_shell_wpt_tests` fail on `mac-rel`.
+  condition = is_debug || !(is_mac || is_fuchsia)
 }
 
 config("rustc_revision") {
@@ -1776,6 +1832,15 @@ config("treat_warnings_as_errors") {
   } else {
     cflags = [ "-Werror" ]
 
+    if (is_clang) {
+      # gcc doesn't support this flag.
+      cflags += [
+        # Treat #pragma message warnings (-W#pragma-messages) as fatal errors
+        # so that #pragma message does not bypass -Werror.
+        "-Werror=#pragma-messages",
+      ]
+    }
+
     # The compiler driver can sometimes (rarely) emit warnings before calling
     # the actual linker.  Make sure these warnings are treated as errors as
     # well.
@@ -1808,10 +1873,7 @@ config("tot_warnings") {
   # Entries should generally require both is_clang and llvm_force_head_revision,
   # but may have additional constraints as well (e.g. only some OSes)
   if (is_clang && llvm_force_head_revision) {
-    cflags += [
-      # TODO(crbug.com/526996813): Figure out what to do about this.
-      "-Wno-stringop-overread",
-    ]
+    cflags += []
   }
 }
 
@@ -1916,6 +1978,13 @@ config("default_warnings") {
       # instead of having a global flag.
       "-Wno-psabi",
     ]
+
+    if (!is_wasm) {
+      cflags += [
+        # TODO(crbug.com/526996813): Figure out what to do about this.
+        "-Wno-stringop-overread",
+      ]
+    }
 
     cflags_cc += [
       # Disables for C++ only
@@ -2037,20 +2106,15 @@ config("default_warnings") {
     ldflags += [ "-Wl,-no_warn_duplicate_libraries" ]
   }
 
-  configs = [ ":default_clippy_lints" ]
+  if (enable_rust_clippy) {
+    configs = [ ":default_clippy_lints" ]
+  }
 }
 
 # default_clippy_lints --------------------------------------------------------
 
 config("default_clippy_lints") {
   rustflags = [
-    # NOTE: Change `cr_clippy_revision` when 1) enabling new Clippy warnings or
-    # 2) enabling Clippy on new platforms/bots.  This is quite similar to
-    # `config("rustc_revision")` - a custom `--cfg` flag is used to force
-    # rebuilding of all `.rs` files (which as a side-effect should also trigger
-    # a Clippy check if `enable_rust_clippy = true`).
-    "--cfg=cr_clippy_revision=\"2026-07-20\"",
-
     # Treat all default Clippy lints as warnings.
     # See also `config("treat_warnings_as_errors")`.
     "-Wclippy::all",
@@ -2061,6 +2125,12 @@ config("default_clippy_lints") {
     # Lints disabled during the initial rollout period (when any objection
     # coming from a Chromium engineer would get a lint disabled):
     "-Aclippy::needless_return",
+
+    # TODO(crbug.com/534628766): Fix and re-enable.
+    "-Aclippy::chunks_exact_to_as_chunks",
+
+    # TODO(crbug.com/556789085): Fix and re-enable.
+    "-Aclippy::needless_range_loop",
   ]
 }
 

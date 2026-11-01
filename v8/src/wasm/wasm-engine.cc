@@ -9,6 +9,7 @@
 #include "src/base/hashing.h"
 #include "src/base/platform/time.h"
 #include "src/base/small-vector.h"
+#include "src/codegen/cpu-features.h"
 #include "src/common/assert-scope.h"
 #include "src/common/globals.h"
 #include "src/debug/debug.h"
@@ -136,6 +137,13 @@ WasmOrphanedGlobalHandle* WasmEngine::NewOrphanedGlobalHandle(
   return orphan;
 }
 
+void WasmEngine::DestroyOrphanedGlobalHandle(WasmOrphanedGlobalHandle* that) {
+  // Acquire the lock because updating the linked list must not happen
+  // concurrently with {NewOrphanedGlobalHandle} inserting a node.
+  base::MutexGuard guard(&mutex_);
+  WasmOrphanedGlobalHandle::Destroy(that);
+}
+
 // static
 void WasmEngine::FreeAllOrphanedGlobalHandles(WasmOrphanedGlobalHandle* start) {
   // This is meant to be called from ~Isolate, so we no longer care about
@@ -213,7 +221,7 @@ class ClearWeakScriptHandleTask : public CancelableTask {
   // it might well be too late to do that safely).
 
   void RunInternal() override {
-    WasmOrphanedGlobalHandle::Destroy(handle_);
+    GetWasmEngine()->DestroyOrphanedGlobalHandle(handle_);
     handle_ = nullptr;
   }
 
@@ -671,7 +679,7 @@ MaybeDirectHandle<WasmModuleObject> WasmEngine::SyncCompile(
   // serializable. Instantiation may occur off a deserialized version of this
   // object.
   DirectHandle<WasmModuleObject> module_object =
-      WasmModuleObject::New(isolate, std::move(native_module), script);
+      WasmModuleObject::New(isolate, script);
 
   // Finish the Wasm script now and make it public to the debugger.
   isolate->debug()->OnAfterCompile(script);
@@ -949,14 +957,14 @@ DirectHandle<Script> CreateWasmScript(
   }
 
   // Use the given shared {NativeModule}, but increase its reference count by
-  // allocating a new {Managed<T>} that the {Script} references.
+  // allocating a new {CppGCManaged<T>} that the {Script} references.
   size_t code_size_estimate = native_module->committed_code_space();
   size_t memory_estimate =
       code_size_estimate +
       wasm::WasmCodeManager::EstimateNativeModuleMetaDataSize(module);
-  DirectHandle<Managed<wasm::NativeModule>> managed_native_module =
-      Managed<wasm::NativeModule>::From(isolate, memory_estimate,
-                                        std::move(native_module));
+  DirectHandle<CppGCManaged<wasm::NativeModule>> managed_native_module =
+      CppGCManaged<wasm::NativeModule>::Create(isolate, memory_estimate,
+                                               std::move(native_module));
 
   DirectHandle<Script> script =
       isolate->factory()->NewScript(isolate->factory()->undefined_value());
@@ -1018,7 +1026,7 @@ MaybeDirectHandle<WasmModuleObject> WasmEngine::ImportNativeModule(
       GetOrCreateScript(isolate, shared_native_module, source_url);
   native_module->LogWasmCodes(isolate, *script);
   DirectHandle<WasmModuleObject> module_object =
-      WasmModuleObject::New(isolate, std::move(shared_native_module), script);
+      WasmModuleObject::New(isolate, script);
   {
     base::MutexGuard lock(&mutex_);
     DCHECK(isolates_.contains(isolate));
@@ -1204,6 +1212,12 @@ void WasmEngine::AddIsolate(Isolate* isolate) {
   bool has_mpk = WasmCodeManager::HasMemoryProtectionKeySupport();
   isolate->counters()->wasm_memory_protection_keys_support()->AddSample(
       has_mpk ? 1 : 0);
+
+#if V8_TARGET_ARCH_X64
+  bool has_avx2 =
+      CpuFeatures::IsSupported(AVX) && CpuFeatures::IsSupported(AVX2);
+  isolate->counters()->wasm_avx2_support()->AddSample(has_avx2 ? 1 : 0);
+#endif
 
   if (log_code) {
     // Log existing wrappers (which are shared across isolates).
@@ -1658,7 +1672,7 @@ void WasmEngine::FreeNativeModule(NativeModule* native_module) {
 
     // Flush the Wasm code lookup cache, since it may refer to some
     // code within native modules that we are going to release (if a
-    // Managed<wasm::NativeModule> object is no longer referenced).
+    // CppGCManaged<wasm::NativeModule> object is no longer referenced).
     GetWasmCodeManager()->FlushCodeLookupCache(isolate);
 
     // {CodeToLogPerScript} keeps the NativeModule alive, so if it dies, there

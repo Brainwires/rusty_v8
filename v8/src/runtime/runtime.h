@@ -141,7 +141,9 @@ constexpr bool CanTriggerGC(T... properties) {
   IF_SPARKPLUG_PLUS(F, PatchCompareOpBaselineCode, 4, 1)         \
   IF_SPARKPLUG_PLUS(F, PatchCompareOpBaselineCodeAndThrow, 4, 1) \
   IF_SPARKPLUG_PLUS(F, PatchBinopBaselineCode, 4, 1)             \
-  IF_SPARKPLUG_PLUS(F, PatchBinopBaselineCodeAndThrow, 4, 1)
+  IF_SPARKPLUG_PLUS(F, PatchBinopBaselineCodeAndThrow, 4, 1)     \
+  IF_SPARKPLUG_PLUS(F, PatchUnaryOpBaselineCode, 4, 1)           \
+  IF_SPARKPLUG_PLUS(F, PatchUnaryOpBaselineCodeAndThrow, 4, 1)
 
 // TODO(olivf): Unify the Maglev/TF variants into one runtime function and pass
 // the optimization tier as an argument.
@@ -151,7 +153,7 @@ constexpr bool CanTriggerGC(T... properties) {
   F(StartMaglevOptimizeJob, 1, 1)        \
   F(OptimizeTurbofanEager, 1, 1)         \
   F(StartTurbofanOptimizeJob, 1, 1)      \
-  F(MarkLazyDeoptimized, 2, 1)
+  F(MarkLazyDeoptimizedOrFlushed, 2, 1)
 
 #define FOR_EACH_INTRINSIC_COMPILER(F, I)    \
   FOR_EACH_INTRINSIC_COMPILER_GENERIC(F, I)  \
@@ -179,7 +181,6 @@ constexpr bool CanTriggerGC(T... properties) {
   F(HandleDebuggerStatement, 0, 1)              \
   F(IsBreakOnException, 1, 1)                   \
   F(IterableForEach, 2, 1)                      \
-  F(LiveEditPatchScript, 2, 1)                  \
   F(ProfileCreateSnapshotDataBlob, 0, 1)        \
   F(ScheduleBreak, 0, 1)                        \
   F(ScriptLocationFromLine2, 4, 1)              \
@@ -300,7 +301,7 @@ constexpr bool CanTriggerGC(T... properties) {
   F(BytecodeBudgetInterrupt_Sparkplug, 1, 1)               \
   F(BytecodeBudgetInterruptWithStackCheck_Sparkplug, 1, 1) \
   F(BytecodeBudgetInterrupt_Maglev, 1, 1)                  \
-  F(BytecodeBudgetInterruptWithStackCheck_Maglev, 1, 1)    \
+  F(BytecodeBudgetLoopInterrupt_Maglev, 2, 1)              \
   F(NotifyContextCellStateWillChange, 1, 1,                \
     RuntimeCallProperty::kCannotTriggerGC)                 \
   F(NewError, 2, 1)                                        \
@@ -669,6 +670,7 @@ constexpr bool CanTriggerGC(T... properties) {
   F(RegexpHasBytecode, 2, 1)                                             \
   F(RegexpHasNativeCode, 2, 1)                                           \
   F(RegexpIsUnmodified, 1, 1)                                            \
+  F(RegexpQuickCheckRejects, 2, 1)                                       \
   F(RegexpTypeTag, 1, 1)                                                 \
   F(Resume, 1, 1)                                                        \
   F(RunningInSimulator, 0, 1)                                            \
@@ -676,6 +678,7 @@ constexpr bool CanTriggerGC(T... properties) {
   F(ScheduleGCInStackCheck, 0, 1)                                        \
   F(SerializeDeserializeNow, 0, 1)                                       \
   F(SetAllocationTimeout, -1 /* 2 || 3 */, 1)                            \
+  F(SetDispatchTableGCInterval, 1, 1)                                    \
   F(SetBatterySaverMode, 1, 1)                                           \
   F(SetForceSlowPath, 1, 1)                                              \
   F(SetIteratorProtector, 0, 1)                                          \
@@ -725,7 +728,9 @@ constexpr bool CanTriggerGC(T... properties) {
   F(ThrowWasmStackOverflow, 0, 1)                                \
   F(WasmI32AtomicWait, 4, 1)                                     \
   F(WasmI64AtomicWait, 5, 1)                                     \
-  F(WasmManagedObjectWait, 5, 1)                                 \
+  F(WasmManagedObjectWait32, 5, 1)                               \
+  F(WasmManagedObjectWait64, 5, 1)                               \
+  F(WasmManagedObjectWaitRef, 5, 1)                              \
   F(WasmWaitqueueNew, 0, 1)                                      \
   F(WasmMemoryGrow, 2, 1)                                        \
   F(WasmStackGuard, 1, 1)                                        \
@@ -763,12 +768,12 @@ constexpr bool CanTriggerGC(T... properties) {
   F(WasmSuspended, 2, 1)                                         \
   F(WasmAllocateContinuation, 3, 1)                              \
   F(ClearWasmSuspenderResumeField, 1, 1)                         \
-  F(WasmCastToSpecialPrimitiveArray, 2, 1)                       \
+  F(WasmCastToSpecialPrimitiveArray, 3, 1)                       \
   F(WasmStringAdd_NoMapCheck_Shared, 2, 1)                       \
   F(WasmStringNewSegmentWtf8, 5, 1)                              \
   F(WasmStringNewWtf8, 5, 1)                                     \
-  F(WasmStringNewWtf8Array, 5, 1)                                \
-  F(WasmStringNewWtf16, 4, 1)                                    \
+  F(WasmStringNewWtf8Array, 4, 1)                                \
+  F(WasmStringNewWtf16, 5, 1)                                    \
   F(WasmStringNewWtf16Array, 4, 1)                               \
   F(WasmStringConst, 2, 1)                                       \
   F(WasmStringMeasureUtf8, 1, 1)                                 \
@@ -776,7 +781,7 @@ constexpr bool CanTriggerGC(T... properties) {
   F(WasmStringEncodeWtf8, 5, 1)                                  \
   F(WasmStringEncodeWtf16, 6, 1)                                 \
   F(WasmStringEncodeWtf8Array, 4, 1)                             \
-  F(WasmStringToUtf8Array, 1, 1)                                 \
+  F(WasmStringToUtf8Array, 2, 1)                                 \
   F(WasmStringAsWtf8, 1, 1)                                      \
   F(WasmStringViewWtf8Encode, 7, 1)                              \
   F(WasmStringViewWtf8Slice, 3, 1)                               \
@@ -787,6 +792,8 @@ constexpr bool CanTriggerGC(T... properties) {
   F(WasmConfigureAllPrototypes, 4, 1)                            \
   F(WasmConfigureAllPrototypesOpt, 3, 1)                         \
   F(DebugCollectWasmCoverage, 0, 1)                              \
+  IF_TSAN(F, TsanAcquireForInitializationFence, 1, 1,            \
+          RuntimeCallProperty::kCannotTriggerGC)                 \
   F(WasmTypeAssertionFailed, 0, 1, RuntimeCallProperty::kCannotTriggerGC)
 
 #define FOR_EACH_INTRINSIC_WASM_TEST(F, I)                      \
@@ -870,7 +877,7 @@ constexpr bool CanTriggerGC(T... properties) {
   F(StoreGlobalIC_Slow, 5, 1)                \
   F(StoreIC_Miss, 5, 1)                      \
   F(DefineNamedOwnIC_Miss, 5, 1)             \
-  F(StoreInArrayLiteralIC_Slow, 5, 1)        \
+  F(StoreInArrayLiteralIC_Slow, 3, 1)        \
   F(StorePropertyPastInterceptor, 4, 1)      \
   F(CloneObjectIC_Slow, 2, 1)                \
   F(CloneObjectIC_Miss, 4, 1)                \

@@ -170,6 +170,11 @@
     ]
   },
   "featureFilters": {
+    "normalization": {
+      "excludelist": [
+        "nfkc_scf"
+      ]
+    },
     "brkitr_dictionaries": {
       "blacklist": [
 // Filtered by android/brkitr.patch        "cjdict",

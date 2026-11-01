@@ -75,6 +75,15 @@ inline void ExternalPointerMember<kTagRange>::store(IsolateForSandbox isolate,
 }
 
 template <ExternalPointerTagRange kTagRange>
+template <ExternalPointerTag tag>
+inline Address ExternalPointerMember<kTagRange>::exchange(
+    IsolateForSandbox isolate, Address value) {
+  static_assert(kTagRange.Contains(tag));
+  return ExchangeExternalPointerField<tag>(reinterpret_cast<Address>(storage_),
+                                           isolate, value);
+}
+
+template <ExternalPointerTagRange kTagRange>
   requires TagWithRedirection<kTagRange>
 inline Address ExternalPointerMember<kTagRange>::load_raw(
     const IsolateForSandbox isolate) const {
@@ -143,10 +152,9 @@ inline Address ExternalPointerMember<kTagRange>::RedirectValue(
 }
 
 template <ExternalPointerTag tag>
-V8_INLINE void InitExternalPointerField(Address host_address,
-                                        Address field_address,
-                                        IsolateForSandbox isolate,
-                                        Address value) {
+V8_INLINE ExternalPointerHandle
+InitExternalPointerField(Address host_address, Address field_address,
+                         IsolateForSandbox isolate, Address value) {
 #ifdef V8_ENABLE_SANDBOX
   static_assert(tag != kExternalPointerNullTag);
   ExternalPointerTable& table = isolate.GetExternalPointerTableFor(tag);
@@ -157,15 +165,16 @@ V8_INLINE void InitExternalPointerField(Address host_address,
   // threads may access an uninitialized table entry and crash.
   auto location = reinterpret_cast<ExternalPointerHandle*>(field_address);
   base::AsAtomic32::Release_Store(location, handle);
+  return handle;
 #else
   WriteExternalPointerField<tag>(field_address, isolate, value);
+  return kNullExternalPointerHandle;
 #endif  // V8_ENABLE_SANDBOX
 }
 
-V8_INLINE void InitExternalPointerField(Address host_address,
-                                        Address field_address,
-                                        IsolateForSandbox isolate,
-                                        ExternalPointerTag tag, Address value) {
+V8_INLINE ExternalPointerHandle InitExternalPointerField(
+    Address host_address, Address field_address, IsolateForSandbox isolate,
+    ExternalPointerTag tag, Address value) {
 #ifdef V8_ENABLE_SANDBOX
   DCHECK_NE(tag, kExternalPointerNullTag);
   ExternalPointerTable& table = isolate.GetExternalPointerTableFor(tag);
@@ -176,23 +185,33 @@ V8_INLINE void InitExternalPointerField(Address host_address,
   // threads may access an uninitialized table entry and crash.
   auto location = reinterpret_cast<ExternalPointerHandle*>(field_address);
   base::AsAtomic32::Release_Store(location, handle);
+  return handle;
 #else
   WriteExternalPointerField(field_address, isolate, tag, value);
+  return kNullExternalPointerHandle;
 #endif  // V8_ENABLE_SANDBOX
 }
+
+#ifdef V8_ENABLE_SANDBOX
+V8_INLINE ExternalPointerHandle
+Relaxed_ReadExternalPointerHandle(Address field_address) {
+  // Handles may be written to objects from other threads so the handle needs
+  // to be loaded atomically. We assume that the access to the table cannot
+  // be reordered before the load of the handle due to the data dependency
+  // between the two accesses and therefore use relaxed memory ordering, but
+  // technically we should use memory_order_consume here.
+  auto location = reinterpret_cast<ExternalPointerHandle*>(field_address);
+  return base::AsAtomic32::Relaxed_Load(location);
+}
+#endif
 
 template <ExternalPointerTagRange tag_range>
 V8_INLINE Address ReadExternalPointerField(Address field_address,
                                            IsolateForSandbox isolate) {
 #ifdef V8_ENABLE_SANDBOX
-  // static_assert(tag != kExternalPointerNullTag); // TODO
-  // Handles may be written to objects from other threads so the handle needs
-  // to be loaded atomically. We assume that the load from the table cannot
-  // be reordered before the load of the handle due to the data dependency
-  // between the two loads and therefore use relaxed memory ordering, but
-  // technically we should use memory_order_consume here.
-  auto location = reinterpret_cast<ExternalPointerHandle*>(field_address);
-  ExternalPointerHandle handle = base::AsAtomic32::Relaxed_Load(location);
+  static_assert(!tag_range.IsEmpty());
+  ExternalPointerHandle handle =
+      Relaxed_ReadExternalPointerHandle(field_address);
   return isolate.GetExternalPointerTableFor(tag_range).Get(handle, tag_range);
 #else
   return ReadMaybeUnalignedValue<Address>(field_address);
@@ -204,13 +223,8 @@ V8_INLINE Address ReadExternalPointerField(Address field_address,
                                            ExternalPointerTagRange tag_range) {
 #ifdef V8_ENABLE_SANDBOX
   DCHECK_NE(tag_range.first, kExternalPointerNullTag);
-  // Handles may be written to objects from other threads so the handle needs
-  // to be loaded atomically. We assume that the load from the table cannot
-  // be reordered before the load of the handle due to the data dependency
-  // between the two loads and therefore use relaxed memory ordering, but
-  // technically we should use memory_order_consume here.
-  auto location = reinterpret_cast<ExternalPointerHandle*>(field_address);
-  ExternalPointerHandle handle = base::AsAtomic32::Relaxed_Load(location);
+  ExternalPointerHandle handle =
+      Relaxed_ReadExternalPointerHandle(field_address);
   return isolate.GetExternalPointerTableFor(tag_range).Get(handle, tag_range);
 #else
   return ReadMaybeUnalignedValue<Address>(field_address);
@@ -223,9 +237,8 @@ V8_INLINE void WriteExternalPointerField(Address field_address,
                                          Address value) {
 #ifdef V8_ENABLE_SANDBOX
   static_assert(tag != kExternalPointerNullTag);
-  // See comment above for why this is a Relaxed_Load.
-  auto location = reinterpret_cast<ExternalPointerHandle*>(field_address);
-  ExternalPointerHandle handle = base::AsAtomic32::Relaxed_Load(location);
+  ExternalPointerHandle handle =
+      Relaxed_ReadExternalPointerHandle(field_address);
   isolate.GetExternalPointerTableFor(tag).Set(handle, value, tag);
 #else
   WriteMaybeUnalignedValue<Address>(field_address, value);
@@ -238,12 +251,27 @@ V8_INLINE void WriteExternalPointerField(Address field_address,
                                          Address value) {
 #ifdef V8_ENABLE_SANDBOX
   DCHECK_NE(tag, kExternalPointerNullTag);
-  // See comment above for why this is a Relaxed_Load.
-  auto location = reinterpret_cast<ExternalPointerHandle*>(field_address);
-  ExternalPointerHandle handle = base::AsAtomic32::Relaxed_Load(location);
+  ExternalPointerHandle handle =
+      Relaxed_ReadExternalPointerHandle(field_address);
   isolate.GetExternalPointerTableFor(tag).Set(handle, value, tag);
 #else
   WriteMaybeUnalignedValue<Address>(field_address, value);
+#endif  // V8_ENABLE_SANDBOX
+}
+
+template <ExternalPointerTag tag>
+V8_INLINE Address ExchangeExternalPointerField(Address field_address,
+                                               IsolateForSandbox isolate,
+                                               Address value) {
+#ifdef V8_ENABLE_SANDBOX
+  static_assert(tag != kExternalPointerNullTag);
+  ExternalPointerHandle handle =
+      Relaxed_ReadExternalPointerHandle(field_address);
+  return isolate.GetExternalPointerTableFor(tag).Exchange(handle, value, tag);
+#else
+  Address old_value = ReadMaybeUnalignedValue<Address>(field_address);
+  WriteMaybeUnalignedValue<Address>(field_address, value);
+  return old_value;
 #endif  // V8_ENABLE_SANDBOX
 }
 

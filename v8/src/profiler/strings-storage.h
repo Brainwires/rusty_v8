@@ -16,6 +16,7 @@
 namespace v8 {
 namespace internal {
 
+class AstRawString;
 class Name;
 class Symbol;
 
@@ -32,10 +33,16 @@ class V8_EXPORT_PRIVATE StringsStorage {
   // Copies the given c-string and stores it, returning the stored copy, or just
   // returns the existing string in storage if it already exists.
   const char* GetCopy(const char* src);
+  // Copies the given AstRawString into UTF-8 representation and stores it,
+  // returning the stored copy, or just returns the existing string in storage
+  // if it already exists.
+  const char* GetCopy(const AstRawString* src);
   // Returns a formatted string, de-duplicated via the storage.
   PRINTF_FORMAT(2, 3) const char* GetFormatted(const char* format, ...);
   // Returns a stored string resulting from name, or "<symbol>" for a symbol.
   const char* GetName(Tagged<Name> name);
+  // Returns a stored string resulting from string without truncation.
+  const char* GetUntruncated(Tagged<String> string);
   // Returns the string representation of the int from the store.
   const char* GetName(int index);
   // Appends string resulting from name to prefix, then returns the stored

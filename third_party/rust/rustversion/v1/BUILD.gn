@@ -38,7 +38,7 @@ cargo_crate("lib") {
   cargo_pkg_description =
       "Conditional compilation according to rustc compiler version"
   cargo_pkg_repository = "https://github.com/dtolnay/rustversion"
-  cargo_pkg_version = "1.0.22"
+  cargo_pkg_version = "1.0.23"
 
   allow_unsafe = false
 
@@ -82,6 +82,7 @@ cargo_crate("lib") {
   proc_macro_configs -= _configs_to_remove
   proc_macro_configs += _configs_to_add
 }
+
 cargo_crate("buildrs_support") {
   crate_name = "rustversion"
   epoch = "1"
@@ -112,7 +113,7 @@ cargo_crate("buildrs_support") {
   cargo_pkg_description =
       "Conditional compilation according to rustc compiler version"
   cargo_pkg_repository = "https://github.com/dtolnay/rustversion"
-  cargo_pkg_version = "1.0.22"
+  cargo_pkg_version = "1.0.23"
 
   allow_unsafe = false
 

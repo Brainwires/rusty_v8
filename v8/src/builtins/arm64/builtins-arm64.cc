@@ -101,7 +101,7 @@ void Generate_JSBuiltinsConstructStubHelper(MacroAssembler* masm) {
     __ Claim(slot_count);
 
     // Preserve the incoming parameters on the stack.
-    __ LoadRoot(x4, RootIndex::kTheHoleValue);
+    __ LoadRoot(x4, RootIndex::kTdzHoleValue);
 
     // Compute a pointer to the slot immediately above the location on the
     // stack to which arguments will be later copied.
@@ -234,9 +234,9 @@ void Builtins::Generate_JSConstructStubGeneric(MacroAssembler* masm) {
 
   __ B(&post_instantiation_deopt_entry);
 
-  // Else: use TheHoleValue as receiver for constructor call
+  // Else: use TdzHoleValue as receiver for constructor call
   __ Bind(&not_create_implicit_receiver);
-  __ LoadRoot(x0, RootIndex::kTheHoleValue);
+  __ LoadRoot(x0, RootIndex::kTdzHoleValue);
 
   // ----------- S t a t e -------------
   //  --                                x0: receiver
@@ -334,7 +334,7 @@ void Builtins::Generate_JSConstructStubGeneric(MacroAssembler* masm) {
   // on-stack receiver as the result.
   __ Bind(&use_receiver);
   __ Peek(x0, 0 * kSystemPointerSize);
-  __ CompareRoot(x0, RootIndex::kTheHoleValue);
+  __ CompareRoot(x0, RootIndex::kTdzHoleValue);
   __ B(eq, &do_throw);
 
   __ Bind(&leave_and_return);
@@ -1245,17 +1245,13 @@ void Builtins::Generate_BaselineOutOfLinePrologue(MacroAssembler* masm) {
 
     FrameScope frame_scope(masm, StackFrame::INTERNAL);
     // Save incoming new target or generator
-    Register maybe_dispatch_handle = V8_JS_LINKAGE_INCLUDES_DISPATCH_HANDLE_BOOL
-                                         ? kJavaScriptCallDispatchHandleRegister
-                                         : padreg;
-    // No need to SmiTag as dispatch handles always look like Smis.
-    static_assert(kJSDispatchHandleShift > 0);
-    __ AssertSmi(maybe_dispatch_handle);
-    __ Push(maybe_dispatch_handle, new_target);
+    __ PushDispatchHandle(kJavaScriptCallDispatchHandleRegister, new_target,
+                          feedback_cell, feedback_vector);
     __ SmiTag(frame_size);
     __ PushArgument(frame_size);
     __ CallRuntime(Runtime::kStackGuardWithGap);
-    __ Pop(new_target, maybe_dispatch_handle);
+    __ PopDispatchHandle(kJavaScriptCallDispatchHandleRegister, new_target,
+                         feedback_cell, feedback_vector);
   }
   __ LoadRoot(kInterpreterAccumulatorRegister, RootIndex::kUndefinedValue);
   __ Ret();
@@ -1849,7 +1845,7 @@ void Builtins::Generate_InterpreterPushArgsThenFastConstructFunction(
   }
 
   // Implicit receiver stored in the construct frame.
-  __ LoadRoot(x2, RootIndex::kTheHoleValue);
+  __ LoadRoot(x2, RootIndex::kTdzHoleValue);
   __ Push(x2, padreg);
 
   // Push arguments + implicit receiver.
@@ -1907,7 +1903,7 @@ void Builtins::Generate_InterpreterPushArgsThenFastConstructFunction(
   __ Bind(&use_receiver);
   __ Ldr(x0,
          MemOperand(fp, FastConstructFrameConstants::kImplicitReceiverOffset));
-  __ CompareRoot(x0, RootIndex::kTheHoleValue);
+  __ CompareRoot(x0, RootIndex::kTdzHoleValue);
   __ B(eq, &do_throw);
 
   __ Bind(&leave_and_return);
@@ -3607,6 +3603,7 @@ void SwitchStacks(MacroAssembler* masm, ExternalReference fn,
 void ReloadParentStack(MacroAssembler* masm, Register return_reg,
                        Register return_value, Register context, Register tmp1,
                        Register tmp2, Register tmp3) {
+  DCHECK(!AreAliased(tmp1, tmp2, tmp3));
   Register active_stack = tmp1;
   __ LoadRootRelative(active_stack, IsolateData::active_stack_offset());
 
@@ -3619,7 +3616,10 @@ void ReloadParentStack(MacroAssembler* masm, Register return_reg,
   // Switch stack!
   SwitchStacks(masm, ExternalReference::wasm_return_jspi_stack(), parent,
                nullptr, no_reg, {return_reg, return_value, context, parent});
+  __ Ldr(tmp1, MemOperand(parent, wasm::kStackPcOffset));
   LoadJumpBuffer(masm, parent, false, tmp3);
+  __ Str(tmp1,
+         MemOperand(fp, WasmJspiFrameConstants::kParentReturnAddressOffset));
 }
 
 void RestoreParentSuspender(MacroAssembler* masm, Register tmp1) {
@@ -3858,6 +3858,9 @@ namespace {
 // forwards the value, the onRejected variant throws the value.
 
 void Generate_WasmResumeHelper(MacroAssembler* masm, wasm::OnResume on_resume) {
+  __ Cmp(kJavaScriptCallArgCountRegister, JSParameterCount(1));
+  __ Check(eq, AbortReason::kJSSignatureMismatch);
+
   auto regs = RegisterAllocator::WithAllocatableGeneralRegisters();
   __ EnterFrame(StackFrame::WASM_JSPI);
 
@@ -4301,6 +4304,10 @@ void SwitchBackAndReturnPromise(MacroAssembler* masm, RegisterAllocator& regs,
   FREE_REG(promise);
   FREE_REG(return_value);
   __ bind(return_promise);
+  // The initial wrapper and a resume callback have different argument cleanup.
+  __ Ldr(tmp,
+         MemOperand(fp, WasmJspiFrameConstants::kParentReturnAddressOffset));
+  __ Br(tmp);
 }
 
 void GenerateExceptionHandlingLandingPad(MacroAssembler* masm,
@@ -4548,6 +4555,7 @@ void JSToWasmWrapperHelper(MacroAssembler* masm, wasm::Promise mode) {
   Label return_promise;
   if (stack_switch) {
     SwitchBackAndReturnPromise(masm, regs, mode, &return_promise);
+    __ Trap();  // Unreachable.
   }
   __ Bind(&suspend, BranchTargetIdentifier::kBtiJump);
 
@@ -5768,7 +5776,7 @@ void Builtins::Generate_RestartFrameTrampoline(MacroAssembler* masm) {
   __ LeaveFrame(StackFrame::INTERPRETED);
 
   // The arguments are already in the stack, but we might need to adapt them
-  // if the function signature changed (e.g. via LiveEdit).
+  // if the function signature changed.
   __ InvokeFunction(x1, x0, InvokeType::kJump, ArgumentAdaptionMode::kAdapt);
 }
 
