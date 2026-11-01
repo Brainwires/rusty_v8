@@ -143,9 +143,20 @@ With both, libclang **23.1.4** generates `src_binding.rs`. Its items are the sam
 from nested classes losing their enclosing-class prefix in the generated names (for example
 `v8_String_WriteFlags` is now `WriteFlags`), which no Rust code refers to (it uses the `v8__*`
 aliases of `binding.hpp`). `release-denext.yml` pins libclang 23 on every host: apt.llvm.org's
-`llvm-toolchain-jammy-23` on Linux, Homebrew's `llvm` (checked to be 23) on macOS, and LLVM's own
+`llvm-toolchain-jammy-23` on Linux, Homebrew's `llvm` (checked to be 23) on arm64 macOS, conda-forge's
+osx-64 packages of 23.1.4 (each SHA-256 pinned) on Intel macOS, and LLVM's own
 `clang+llvm-23.1.4-x86_64-pc-windows-msvc.tar.xz` (SHA-256 pinned) on Windows, instead of
-Chromium's libclang package.
+Chromium's libclang package. Intel macOS takes conda-forge because LLVM's 23.1.x releases carry no
+x86_64 macOS tarball and Homebrew's `llvm` has no Intel bottle past 22.
+
+### Windows SDK
+
+V8 15.6's `build` pins `SDK_VERSION = 10.0.28000.0` in `toolchain/win/setup_toolchain.py`, passed to
+`vcvarsall`, and `gn gen` fails if that SDK's directories are missing. GitHub's `windows-2022` image
+stops at 26100 ([runner-images#14198](https://github.com/actions/runner-images/issues/14198)), so
+`release-denext.yml` installs 10.0.28000 first, with the installer pinned by the SHA-256 in
+`microsoft/winget-pkgs`, and its Authenticode signature checked. Remove the step once the image
+ships this SDK.
 
 ### Verified (biscuits, Linux x86_64)
 

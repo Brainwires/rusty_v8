@@ -188,8 +188,8 @@ jobs:
           sudo apt-get install -y --no-install-recommends libclang-23-dev clang-23
           echo "LIBCLANG_PATH=/usr/lib/llvm-23/lib" >>"$GITHUB_ENV"
 
-      - name: libclang (macOS)
-        if: runner.os == 'macOS'
+      - name: libclang (macOS arm64)
+        if: matrix.target == 'aarch64-apple-darwin'
         run: |
           set -euo pipefail
           brew install llvm
@@ -197,6 +197,80 @@ jobs:
           major=$("$prefix/bin/clang" --version | sed -n 's/.*clang version \([0-9]*\)\..*/\1/p' | head -1)
           if [ "$major" != 23 ]; then echo "::error::Homebrew llvm is $major, want 23"; exit 1; fi
           echo "LIBCLANG_PATH=$prefix/lib" >>"$GITHUB_ENV"
+
+      # Intel macOS has neither an official LLVM 23.1.4 tarball nor a Homebrew
+      # bottle (Homebrew's Intel CI is off, so its bottle stays at 22). conda-forge
+      # builds 23.1.4 for osx-64 from LLVM's source; each package is pinned by the
+      # SHA-256 in its repodata. These 11 are clang, libclang and their shared
+      # libraries (they find each other through @loader_path). DENEXT.md.
+      - name: libclang (macOS x64)
+        if: matrix.target == 'x86_64-apple-darwin'
+        run: |
+          set -euo pipefail
+          dir="$RUNNER_TEMP/llvm"
+          dl="$RUNNER_TEMP/llvm-dl"
+          mkdir -p "$dir" "$dl"
+          command -v zstd >/dev/null || brew install zstd
+          while read -r file sum; do
+            curl -fsSL -o "$dl/$file" "https://conda.anaconda.org/conda-forge/osx-64/$file"
+            got=$(shasum -a 256 "$dl/$file" | cut -d' ' -f1)
+            if [ "$got" != "$sum" ]; then echo "::error::$file checksum mismatch: $got"; exit 1; fi
+            unzip -q -o -d "$dl/x" "$dl/$file" 'pkg-*'
+            zstd -dqc "$dl"/x/pkg-*.tar.zst | tar -xf - -C "$dir"
+            rm -rf "$dl/x" "$dl/$file"
+          done <<'EOF'
+          clang-23-23.1.4-default_h4ef152c_1.conda 55e98ad0e958f4cb88d39eab8c29464867722362298916183b92d1aa25505855
+          libclang13-23.1.4-default_h4ef152c_1.conda 42c7f69f9cc4e8633360c7cada102bc8246add593a1ce4aee4905ffca3666b20
+          libclang-23.1.4-default_hb9e13d8_1.conda b7819b3b7a4263e789d6f4e11fcd6359b101aed411289082ba0b28dfa4c3eb10
+          libclang-cpp23.1-23.1.4-default_hae96fce_1.conda 007a3ae2fef8c659a3eb4f5a6a3bf63ff3f6acd0d258b8d7a5eb4da139a50f39
+          libllvm23-23.1.4-hd11396f_1.conda bd70294eeaa02453cc70d72f0e7cba643a0eb5a6f786d8373cbb9b3bb052191b
+          libcxx-23.1.4-h19cb2f5_2.conda 5d66e121f30c4b3792480de92230ec05d024106df5c031452bba356153df8c65
+          libxml2-16-2.15.4-h341e563_1.conda 4e156c9c6223e6aa54b4087ccf722e4ba2a259a314f0a9143f0e11ec9d884a91
+          libiconv-1.18-h4ae439b_3.conda 2389e03a58ed0f5e8f2469eb4d4ba80d0af378b38854ae5eee65e5b641244082
+          liblzma-5.8.3-hbb4bfdb_1.conda 7915dac7c71c208e40e716e2f6d3eff41a8d5584e0e7c2d46f9bf9bd5f9aa739
+          libzlib-1.3.2-hbb4bfdb_3.conda b2dba286dd6632292b12296e761193b5ef9fb0eaeecaa481f5ba9af72c0c18e1
+          zstd-1.5.7-hbc1a06c_7.conda 5277886d9704a624dc9b79ac985861e1e431bdb39a57c082507ab577a138ec6c
+          EOF
+          # build.rs takes the clang beside LIBCLANG_PATH; the package names it clang-23.
+          ln -sf clang-23 "$dir/bin/clang"
+          "$dir/bin/clang" --version
+          "$dir/bin/clang" --version | grep -q 'clang version 23\.1\.4'
+          test -f "$("$dir/bin/clang" -print-resource-dir)/include/stddef.h"
+          test -e "$dir/lib/libclang.dylib"
+          echo "LIBCLANG_PATH=$dir/lib" >>"$GITHUB_ENV"
+
+      # V8 15.6's build pins SDK_VERSION 10.0.28000.0 (toolchain/win/setup_toolchain.py
+      # hands it to vcvarsall), which windows-2022 does not ship (up to 26100).
+      # The URL and hash are winget-pkgs' for Microsoft.WindowsSDK.10.0.28000
+      # 10.0.28000.2526. The bootstrapper fetches the rest itself.
+      - name: Windows SDK 10.0.28000
+        if: runner.os == 'Windows'
+        shell: pwsh
+        timeout-minutes: 30
+        env:
+          SDK_URL: https://download.microsoft.com/download/06fc99ac-527e-451e-a536-8866695a2e7e/KIT_BUNDLE_WINDOWSSDK_MEDIACREATION/winsdksetup.exe
+          SDK_SHA256: 02988EA51EAB2A2DB53E19735E51C97A6D221ADA74B9174FA0868870B9403BA0
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $exe = Join-Path $env:RUNNER_TEMP 'winsdksetup.exe'
+          Invoke-WebRequest -Uri $env:SDK_URL -OutFile $exe
+          $got = (Get-FileHash -Algorithm SHA256 $exe).Hash
+          if ($got -ne $env:SDK_SHA256) { throw "winsdksetup.exe checksum mismatch: $got" }
+          $sig = Get-AuthenticodeSignature $exe
+          if ($sig.Status -ne 'Valid' -or $sig.SignerCertificate.Subject -notmatch 'O=Microsoft Corporation') {
+            throw "winsdksetup.exe signature: $($sig.Status) $($sig.SignerCertificate.Subject)"
+          }
+          $features = 'OptionId.DesktopCPPx64 OptionId.DesktopCPPx86 OptionId.DesktopCPPArm64 OptionId.WindowsDesktopDebuggers OptionId.UWPCPP OptionId.SigningTools'
+          $proc = Start-Process -FilePath $exe -ArgumentList "/features $features /q /norestart /ceip off" -PassThru -Wait
+          if ($proc.ExitCode -notin 0, 3010) { throw "winsdksetup.exe exited $($proc.ExitCode)" }
+          $kit = 'C:\Program Files (x86)\Windows Kits\10'
+          $v = '10.0.28000.0'
+          foreach ($p in "Include\$v\um\windows.h", "Include\$v\ucrt\stdio.h", "Include\$v\shared\sdkddkver.h", "Include\$v\winrt\windows.foundation.h",
+                         "Lib\$v\um\x64\kernel32.lib", "Lib\$v\um\arm64\kernel32.lib", "Lib\$v\um\x86\kernel32.lib",
+                         "Lib\$v\ucrt\x64\ucrt.lib", "Lib\$v\ucrt\arm64\ucrt.lib", "Lib\$v\ucrt\x86\ucrt.lib", "bin\$v\x64\rc.exe") {
+            if (-not (Test-Path (Join-Path $kit $p))) { throw "SDK install incomplete: $p" }
+          }
+          Write-Host "Windows SDK $v installed"
 
       # Windows: LLVM's own release, pinned by SHA-256 (build.rs would
       # otherwise fetch Chromium's libclang package, which bindgen rejects).
