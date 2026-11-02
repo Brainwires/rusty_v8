@@ -134,6 +134,9 @@ created after the process ran out of isolates had a writable heap and no guard, 
 on other threads attached to it: the guard only helped when a creator was the very first isolate.
 Whether this explains the aborts of `deno_core`'s lib tests on parallel threads
 (`vector.h:419: libc++ Hardening assertion __n < size() failed`, 3 of 33 runs) is not established.
+**This does not cure them:** with this guard, 40 parallel runs on Linux x86_64 still had 1 such abort,
+and 2 runs hung until a 400-second timeout. The hangs were not diagnosed and no baseline was
+measured for them, so this guard may cause them; it must not ship until that is settled.
 
 The guard now counts the group's isolates. Whether a creator joins an empty group is only known
 while no isolate is being created or disposed, so a creator is constructed alone, while regular
