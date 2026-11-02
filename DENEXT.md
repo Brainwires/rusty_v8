@@ -120,17 +120,32 @@ the creator appends to it, or allocates into it (the creator's own `ReadOnlySeri
 crashed walking the pages), and on any thread it keeps `Heap::read_only_space_` pointing at the
 space V8 deletes (a use-after-free). V8's comment on that path expects it only in `mksnapshot`.
 
-The binding now enforces the window (`snapshot::read_only_heap_guard`): while the process's first
-isolate is a snapshot creator that has not created its blob, `Isolate::new` and another
+The binding now enforces the window (`snapshot::read_only_heap_guard`): while a snapshot creator
+is the isolate group's only isolate and has not created its blob, `Isolate::new` and another
 `snapshot_creator` wait for it on other threads and panic on the creator's own thread (where
-waiting would never end). Once the first isolate is a regular one, or the creator is done, the
-heap is sealed for good and creation costs one atomic load. Snapshots are unchanged (the creator
-still extends read-only space). Test `test_snapshot_creator_concurrent_isolates` (its own binary,
-so the creator is the first isolate) failed 9 of 20 runs without the guard and 0 of 60 with it;
-`tests/slots.rs` 0 of 100.
+waiting would never end). Snapshots are unchanged (the creator still extends read-only space).
+Test `test_snapshot_creator_concurrent_isolates` (its own binary, so the creator is the first
+isolate) failed 9 of 20 runs without the guard and 0 of 60 with it; `tests/slots.rs` 0 of 100.
 
-Deno is not exposed: it makes its snapshots in `build.rs` processes, and its workers are created
-from a sealed heap (9,600 concurrent `new Worker` on runtime 3.0.0-denext.6: no failure).
+**The window reopens** (fixed on this branch, not in a release yet). The guard took the heap to be sealed for
+good once a regular isolate had existed. V8 frees it when the group's last isolate is disposed
+(`IsolateGroup::RemoveIsolate`), and the next isolate sets up a new one, so a snapshot creator
+created after the process ran out of isolates had a writable heap and no guard, and regular isolates
+on other threads attached to it: the guard only helped when a creator was the very first isolate.
+Whether this explains the aborts of `deno_core`'s lib tests on parallel threads
+(`vector.h:419: libc++ Hardening assertion __n < size() failed`, 3 of 33 runs) is not established.
+
+The guard now counts the group's isolates. Whether a creator joins an empty group is only known
+while no isolate is being created or disposed, so a creator is constructed alone, while regular
+isolates and disposals may still overlap each other; creating or disposing an isolate takes a mutex
+where it used to take one atomic load. Beside a live regular isolate the heap is sealed, and a
+creator holds nothing up. Test `test_snapshot_creator_after_last_isolate` empties the group before
+each creator.
+
+Deno is not exposed: `JsRuntimeForSnapshot` and `create_runtime_snapshot` are reached only from
+`build.rs` processes and tests, not from the runtime, `deno compile` or desktop packaging (which
+embed the prebuilt `CLI_SNAPSHOT`), and its workers are created from a sealed heap (9,600 concurrent
+`new Worker` on runtime 3.0.0-denext.6: no failure).
 
 ### bindgen
 
