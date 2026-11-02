@@ -3,6 +3,14 @@
 This fork builds rusty_v8 for the Brainwires Deno fork (denext's runtime). It exists to ship V8
 security fixes that upstream rusty_v8 has not released yet. It is not published to crates.io.
 
+## `v156.0.0-denext.2`: V8 15.6.75.33
+
+A patch-level move on `branch-heads/15.6`: the `v8` submodule moves from 15.6.75.32 to 15.6.75.33
+(`292c5548f4`), which adds the security merge `e1c709282e` "[M156] [builtins] Track Promise.any
+reject closure state in the errors array". V8's `DEPS` and public API did not change between them,
+so no other submodule, patch or binding moved. The crate is `156.0.0+denext.2`. The release notes
+now state the V8 version, the Windows SDK bootstrapper and the conda-forge LLVM packages.
+
 ## `v156.0.0-denext.1`: V8 15.6.75.32 (phase 2)
 
 Branch `v8-15.6-denext`, cut from `denext/v152.2.0-v8.15.2.124.45` (upstream `v152.2.0` plus

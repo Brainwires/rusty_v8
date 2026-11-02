@@ -23,7 +23,7 @@ on:
     inputs:
       tag:
         description: Release tag (v<crate version without build metadata>-denext.<n>)
-        default: v156.0.0-denext.1
+        default: v156.0.0-denext.2
         required: true
         type: string
 
@@ -38,6 +38,9 @@ env:
   SCCACHE_VERSION: v0.8.2
   # tools/win, as upstream's ci.yml downloads it (the submodule is update=none).
   TOOLS_WIN_REV: 13cb6e5d223dc49eadd082d3aef4c2a5b0e4c0a0
+  # Windows SDK 10.0.28000.2526's bootstrapper, as winget-pkgs lists it.
+  WINDOWS_SDK_URL: https://download.microsoft.com/download/06fc99ac-527e-451e-a536-8866695a2e7e/KIT_BUNDLE_WINDOWSSDK_MEDIACREATION/winsdksetup.exe
+  WINDOWS_SDK_SHA256: 02988EA51EAB2A2DB53E19735E51C97A6D221ADA74B9174FA0868870B9403BA0
 
 jobs:
   check:
@@ -247,15 +250,12 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         timeout-minutes: 30
-        env:
-          SDK_URL: https://download.microsoft.com/download/06fc99ac-527e-451e-a536-8866695a2e7e/KIT_BUNDLE_WINDOWSSDK_MEDIACREATION/winsdksetup.exe
-          SDK_SHA256: 02988EA51EAB2A2DB53E19735E51C97A6D221ADA74B9174FA0868870B9403BA0
         run: |
           $ErrorActionPreference = 'Stop'
           $exe = Join-Path $env:RUNNER_TEMP 'winsdksetup.exe'
-          Invoke-WebRequest -Uri $env:SDK_URL -OutFile $exe
+          Invoke-WebRequest -Uri $env:WINDOWS_SDK_URL -OutFile $exe
           $got = (Get-FileHash -Algorithm SHA256 $exe).Hash
-          if ($got -ne $env:SDK_SHA256) { throw "winsdksetup.exe checksum mismatch: $got" }
+          if ($got -ne $env:WINDOWS_SDK_SHA256) { throw "winsdksetup.exe checksum mismatch: $got" }
           $sig = Get-AuthenticodeSignature $exe
           if ($sig.Status -ne 'Valid' -or $sig.SignerCertificate.Subject -notmatch 'O=Microsoft Corporation') {
             throw "winsdksetup.exe signature: $($sig.Status) $($sig.SignerCertificate.Subject)"
@@ -456,6 +456,8 @@ jobs:
       contents: write
     outputs:
       commit: ${{ steps.commit.outputs.commit }}
+      v8_version: ${{ steps.commit.outputs.v8_version }}
+      v8_commit: ${{ steps.commit.outputs.v8_commit }}
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
@@ -511,6 +513,13 @@ jobs:
             git commit-tree "$tree" "${parent[@]}")
           git push origin "$commit:refs/heads/crate"
           echo "commit=$commit" >>"$GITHUB_OUTPUT"
+          v8_version=$(sed -n 's/^#define V8_\(MAJOR_VERSION\|MINOR_VERSION\|BUILD_NUMBER\|PATCH_LEVEL\) *\([0-9]*\)$/\2/p' v8/include/v8-version.h | paste -sd. -)
+          case "$v8_version" in
+            [0-9]*.[0-9]*.[0-9]*.[0-9]*) ;;
+            *) echo "::error::cannot read the V8 version: $v8_version"; exit 1 ;;
+          esac
+          echo "v8_version=$v8_version" >>"$GITHUB_OUTPUT"
+          echo "v8_commit=$v8" >>"$GITHUB_OUTPUT"
           echo "crate branch: $commit" >>"$GITHUB_STEP_SUMMARY"
 
   publish:
@@ -523,6 +532,13 @@ jobs:
       id-token: write
       attestations: write
     steps:
+      # Only for the conda-forge pins the release notes list.
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          path: src
+          submodules: false
+          persist-credentials: false
+
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           pattern: rusty_v8-*
@@ -547,15 +563,29 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ inputs.tag }}
           CRATE_COMMIT: ${{ needs.crate.outputs.commit }}
+          V8_VERSION: ${{ needs.crate.outputs.v8_version }}
+          V8_COMMIT: ${{ needs.crate.outputs.v8_commit }}
         run: |
           set -euo pipefail
+          conda=$(sed -n 's/^ *\([^ ]*\.conda\) \([0-9a-f]\{64\}\)$/- `\1` `\2`/p' src/.github/workflows/release-denext.yml)
+          if [ "$(printf '%s\n' "$conda" | wc -l)" -ne 11 ]; then echo "::error::expected 11 conda packages"; exit 1; fi
           cat >notes.md <<EOF
+          **V8 $V8_VERSION** (\`$V8_COMMIT\`).
+
           rusty_v8 built from source at $GITHUB_SHA ($GITHUB_REF_NAME) by run $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID.
           See DENEXT.md on that commit for what changed against upstream.
 
           Crate source (\`cargo package\` output) for \`[patch.crates-io]\`: branch \`crate\`, commit \`$CRATE_COMMIT\`.
 
           Verify: \`sha256sum -c SHA256SUMS\` and \`gh attestation verify <file> -R $GITHUB_REPOSITORY\`.
+
+          ## Build inputs outside Chromium's pins
+
+          **Windows SDK 10.0.28000**, which V8 15.6's build requires and the \`windows-2022\` image does not ship: the bootstrapper $WINDOWS_SDK_URL, SHA-256 \`$WINDOWS_SDK_SHA256\` (winget-pkgs' \`Microsoft.WindowsSDK.10.0.28000\` 10.0.28000.2526), Authenticode signature checked. The bootstrapper downloads the SDK's components itself, and those are not pinned by hash.
+
+          **LLVM 23.1.4 from conda-forge on Intel macOS**, for bindgen's libclang only (V8 builds with Chromium's pinned clang), because LLVM publishes no x86_64 macOS tarball for that release and Homebrew has no Intel bottle past 22. Packages from \`conda.anaconda.org/conda-forge/osx-64\`, by SHA-256:
+
+          $conda
           EOF
           # Draft first, then publish: an immutable release is frozen once published.
           gh release create "$TAG" -R "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" \
