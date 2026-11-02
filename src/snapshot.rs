@@ -148,24 +148,52 @@ pub enum FunctionCodeHandling {
   Keep,
 }
 
-/// Keeps isolates away from a read-only heap that a [`SnapshotCreator`] is
-/// still writing.
+/// Keeps every isolate on a read-only heap it can use.
 ///
 /// Every isolate of the process shares one read-only heap (V8's isolate group
-/// holds it), set up by the isolate that joins an empty group. V8 frees the
-/// heap when the group's last isolate leaves, so this happens again each time
-/// the process runs out of isolates. When that isolate is a `SnapshotCreator`,
-/// V8 leaves the heap writable so the snapshot can extend it, and only seals it
-/// when the blob is created (or the creator is destroyed): it appends pages,
-/// then detaches them into the shared space and deletes the space the creator
-/// started with. An isolate created in that window attaches to the creator's
-/// writable space: on another thread it reads the page list while the creator
-/// appends to it (libc++'s "vector[] index out of bounds" in
-/// `Deserializer::ReadReadOnlyHeapRef`) or allocates into it, and on any thread
-/// it keeps a pointer to the space V8 deletes on sealing. V8 expects snapshots
-/// to be made in a process of their own (as `mksnapshot` does), so the binding
-/// enforces the window: isolate creation waits while it is open, and creating
-/// an isolate on the creator's own thread, which would wait forever, panics.
+/// holds it), set up by the isolate that joins an empty group, from that
+/// isolate's snapshot. V8 frees the heap when the group's last isolate leaves,
+/// so this happens again each time the process runs out of isolates. Two things
+/// go wrong when isolates are created regardless:
+///
+/// 1. **A heap a snapshot creator is still writing.** When the isolate that
+///    joins the empty group is a `SnapshotCreator`, V8 leaves the heap writable
+///    so the snapshot can extend it, and only seals it when the blob is created
+///    (or the creator is destroyed): it appends pages, then detaches them into
+///    the shared space and deletes the space the creator started with. An
+///    isolate created in that window attaches to the creator's writable space:
+///    it allocates into it (a SIGSEGV in `ReadOnlySpace::EnsureSpaceForAllocation`),
+///    reads its page list while the creator appends to it, and keeps a pointer
+///    to the space V8 deletes on sealing.
+/// 2. **A heap from another snapshot.** An isolate's startup snapshot refers to
+///    read-only objects by page and offset in the read-only image it was made
+///    with, but V8 attaches every isolate to the group's heap whatever its
+///    snapshot holds. A snapshot whose creator extended the read-only heap has
+///    an image of its own, so an isolate made from it while the group holds
+///    another image reads past the heap's pages (libc++'s "vector[] index out
+///    of bounds" in `Deserializer::ReadReadOnlyHeapRef`), and the reverse
+///    resolves references to the wrong objects. V8 only checks this in debug
+///    builds (`ReadOnlyArtifacts::VerifyChecksum`).
+///
+/// V8 expects snapshots to be made in a process of their own (as `mksnapshot`
+/// does), and one snapshot per process. The binding enforces both: isolate
+/// creation waits while a creator's window is open, and an isolate whose
+/// snapshot has another read-only image than the group's waits until the group
+/// is empty, then sets the heap up from its own. Isolates of the image the group
+/// holds are held back meanwhile, so the group drains, unless their thread
+/// already owns an isolate (which must not wait on the others). Creating an
+/// isolate on the creator's own thread, or one of another image on a thread
+/// that owns an isolate of the group, would wait forever and panics instead, as
+/// does a wait for the group to drain that outlasts [`DRAIN_TIMEOUT`].
+///
+/// An image is known by the read-only checksum in the snapshot blob's header.
+/// V8's built-in snapshot is told apart without one. A creator that joins a
+/// sealed heap cannot extend it, so the blob it makes refers to that heap's
+/// image: the guard records the blob's checksum as that image. A blob from
+/// elsewhere whose creator did not extend the heap either is taken for an
+/// image of its own, so its isolates wait for the group to drain when they did
+/// not need to, which is safe. A process whose isolates all come from one
+/// snapshot never waits.
 ///
 /// A snapshot creator must know whether it is joining an empty group, which
 /// `live` only answers while no isolate is being created or disposed: a creator
@@ -173,6 +201,61 @@ pub enum FunctionCodeHandling {
 /// a sealed heap under the group's mutex).
 pub(crate) mod read_only_heap_guard {
   use super::*;
+  use std::time::Duration;
+  use std::time::Instant;
+
+  /// How long an isolate waits for the isolates of another read-only image to
+  /// be disposed before it panics.
+  pub(crate) const DRAIN_TIMEOUT: Duration = Duration::from_secs(120);
+  /// How long an isolate of the group's image is held back while another
+  /// image waits for the group to drain. Past it, it proceeds: holding it
+  /// longer could deadlock a thread that waits for it while it owns an isolate.
+  const HOLD_BACK: Duration = Duration::from_secs(5);
+
+  /// The read-only image a snapshot holds, or that the group's heap was set
+  /// up from.
+  #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+  pub(crate) enum Image {
+    /// V8's built-in snapshot.
+    Default,
+    /// A snapshot blob, by the checksum of its read-only part.
+    Blob(u32),
+    /// A heap a snapshot creator has extended without producing a blob: no
+    /// snapshot matches it.
+    Unknown,
+  }
+
+  /// `kReadOnlySnapshotChecksumOffset` of V8's snapshot blob header
+  /// (`src/snapshot/snapshot.cc`, `SnapshotImpl`): after the number of
+  /// contexts, the rehashability flag and the blob's checksum, each a
+  /// `uint32_t`. The same in V8 15.2 and 15.6.
+  const READ_ONLY_CHECKSUM_OFFSET: usize = 12;
+
+  /// The read-only image of the snapshot `blob` points to; null is V8's
+  /// built-in snapshot.
+  pub(crate) fn image_of(blob: *const RawStartupData) -> Image {
+    if blob.is_null() {
+      return Image::Default;
+    }
+    let blob = unsafe { *blob };
+    blob_image(blob.data, blob.raw_size as usize)
+  }
+
+  fn blob_image(data: *const char, len: usize) -> Image {
+    if data.is_null() || len < READ_ONLY_CHECKSUM_OFFSET + 4 {
+      // V8 refuses such a blob; it never sets up a heap.
+      return Image::Unknown;
+    }
+    let mut bytes = [0u8; 4];
+    unsafe {
+      std::ptr::copy_nonoverlapping(
+        (data as *const u8).add(READ_ONLY_CHECKSUM_OFFSET),
+        bytes.as_mut_ptr(),
+        4,
+      );
+    }
+    Image::Blob(u32::from_ne_bytes(bytes))
+  }
 
   struct State {
     /// Isolates that V8's isolate group holds, while `in_flight` is zero.
@@ -184,6 +267,40 @@ pub(crate) mod read_only_heap_guard {
     /// The snapshot creator that owns the writable read-only heap: its thread
     /// and its `v8::SnapshotCreator`'s implementation pointer.
     open: Option<(ThreadId, usize)>,
+    /// The image the group's heap holds, while the group is not empty.
+    image: Option<Image>,
+    /// Threads waiting for the group to drain, to set up another image.
+    draining: usize,
+    /// Each live isolate and the thread that created it.
+    owners: Vec<(usize, ThreadId)>,
+    /// Snapshot creators that joined a sealed heap, by
+    /// [`SnapshotCreator::id`], and that heap's image.
+    attached_creators: Vec<(usize, Image)>,
+    /// Images of blobs this process made on a sealed heap: such a creator
+    /// cannot extend the heap, so its blob refers to the heap's image.
+    aliases: Vec<(u32, Image)>,
+  }
+
+  impl State {
+    fn empty(&self) -> bool {
+      self.live == 0 && self.in_flight == 0 && !self.constructing_creator
+    }
+
+    fn owns_an_isolate(&self, thread: ThreadId) -> bool {
+      self.owners.iter().any(|(_, owner)| *owner == thread)
+    }
+
+    /// The image a heap set up from `image` holds.
+    fn canonical(&self, image: Image) -> Image {
+      match image {
+        Image::Blob(checksum) => self
+          .aliases
+          .iter()
+          .find(|(c, _)| *c == checksum)
+          .map_or(image, |(_, canonical)| *canonical),
+        _ => image,
+      }
+    }
   }
 
   static STATE: Mutex<State> = Mutex::new(State {
@@ -191,6 +308,11 @@ pub(crate) mod read_only_heap_guard {
     in_flight: 0,
     constructing_creator: false,
     open: None,
+    image: None,
+    draining: 0,
+    owners: Vec::new(),
+    attached_creators: Vec::new(),
+    aliases: Vec::new(),
   });
   static CHANGED: Condvar = Condvar::new();
 
@@ -202,28 +324,102 @@ pub(crate) mod read_only_heap_guard {
     CHANGED.wait(state).unwrap_or_else(|e| e.into_inner())
   }
 
-  /// Waits for the window of an open snapshot creator to close.
-  fn wait_for_open_creator(
-    mut state: MutexGuard<'static, State>,
+  fn wait_until(
+    state: MutexGuard<'static, State>,
+    deadline: Instant,
   ) -> MutexGuard<'static, State> {
-    while let Some((owner, _)) = state.open {
-      if owner == std::thread::current().id() {
-        drop(state);
-        panic!(
-          "cannot create an isolate while this thread's v8::Isolate::snapshot_creator, the only isolate of the process, is alive: call create_blob first, or create any other isolate before the snapshot creator"
-        );
-      }
-      state = wait(state);
-    }
-    state
+    let timeout = deadline.saturating_duration_since(Instant::now());
+    CHANGED
+      .wait_timeout(state, timeout)
+      .map(|(state, _)| state)
+      .unwrap_or_else(|e| e.into_inner().0)
   }
 
-  /// Runs `create`, which calls V8 to create a regular isolate.
-  pub(crate) fn create_isolate<T>(create: impl FnOnce() -> T) -> T {
-    let mut state = wait_for_open_creator(lock());
-    while state.constructing_creator {
-      state = wait_for_open_creator(wait(state));
+  /// Waits until an isolate of `image` may join the group, and claims it:
+  /// returns whether this isolate sets up the group's heap. `creator` waits,
+  /// in addition, for every other creation and disposal to finish.
+  fn admit(image: Image, creator: bool) -> (MutexGuard<'static, State>, bool) {
+    let thread = std::thread::current().id();
+    let start = Instant::now();
+    let mut state = lock();
+    let image = state.canonical(image);
+    let mut draining = false;
+    let result = loop {
+      if let Some((owner, _)) = state.open {
+        if owner == thread {
+          if draining {
+            state.draining -= 1;
+          }
+          drop(state);
+          panic!(
+            "cannot create an isolate while this thread's v8::Isolate::snapshot_creator, the only isolate of the process, is alive: call create_blob first, or create any other isolate before the snapshot creator"
+          );
+        }
+        state = wait(state);
+        continue;
+      }
+      if state.constructing_creator || (creator && state.in_flight > 0) {
+        state = wait(state);
+        continue;
+      }
+      if state.empty() {
+        break true;
+      }
+      if state.image == Some(image) && image != Image::Unknown {
+        let held_back = state.draining > 0
+          && !draining
+          && !state.owns_an_isolate(thread)
+          && start.elapsed() < HOLD_BACK;
+        if !held_back {
+          break false;
+        }
+        state = wait_until(state, start + HOLD_BACK);
+        continue;
+      }
+      // The group holds another image: wait for it to drain.
+      if state.owns_an_isolate(thread) {
+        if draining {
+          state.draining -= 1;
+        }
+        let held = state.image;
+        drop(state);
+        panic!(
+          "cannot create an isolate from a snapshot with another read-only heap ({image:?}) than the process's isolates have ({held:?}) while this thread owns one of them: V8 shares one read-only heap between all isolates of a process, so isolates of different snapshots cannot be alive at the same time"
+        );
+      }
+      if start.elapsed() >= DRAIN_TIMEOUT {
+        if draining {
+          state.draining -= 1;
+        }
+        let held = state.image;
+        drop(state);
+        panic!(
+          "waited {DRAIN_TIMEOUT:?} to create an isolate from a snapshot with another read-only heap ({image:?}) than the process's isolates have ({held:?}): V8 shares one read-only heap between all isolates of a process, so it can only be created once they are all disposed"
+        );
+      }
+      if !draining {
+        draining = true;
+        state.draining += 1;
+      }
+      state = wait_until(state, start + DRAIN_TIMEOUT);
+    };
+    if draining {
+      state.draining -= 1;
+      CHANGED.notify_all();
     }
+    if result {
+      state.image = Some(image);
+    }
+    (state, result)
+  }
+
+  /// Runs `create`, which calls V8 to create a regular isolate from a
+  /// snapshot of `image`.
+  pub(crate) fn create_isolate(
+    image: Image,
+    create: impl FnOnce() -> *mut RealIsolate,
+  ) -> *mut RealIsolate {
+    let (mut state, _) = admit(image, false);
     state.in_flight += 1;
     drop(state);
 
@@ -232,39 +428,49 @@ pub(crate) mod read_only_heap_guard {
     let mut state = lock();
     state.in_flight -= 1;
     state.live += 1;
+    state
+      .owners
+      .push((isolate as usize, std::thread::current().id()));
     CHANGED.notify_all();
     isolate
   }
 
-  /// Runs `construct`, which calls V8 to construct a snapshot creator. It
-  /// holds the read-only heap open when it is the group's only isolate, until
-  /// [`snapshot_creator_done`] is called for it.
+  /// Runs `construct`, which calls V8 to construct a snapshot creator from a
+  /// snapshot of `image`. It holds the read-only heap open when it is the
+  /// group's only isolate, until [`snapshot_creator_done`] is called for it.
   pub(crate) fn create_snapshot_creator(
+    image: Image,
     construct: impl FnOnce() -> SnapshotCreator,
   ) -> SnapshotCreator {
-    let mut state = wait_for_open_creator(lock());
-    while state.constructing_creator || state.in_flight > 0 {
-      state = wait_for_open_creator(wait(state));
-    }
+    let (mut state, first) = admit(image, true);
     state.constructing_creator = true;
-    let first = state.live == 0;
     drop(state);
 
     let creator = construct();
+    let isolate = unsafe { v8__SnapshotCreator__GetIsolate(&creator) };
 
     let mut state = lock();
     state.constructing_creator = false;
     state.live += 1;
+    state
+      .owners
+      .push((isolate as usize, std::thread::current().id()));
     if first {
       state.open = Some((std::thread::current().id(), creator.id()));
+      state.image = Some(Image::Unknown);
+    } else if let Some(image) = state.image {
+      state.attached_creators.push((creator.id(), image));
     }
     CHANGED.notify_all();
     creator
   }
 
-  /// Runs `dispose`, which calls V8 to dispose an isolate or destroy a
-  /// snapshot creator.
-  pub(crate) fn dispose_isolate(dispose: impl FnOnce()) {
+  /// Runs `dispose`, which calls V8 to dispose `isolate` or destroy the
+  /// snapshot creator that owns it.
+  pub(crate) fn dispose_isolate(
+    isolate: *mut RealIsolate,
+    dispose: impl FnOnce(),
+  ) {
     let mut state = lock();
     while state.constructing_creator {
       state = wait(state);
@@ -277,16 +483,49 @@ pub(crate) mod read_only_heap_guard {
     let mut state = lock();
     state.in_flight -= 1;
     state.live -= 1;
+    if let Some(i) = state
+      .owners
+      .iter()
+      .position(|(ptr, _)| *ptr == isolate as usize)
+    {
+      state.owners.swap_remove(i);
+    }
+    if state.empty() {
+      state.image = None;
+    }
     CHANGED.notify_all();
   }
 
-  /// The creator with this [`SnapshotCreator::id`] has created its blob or has
-  /// been destroyed: V8 has sealed the read-only heap.
-  pub(crate) fn snapshot_creator_done(creator: usize) {
+  /// The creator with this [`SnapshotCreator::id`] has created `blob` (or
+  /// failed to, or has been destroyed): V8 has sealed the read-only heap.
+  pub(crate) fn snapshot_creator_done(
+    creator: usize,
+    blob: Option<&RawStartupData>,
+  ) {
     let mut state = lock();
     if matches!(state.open, Some((_, id)) if id == creator) {
       state.open = None;
+      if !state.empty() {
+        // The heap holds what the creator added: the image its blob carries.
+        state.image = Some(match blob {
+          Some(blob) => blob_image(blob.data, blob.raw_size as usize),
+          None => Image::Unknown,
+        });
+      }
       CHANGED.notify_all();
+    } else if let Some(i) = state
+      .attached_creators
+      .iter()
+      .position(|(id, _)| *id == creator)
+    {
+      let (_, heap) = state.attached_creators.swap_remove(i);
+      if let Some(Image::Blob(checksum)) =
+        blob.map(|blob| blob_image(blob.data, blob.raw_size as usize))
+        && heap != Image::Unknown
+        && !state.aliases.iter().any(|(c, _)| *c == checksum)
+      {
+        state.aliases.push((checksum, heap));
+      }
     }
   }
 }
@@ -346,8 +585,9 @@ impl SnapshotCreator {
     }
     let (raw_create_params, create_param_allocations) = params.finalize();
 
+    let image = read_only_heap_guard::image_of(raw_create_params.snapshot_blob);
     let snapshot_creator =
-      read_only_heap_guard::create_snapshot_creator(|| unsafe {
+      read_only_heap_guard::create_snapshot_creator(image, || unsafe {
         v8__SnapshotCreator__CONSTRUCT(
           &mut snapshot_creator,
           &raw_create_params,
@@ -367,11 +607,12 @@ impl SnapshotCreator {
 impl Drop for SnapshotCreator {
   fn drop(&mut self) {
     let id = self.id();
-    read_only_heap_guard::dispose_isolate(|| unsafe {
+    let isolate = unsafe { v8__SnapshotCreator__GetIsolate(self) };
+    read_only_heap_guard::dispose_isolate(isolate, || unsafe {
       v8__SnapshotCreator__DESTRUCT(self)
     });
     // The destructor seals the read-only heap if CreateBlob never ran.
-    read_only_heap_guard::snapshot_creator_done(id);
+    read_only_heap_guard::snapshot_creator_done(id, None);
   }
 }
 
@@ -433,7 +674,10 @@ impl SnapshotCreator {
     let blob =
       unsafe { v8__SnapshotCreator__CreateBlob(self, function_code_handling) };
     // CreateBlob seals the read-only heap before it serializes it.
-    read_only_heap_guard::snapshot_creator_done(self.id());
+    read_only_heap_guard::snapshot_creator_done(
+      self.id(),
+      (!blob.data.is_null()).then_some(&blob),
+    );
     if blob.data.is_null() {
       debug_assert!(blob.raw_size == 0);
       None

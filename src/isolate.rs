@@ -1000,8 +1000,11 @@ impl Isolate {
     crate::V8::assert_initialized();
     let (raw_create_params, create_param_allocations) = params.finalize();
     let has_embedder_cpp_heap = !raw_create_params.cpp_heap.is_null();
+    let image = crate::snapshot::read_only_heap_guard::image_of(
+      raw_create_params.snapshot_blob,
+    );
     let cxx_isolate =
-      crate::snapshot::read_only_heap_guard::create_isolate(|| unsafe {
+      crate::snapshot::read_only_heap_guard::create_isolate(image, || unsafe {
         v8__Isolate__New(&raw_create_params)
       });
     let mut isolate = unsafe { Isolate::from_raw_ptr(cxx_isolate) };
@@ -2073,9 +2076,12 @@ impl Isolate {
     // No test case in rusty_v8 show this, but there have been situations in
     // deno where dropping Annex before the states causes a segfault.
     let isolate = self.as_real_ptr();
-    crate::snapshot::read_only_heap_guard::dispose_isolate(|| unsafe {
-      v8__Isolate__Dispose(isolate);
-    });
+    crate::snapshot::read_only_heap_guard::dispose_isolate(
+      isolate,
+      || unsafe {
+        v8__Isolate__Dispose(isolate);
+      },
+    );
   }
 
   /// Take a heap snapshot. The callback is invoked one or more times

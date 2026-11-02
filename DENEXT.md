@@ -142,6 +142,32 @@ where it used to take one atomic load. Beside a live regular isolate the heap is
 creator holds nothing up. Test `test_snapshot_creator_after_last_isolate` empties the group before
 each creator.
 
+**Isolates of another snapshot** (this branch). The shared read-only heap is set up from the
+snapshot of the isolate that joins the empty group, and V8 attaches every later isolate to it
+whatever its own snapshot holds. A snapshot whose creator extended the heap has a read-only image
+of its own, and its startup data refers to read-only objects by page and offset in that image. An
+isolate made from it while the group holds V8's built-in image reads past the heap's pages:
+`vector.h:419: libc++ Hardening assertion __n < size() failed` in
+`Deserializer::ReadReadOnlyHeapRef`, deterministically and on one thread (default isolate alive,
+then `Isolate::new` from such a blob: 5 of 5 aborts on 15.6.75.33, the same on 15.2.124.45 at
+`vector.h:415`). The reverse order resolves references to the wrong objects without a crash. V8
+checks this only in debug builds (`ReadOnlyArtifacts::VerifyChecksum`: "make sure it's always the
+same snapshot"). This, and the reopened window above, are what `deno_core`'s lib tests hit on
+parallel threads: its snapshot tests load the snapshots they make while other tests hold built-in
+isolates.
+
+The guard now also tracks the group's read-only image, by the read-only checksum in the snapshot
+blob's header (`kReadOnlySnapshotChecksumOffset`, byte 12; V8's built-in snapshot is its own
+image, never equal to a blob's). An isolate of another image waits until the group is empty and
+then sets the heap up from its own; isolates of the group's image are held back for up to 5 s
+meanwhile so the group drains, unless their thread already owns an isolate. Where the wait could
+never end (the thread owns an isolate of the other image) or outlasts 120 s, creation panics with
+the cause. A process whose isolates all come from one snapshot, as Deno's do (`CLI_SNAPSHOT`),
+never waits. A creator that joins a sealed heap cannot extend it, so the guard records the blob it
+makes as that heap's image (rusty_v8's `test_api` makes such snapshots beside live isolates).
+Test `test_snapshot_read_only_image`: 5 of 5 aborts on the released guard, 20 of 20 passes here;
+the whole suite passes (Linux x86_64, prebuilt 15.6.75.33 archive; `test_api` 5 of 5).
+
 Deno is not exposed: `JsRuntimeForSnapshot` and `create_runtime_snapshot` are reached only from
 `build.rs` processes and tests, not from the runtime, `deno compile` or desktop packaging (which
 embed the prebuilt `CLI_SNAPSHOT`), and its workers are created from a sealed heap (9,600 concurrent
