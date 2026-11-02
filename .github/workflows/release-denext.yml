@@ -23,7 +23,7 @@ on:
     inputs:
       tag:
         description: Release tag (v<crate version without build metadata>-denext.<n>)
-        default: v156.0.0-denext.2
+        default: v156.0.0-denext.3
         required: true
         type: string
 
@@ -67,6 +67,10 @@ jobs:
           esac
           if gh release view "$TAG" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
             echo "::error::release $TAG already exists"; exit 1
+          fi
+          notes="denext/release-notes/$TAG.md"
+          if [ ! -s "$notes" ]; then
+            echo "::error::$notes is missing: the release notes state what changed"; exit 1
           fi
           echo "V8: $(git submodule status v8)"
 
@@ -569,11 +573,17 @@ jobs:
           set -euo pipefail
           conda=$(sed -n 's/^ *\([^ ]*\.conda\) \([0-9a-f]\{64\}\)$/- `\1` `\2`/p' src/.github/workflows/release-denext.yml)
           if [ "$(printf '%s\n' "$conda" | wc -l)" -ne 11 ]; then echo "::error::expected 11 conda packages"; exit 1; fi
+          changes="src/denext/release-notes/$TAG.md"
+          if [ ! -s "$changes" ]; then echo "::error::$changes is missing"; exit 1; fi
           cat >notes.md <<EOF
           **V8 $V8_VERSION** (\`$V8_COMMIT\`).
 
           rusty_v8 built from source at $GITHUB_SHA ($GITHUB_REF_NAME) by run $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID.
           See DENEXT.md on that commit for what changed against upstream.
+
+          ## Changes
+
+          $(cat "$changes")
 
           Crate source (\`cargo package\` output) for \`[patch.crates-io]\`: branch \`crate\`, commit \`$CRATE_COMMIT\`.
 
