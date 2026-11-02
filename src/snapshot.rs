@@ -181,7 +181,8 @@ pub enum FunctionCodeHandling {
 /// snapshot has another read-only image than the group's waits until the group
 /// is empty, then sets the heap up from its own. Isolates of the image the group
 /// holds are held back meanwhile, so the group drains, unless their thread
-/// already owns an isolate (which must not wait on the others). Creating an
+/// already owns an isolate (which must not wait on the others), and once it has
+/// drained they let the waiting isolate set up its image first. Creating an
 /// isolate on the creator's own thread, or one of another image on a thread
 /// that owns an isolate of the group, would wait forever and panics instead, as
 /// does a wait for the group to drain that outlasts [`DRAIN_TIMEOUT`].
@@ -201,6 +202,7 @@ pub enum FunctionCodeHandling {
 /// a sealed heap under the group's mutex).
 pub(crate) mod read_only_heap_guard {
   use super::*;
+  use std::collections::BTreeMap;
   use std::time::Duration;
   use std::time::Instant;
 
@@ -271,23 +273,44 @@ pub(crate) mod read_only_heap_guard {
     image: Option<Image>,
     /// Threads waiting for the group to drain, to set up another image.
     draining: usize,
-    /// Each live isolate and the thread that created it.
-    owners: Vec<(usize, ThreadId)>,
+    /// Each live isolate, by address, and the thread that created it. An
+    /// isolate leaves it before V8 disposes it, so an isolate V8 creates at
+    /// the same address meanwhile is not mistaken for it.
+    owners: BTreeMap<usize, ThreadId>,
     /// Snapshot creators that joined a sealed heap, by
     /// [`SnapshotCreator::id`], and that heap's image.
     attached_creators: Vec<(usize, Image)>,
     /// Images of blobs this process made on a sealed heap: such a creator
     /// cannot extend the heap, so its blob refers to the heap's image.
     aliases: Vec<(u32, Image)>,
+    /// How many times a thread waited in [`Guard::admit`].
+    #[cfg(test)]
+    waits: usize,
   }
 
   impl State {
+    const fn new() -> Self {
+      Self {
+        live: 0,
+        in_flight: 0,
+        constructing_creator: false,
+        open: None,
+        image: None,
+        draining: 0,
+        owners: BTreeMap::new(),
+        attached_creators: Vec::new(),
+        aliases: Vec::new(),
+        #[cfg(test)]
+        waits: 0,
+      }
+    }
+
     fn empty(&self) -> bool {
       self.live == 0 && self.in_flight == 0 && !self.constructing_creator
     }
 
     fn owns_an_isolate(&self, thread: ThreadId) -> bool {
-      self.owners.iter().any(|(_, owner)| *owner == thread)
+      self.owners.values().any(|owner| *owner == thread)
     }
 
     /// The image a heap set up from `image` holds.
@@ -303,50 +326,69 @@ pub(crate) mod read_only_heap_guard {
     }
   }
 
-  static STATE: Mutex<State> = Mutex::new(State {
-    live: 0,
-    in_flight: 0,
-    constructing_creator: false,
-    open: None,
-    image: None,
-    draining: 0,
-    owners: Vec::new(),
-    attached_creators: Vec::new(),
-    aliases: Vec::new(),
-  });
-  static CHANGED: Condvar = Condvar::new();
-
-  fn lock() -> MutexGuard<'static, State> {
-    STATE.lock().unwrap_or_else(|e| e.into_inner())
+  /// The process's guard. Tests make their own, with shorter timeouts.
+  pub(crate) struct Guard {
+    state: Mutex<State>,
+    changed: Condvar,
+    drain_timeout: Duration,
+    hold_back: Duration,
   }
 
-  fn wait(state: MutexGuard<'static, State>) -> MutexGuard<'static, State> {
-    CHANGED.wait(state).unwrap_or_else(|e| e.into_inner())
-  }
+  static GUARD: Guard = Guard::new(DRAIN_TIMEOUT, HOLD_BACK);
 
-  fn wait_until(
-    state: MutexGuard<'static, State>,
-    deadline: Instant,
-  ) -> MutexGuard<'static, State> {
-    let timeout = deadline.saturating_duration_since(Instant::now());
-    CHANGED
-      .wait_timeout(state, timeout)
-      .map(|(state, _)| state)
-      .unwrap_or_else(|e| e.into_inner().0)
-  }
+  impl Guard {
+    const fn new(drain_timeout: Duration, hold_back: Duration) -> Self {
+      Self {
+        state: Mutex::new(State::new()),
+        changed: Condvar::new(),
+        drain_timeout,
+        hold_back,
+      }
+    }
 
-  /// Waits until an isolate of `image` may join the group, and claims it:
-  /// returns whether this isolate sets up the group's heap. `creator` waits,
-  /// in addition, for every other creation and disposal to finish.
-  fn admit(image: Image, creator: bool) -> (MutexGuard<'static, State>, bool) {
-    let thread = std::thread::current().id();
-    let start = Instant::now();
-    let mut state = lock();
-    let image = state.canonical(image);
-    let mut draining = false;
-    let result = loop {
-      if let Some((owner, _)) = state.open {
-        if owner == thread {
+    fn lock(&self) -> MutexGuard<'_, State> {
+      self.state.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn wait<'a>(&self, state: MutexGuard<'a, State>) -> MutexGuard<'a, State> {
+      self.changed.wait(state).unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn wait_until<'a>(
+      &self,
+      state: MutexGuard<'a, State>,
+      deadline: Instant,
+    ) -> MutexGuard<'a, State> {
+      let timeout = deadline.saturating_duration_since(Instant::now());
+      self
+        .changed
+        .wait_timeout(state, timeout)
+        .map(|(state, _)| state)
+        .unwrap_or_else(|e| e.into_inner().0)
+    }
+
+    /// Waits until an isolate of `image` may join the group, and claims it:
+    /// returns whether this isolate sets up the group's heap. `creator` waits,
+    /// in addition, for every other creation and disposal to finish.
+    fn admit(
+      &self,
+      image: Image,
+      creator: bool,
+    ) -> (MutexGuard<'_, State>, bool) {
+      let thread = std::thread::current().id();
+      let start = Instant::now();
+      let mut state = self.lock();
+      let image = state.canonical(image);
+      let mut draining = false;
+      let result = loop {
+        // Whether to hold this isolate back for one that waits for the group
+        // to drain: not when it waits for that itself, nor once its hold-back
+        // has run out.
+        let hold_back =
+          state.draining > 0 && !draining && start.elapsed() < self.hold_back;
+        if let Some((owner, _)) = state.open
+          && owner == thread
+        {
           if draining {
             state.draining -= 1;
           }
@@ -355,62 +397,186 @@ pub(crate) mod read_only_heap_guard {
             "cannot create an isolate while this thread's v8::Isolate::snapshot_creator, the only isolate of the process, is alive: call create_blob first, or create any other isolate before the snapshot creator"
           );
         }
-        state = wait(state);
-        continue;
+        if state.open.is_some()
+          || state.constructing_creator
+          || (creator && state.in_flight > 0)
+        {
+          // A creator's window is open, or a creator waits to start alone.
+          #[cfg(test)]
+          {
+            state.waits += 1;
+          }
+          state = self.wait(state);
+          continue;
+        }
+        if state.empty() {
+          // An isolate waiting to set up another image goes first.
+          if !hold_back {
+            break true;
+          }
+          #[cfg(test)]
+          {
+            state.waits += 1;
+          }
+          state = self.wait_until(state, start + self.hold_back);
+          continue;
+        }
+        if state.image == Some(image) && image != Image::Unknown {
+          if !hold_back || state.owns_an_isolate(thread) {
+            break false;
+          }
+          #[cfg(test)]
+          {
+            state.waits += 1;
+          }
+          state = self.wait_until(state, start + self.hold_back);
+          continue;
+        } else {
+          // The group holds another image: wait for it to drain.
+          if state.owns_an_isolate(thread) {
+            if draining {
+              state.draining -= 1;
+            }
+            let held = state.image;
+            drop(state);
+            panic!(
+              "cannot create an isolate from a snapshot with another read-only heap ({image:?}) than the process's isolates have ({held:?}) while this thread owns one of them: V8 shares one read-only heap between all isolates of a process, so isolates of different snapshots cannot be alive at the same time"
+            );
+          }
+          if start.elapsed() >= self.drain_timeout {
+            if draining {
+              state.draining -= 1;
+            }
+            let held = state.image;
+            let timeout = self.drain_timeout;
+            drop(state);
+            panic!(
+              "waited {timeout:?} to create an isolate from a snapshot with another read-only heap ({image:?}) than the process's isolates have ({held:?}): V8 shares one read-only heap between all isolates of a process, so it can only be created once they are all disposed"
+            );
+          }
+          if !draining {
+            draining = true;
+            state.draining += 1;
+          }
+          #[cfg(test)]
+          {
+            state.waits += 1;
+          }
+          state = self.wait_until(state, start + self.drain_timeout);
+        }
+      };
+      if draining {
+        state.draining -= 1;
+        self.changed.notify_all();
       }
-      if state.constructing_creator || (creator && state.in_flight > 0) {
-        state = wait(state);
-        continue;
+      if result {
+        state.image = Some(image);
       }
+      (state, result)
+    }
+
+    /// Runs `create`, which calls V8 to create a regular isolate from a
+    /// snapshot of `image`.
+    fn create_isolate(
+      &self,
+      image: Image,
+      create: impl FnOnce() -> *mut RealIsolate,
+    ) -> *mut RealIsolate {
+      let (mut state, _) = self.admit(image, false);
+      state.in_flight += 1;
+      drop(state);
+
+      let isolate = create();
+
+      let mut state = self.lock();
+      state.in_flight -= 1;
+      state.live += 1;
+      state
+        .owners
+        .insert(isolate as usize, std::thread::current().id());
+      self.changed.notify_all();
+      isolate
+    }
+
+    /// Admits a snapshot creator of `image`, which must then be constructed
+    /// and passed to [`Self::creator_constructed`]: returns whether it joins
+    /// an empty group.
+    fn begin_creator(&self, image: Image) -> bool {
+      let (mut state, first) = self.admit(image, true);
+      state.constructing_creator = true;
+      first
+    }
+
+    /// The snapshot creator [`Self::begin_creator`] admitted, with this
+    /// [`SnapshotCreator::id`] and isolate, is constructed. It holds the
+    /// read-only heap open when it is the group's only isolate, until
+    /// [`Self::snapshot_creator_done`] is called for it.
+    fn creator_constructed(&self, first: bool, isolate: usize, id: usize) {
+      let mut state = self.lock();
+      state.constructing_creator = false;
+      state.live += 1;
+      state.owners.insert(isolate, std::thread::current().id());
+      if first {
+        state.open = Some((std::thread::current().id(), id));
+        state.image = Some(Image::Unknown);
+      } else if let Some(image) = state.image {
+        state.attached_creators.push((id, image));
+      }
+      self.changed.notify_all();
+    }
+
+    /// Runs `dispose`, which calls V8 to dispose `isolate` or destroy the
+    /// snapshot creator that owns it.
+    fn dispose_isolate(
+      &self,
+      isolate: *mut RealIsolate,
+      dispose: impl FnOnce(),
+    ) {
+      let mut state = self.lock();
+      while state.constructing_creator {
+        state = self.wait(state);
+      }
+      state.in_flight += 1;
+      state.owners.remove(&(isolate as usize));
+      drop(state);
+
+      dispose();
+
+      let mut state = self.lock();
+      state.in_flight -= 1;
+      state.live -= 1;
       if state.empty() {
-        break true;
+        state.image = None;
       }
-      if state.image == Some(image) && image != Image::Unknown {
-        let held_back = state.draining > 0
-          && !draining
-          && !state.owns_an_isolate(thread)
-          && start.elapsed() < HOLD_BACK;
-        if !held_back {
-          break false;
-        }
-        state = wait_until(state, start + HOLD_BACK);
-        continue;
-      }
-      // The group holds another image: wait for it to drain.
-      if state.owns_an_isolate(thread) {
-        if draining {
-          state.draining -= 1;
-        }
-        let held = state.image;
-        drop(state);
-        panic!(
-          "cannot create an isolate from a snapshot with another read-only heap ({image:?}) than the process's isolates have ({held:?}) while this thread owns one of them: V8 shares one read-only heap between all isolates of a process, so isolates of different snapshots cannot be alive at the same time"
-        );
-      }
-      if start.elapsed() >= DRAIN_TIMEOUT {
-        if draining {
-          state.draining -= 1;
-        }
-        let held = state.image;
-        drop(state);
-        panic!(
-          "waited {DRAIN_TIMEOUT:?} to create an isolate from a snapshot with another read-only heap ({image:?}) than the process's isolates have ({held:?}): V8 shares one read-only heap between all isolates of a process, so it can only be created once they are all disposed"
-        );
-      }
-      if !draining {
-        draining = true;
-        state.draining += 1;
-      }
-      state = wait_until(state, start + DRAIN_TIMEOUT);
-    };
-    if draining {
-      state.draining -= 1;
-      CHANGED.notify_all();
+      self.changed.notify_all();
     }
-    if result {
-      state.image = Some(image);
+
+    /// The creator with this [`SnapshotCreator::id`] has created a blob of
+    /// `blob` (or failed to, or has been destroyed): V8 has sealed the
+    /// read-only heap.
+    fn snapshot_creator_done(&self, creator: usize, blob: Option<Image>) {
+      let mut state = self.lock();
+      if matches!(state.open, Some((_, id)) if id == creator) {
+        state.open = None;
+        if !state.empty() {
+          // The heap holds what the creator added: the image its blob carries.
+          state.image = Some(blob.unwrap_or(Image::Unknown));
+        }
+        self.changed.notify_all();
+      } else if let Some(i) = state
+        .attached_creators
+        .iter()
+        .position(|(id, _)| *id == creator)
+      {
+        let (_, heap) = state.attached_creators.swap_remove(i);
+        if let Some(Image::Blob(checksum)) = blob
+          && heap != Image::Unknown
+          && !state.aliases.iter().any(|(c, _)| *c == checksum)
+        {
+          state.aliases.push((checksum, heap));
+        }
+      }
     }
-    (state, result)
   }
 
   /// Runs `create`, which calls V8 to create a regular isolate from a
@@ -419,20 +585,7 @@ pub(crate) mod read_only_heap_guard {
     image: Image,
     create: impl FnOnce() -> *mut RealIsolate,
   ) -> *mut RealIsolate {
-    let (mut state, _) = admit(image, false);
-    state.in_flight += 1;
-    drop(state);
-
-    let isolate = create();
-
-    let mut state = lock();
-    state.in_flight -= 1;
-    state.live += 1;
-    state
-      .owners
-      .push((isolate as usize, std::thread::current().id()));
-    CHANGED.notify_all();
-    isolate
+    GUARD.create_isolate(image, create)
   }
 
   /// Runs `construct`, which calls V8 to construct a snapshot creator from a
@@ -442,26 +595,10 @@ pub(crate) mod read_only_heap_guard {
     image: Image,
     construct: impl FnOnce() -> SnapshotCreator,
   ) -> SnapshotCreator {
-    let (mut state, first) = admit(image, true);
-    state.constructing_creator = true;
-    drop(state);
-
+    let first = GUARD.begin_creator(image);
     let creator = construct();
     let isolate = unsafe { v8__SnapshotCreator__GetIsolate(&creator) };
-
-    let mut state = lock();
-    state.constructing_creator = false;
-    state.live += 1;
-    state
-      .owners
-      .push((isolate as usize, std::thread::current().id()));
-    if first {
-      state.open = Some((std::thread::current().id(), creator.id()));
-      state.image = Some(Image::Unknown);
-    } else if let Some(image) = state.image {
-      state.attached_creators.push((creator.id(), image));
-    }
-    CHANGED.notify_all();
+    GUARD.creator_constructed(first, isolate as usize, creator.id());
     creator
   }
 
@@ -471,29 +608,7 @@ pub(crate) mod read_only_heap_guard {
     isolate: *mut RealIsolate,
     dispose: impl FnOnce(),
   ) {
-    let mut state = lock();
-    while state.constructing_creator {
-      state = wait(state);
-    }
-    state.in_flight += 1;
-    drop(state);
-
-    dispose();
-
-    let mut state = lock();
-    state.in_flight -= 1;
-    state.live -= 1;
-    if let Some(i) = state
-      .owners
-      .iter()
-      .position(|(ptr, _)| *ptr == isolate as usize)
-    {
-      state.owners.swap_remove(i);
-    }
-    if state.empty() {
-      state.image = None;
-    }
-    CHANGED.notify_all();
+    GUARD.dispose_isolate(isolate, dispose);
   }
 
   /// The creator with this [`SnapshotCreator::id`] has created `blob` (or
@@ -502,30 +617,246 @@ pub(crate) mod read_only_heap_guard {
     creator: usize,
     blob: Option<&RawStartupData>,
   ) {
-    let mut state = lock();
-    if matches!(state.open, Some((_, id)) if id == creator) {
-      state.open = None;
-      if !state.empty() {
-        // The heap holds what the creator added: the image its blob carries.
-        state.image = Some(match blob {
-          Some(blob) => blob_image(blob.data, blob.raw_size as usize),
-          None => Image::Unknown,
+    GUARD.snapshot_creator_done(
+      creator,
+      blob.map(|blob| blob_image(blob.data, blob.raw_size as usize)),
+    );
+  }
+
+  // The guard's bookkeeping, on guards of their own and with stand-ins for the
+  // isolates V8 would create: the timing these tests need is not reachable
+  // through V8 (tests/test_snapshot_*.rs cover the guard with real isolates).
+  #[cfg(test)]
+  mod tests {
+    use super::*;
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::atomic::Ordering;
+    use std::sync::mpsc;
+    use std::thread;
+
+    const A: Image = Image::Blob(0xa);
+    const B: Image = Image::Blob(0xb);
+
+    fn guard(drain_timeout: Duration, hold_back: Duration) -> &'static Guard {
+      Box::leak(Box::new(Guard::new(drain_timeout, hold_back)))
+    }
+
+    fn isolate(address: usize) -> *mut RealIsolate {
+      address as *mut RealIsolate
+    }
+
+    fn create(guard: &Guard, image: Image, address: usize) {
+      guard.create_isolate(image, || isolate(address));
+    }
+
+    fn dispose(guard: &Guard, address: usize) {
+      guard.dispose_isolate(isolate(address), || {});
+    }
+
+    fn until(mut done: impl FnMut() -> bool) {
+      let deadline = Instant::now() + Duration::from_secs(10);
+      while !done() {
+        assert!(Instant::now() < deadline, "timed out");
+        thread::sleep(Duration::from_millis(1));
+      }
+    }
+
+    fn panic_message(result: thread::Result<()>) -> String {
+      let Err(payload) = result else {
+        panic!("expected a panic");
+      };
+      payload
+        .downcast_ref::<String>()
+        .cloned()
+        .unwrap_or_default()
+    }
+
+    #[test]
+    fn isolates_of_one_image_never_wait() {
+      let guard = guard(DRAIN_TIMEOUT, HOLD_BACK);
+      let next = Arc::new(AtomicUsize::new(1));
+      let threads: Vec<_> = (0..8)
+        .map(|_| {
+          let next = next.clone();
+          thread::spawn(move || {
+            let mut held = Vec::new();
+            for i in 0..500 {
+              let address = next.fetch_add(1, Ordering::Relaxed);
+              create(guard, A, address);
+              held.push(address);
+              if i % 3 == 0 {
+                for address in held.drain(..) {
+                  dispose(guard, address);
+                }
+              }
+            }
+            for address in held {
+              dispose(guard, address);
+            }
+          })
+        })
+        .collect();
+      for t in threads {
+        t.join().unwrap();
+      }
+      let state = guard.lock();
+      assert_eq!(state.waits, 0);
+      assert!(state.empty());
+      assert!(state.owners.is_empty());
+      assert_eq!(state.image, None);
+    }
+
+    // V8 may create an isolate at the address of one it is disposing. The
+    // disposed isolate's owner used to be removed by address after V8 had
+    // disposed it, so the new isolate's entry could go instead: its thread then
+    // looked as if it owned no isolate, and the disposing one as if it still
+    // did (and panicked on its next isolate of another image).
+    #[test]
+    fn an_address_reused_during_dispose_keeps_its_new_owner() {
+      let guard = guard(DRAIN_TIMEOUT, HOLD_BACK);
+      let me = thread::current().id();
+      let other = thread::spawn(move || create(guard, A, 1));
+      other.join().unwrap();
+      create(guard, A, 2);
+      let (tx, rx) = mpsc::channel();
+      guard.dispose_isolate(isolate(2), || {
+        // V8 creates an isolate at address 2 on another thread, and another
+        // isolate is disposed, while this one is disposed.
+        let reuser = thread::spawn(move || {
+          create(guard, A, 2);
+          tx.send(thread::current().id()).unwrap();
         });
-      }
-      CHANGED.notify_all();
-    } else if let Some(i) = state
-      .attached_creators
-      .iter()
-      .position(|(id, _)| *id == creator)
-    {
-      let (_, heap) = state.attached_creators.swap_remove(i);
-      if let Some(Image::Blob(checksum)) =
-        blob.map(|blob| blob_image(blob.data, blob.raw_size as usize))
-        && heap != Image::Unknown
-        && !state.aliases.iter().any(|(c, _)| *c == checksum)
+        reuser.join().unwrap();
+        dispose(guard, 1);
+      });
+      let reuser = rx.recv().unwrap();
       {
-        state.aliases.push((checksum, heap));
+        let state = guard.lock();
+        assert_eq!(state.owners.get(&2), Some(&reuser));
+        assert!(!state.owns_an_isolate(me));
+        assert_eq!(state.live, 1);
       }
+      dispose(guard, 2);
+      assert!(guard.lock().empty());
+    }
+
+    // Once the group has drained, the isolate that waited for it sets up its
+    // image before an isolate of the drained image may set that up again.
+    #[test]
+    fn a_drained_group_goes_to_the_isolate_that_waited() {
+      let guard = guard(Duration::from_secs(30), Duration::from_secs(10));
+      let order = Arc::new(Mutex::new(Vec::new()));
+      let (release_tx, release_rx) = mpsc::channel::<()>();
+      let (dispose_tx, dispose_rx) = mpsc::channel::<()>();
+      let holder = {
+        let order = order.clone();
+        thread::spawn(move || {
+          create(guard, A, 1);
+          dispose_rx.recv().unwrap();
+          dispose(guard, 1);
+          // At once, on the same thread: the group is empty, and this thread
+          // gets the mutex before the waiting one wakes.
+          create(guard, A, 3);
+          order.lock().unwrap().push("A");
+          dispose(guard, 3);
+        })
+      };
+      until(|| guard.lock().live == 1);
+      let waiter = {
+        let order = order.clone();
+        thread::spawn(move || {
+          create(guard, B, 2);
+          order.lock().unwrap().push("B");
+          release_rx.recv().unwrap();
+          dispose(guard, 2);
+        })
+      };
+      until(|| guard.lock().draining == 1);
+      dispose_tx.send(()).unwrap();
+      until(|| !order.lock().unwrap().is_empty());
+      release_tx.send(()).unwrap();
+      waiter.join().unwrap();
+      holder.join().unwrap();
+      assert_eq!(*order.lock().unwrap(), ["B", "A"]);
+      assert!(guard.lock().empty());
+    }
+
+    #[test]
+    fn a_held_back_isolate_proceeds_after_the_hold_back() {
+      let hold_back = Duration::from_millis(200);
+      let guard = guard(Duration::from_secs(30), hold_back);
+      let (tx, rx) = mpsc::channel::<()>();
+      let holder = thread::spawn(move || {
+        create(guard, A, 1);
+        rx.recv().unwrap();
+        dispose(guard, 1);
+      });
+      until(|| guard.lock().live == 1);
+      let waiter = thread::spawn(move || {
+        create(guard, B, 2);
+        dispose(guard, 2);
+      });
+      until(|| guard.lock().draining == 1);
+      let start = Instant::now();
+      create(guard, A, 3);
+      let waited = start.elapsed();
+      assert!(waited >= hold_back, "{waited:?}");
+      assert!(waited < Duration::from_secs(5), "{waited:?}");
+      // A thread that owns an isolate is never held back.
+      create(guard, A, 4);
+      assert!(start.elapsed() < hold_back * 2 + Duration::from_secs(1));
+      dispose(guard, 4);
+      dispose(guard, 3);
+      tx.send(()).unwrap();
+      holder.join().unwrap();
+      waiter.join().unwrap();
+      assert!(guard.lock().empty());
+    }
+
+    #[test]
+    fn another_image_on_a_thread_that_owns_an_isolate_panics() {
+      let guard = guard(DRAIN_TIMEOUT, HOLD_BACK);
+      create(guard, A, 1);
+      let message = panic_message(std::panic::catch_unwind(|| {
+        create(guard, B, 2);
+      }));
+      assert!(message.contains("while this thread owns one"), "{message}");
+      assert_eq!(guard.lock().draining, 0);
+      dispose(guard, 1);
+      create(guard, B, 2);
+      dispose(guard, 2);
+      assert!(guard.lock().empty());
+    }
+
+    #[test]
+    fn a_drain_that_outlasts_the_timeout_panics() {
+      let timeout = Duration::from_millis(200);
+      let guard = guard(timeout, HOLD_BACK);
+      let (tx, rx) = mpsc::channel::<()>();
+      let holder = thread::spawn(move || {
+        create(guard, A, 1);
+        rx.recv().unwrap();
+        dispose(guard, 1);
+      });
+      until(|| guard.lock().live == 1);
+      let start = Instant::now();
+      let message = panic_message(std::panic::catch_unwind(|| {
+        create(guard, B, 2);
+      }));
+      assert!(start.elapsed() >= timeout);
+      assert!(message.contains("waited"), "{message}");
+      {
+        let state = guard.lock();
+        assert_eq!(state.draining, 0);
+        assert_eq!(state.in_flight, 0);
+      }
+      // Nothing is held back by the drain that gave up.
+      create(guard, A, 3);
+      dispose(guard, 3);
+      tx.send(()).unwrap();
+      holder.join().unwrap();
+      assert!(guard.lock().empty());
     }
   }
 }

@@ -3,6 +3,18 @@
 This fork builds rusty_v8 for the Brainwires Deno fork (denext's runtime). It exists to ship V8
 security fixes that upstream rusty_v8 has not released yet. It is not published to crates.io.
 
+## `v156.0.0-denext.3`: V8 15.6.75.33, read-only heap guard
+
+V8 is unchanged (15.6.75.33, `292c5548f4`); the crate is `156.0.0+denext.3`. The binding's guard
+on V8's shared read-only heap (`snapshot::read_only_heap_guard`) now covers the two cases the
+`denext.2` guard missed, both described under [Snapshot creators and concurrent
+isolates](#snapshot-creators-and-concurrent-isolates): a snapshot creator that joins an isolate
+group V8 has emptied and set up anew, and isolates of snapshots with different read-only images
+alive at the same time (a deterministic abort in `Deserializer::ReadReadOnlyHeapRef`). Creating and
+disposing an isolate now takes the guard's mutex (about 46 ns per create and dispose,
+uncontended). A process whose isolates all come from one snapshot never waits. The release notes
+now carry a summary of the release's changes (`denext/release-notes/<tag>.md`).
+
 ## `v156.0.0-denext.2`: V8 15.6.75.33
 
 A patch-level move on `branch-heads/15.6`: the `v8` submodule moves from 15.6.75.32 to 15.6.75.33
@@ -127,7 +139,7 @@ waiting would never end). Snapshots are unchanged (the creator still extends rea
 Test `test_snapshot_creator_concurrent_isolates` (its own binary, so the creator is the first
 isolate) failed 9 of 20 runs without the guard and 0 of 60 with it; `tests/slots.rs` 0 of 100.
 
-**The window reopens** (fixed on this branch, not in a release yet). The guard took the heap to be sealed for
+**The window reopens** (fixed in `denext.3`). The guard took the heap to be sealed for
 good once a regular isolate had existed. V8 frees it when the group's last isolate is disposed
 (`IsolateGroup::RemoveIsolate`), and the next isolate sets up a new one, so a snapshot creator
 created after the process ran out of isolates had a writable heap and no guard, and regular isolates
@@ -142,7 +154,7 @@ where it used to take one atomic load. Beside a live regular isolate the heap is
 creator holds nothing up. Test `test_snapshot_creator_after_last_isolate` empties the group before
 each creator.
 
-**Isolates of another snapshot** (this branch). The shared read-only heap is set up from the
+**Isolates of another snapshot** (fixed in `denext.3`). The shared read-only heap is set up from the
 snapshot of the isolate that joins the empty group, and V8 attaches every later isolate to it
 whatever its own snapshot holds. A snapshot whose creator extended the heap has a read-only image
 of its own, and its startup data refers to read-only objects by page and offset in that image. An
@@ -167,6 +179,31 @@ never waits. A creator that joins a sealed heap cannot extend it, so the guard r
 makes as that heap's image (rusty_v8's `test_api` makes such snapshots beside live isolates).
 Test `test_snapshot_read_only_image`: 5 of 5 aborts on the released guard, 20 of 20 passes here;
 the whole suite passes (Linux x86_64, prebuilt 15.6.75.33 archive; `test_api` 5 of 5).
+
+**Review before release.** Three changes. (1) The guard removes an isolate from its owners before
+V8 disposes it: it used to remove the entry by address afterwards, so when V8 created another
+isolate at the same address meanwhile, the entry of the new isolate could go instead, and the
+disposing thread then looked as if it still owned an isolate (and would panic on its next isolate
+of another image). (2) Once the group has drained, an isolate that waited to set up another image
+goes first: isolates of the drained image are held back from an empty group too, within their 5 s,
+where any thread that took the mutex first could set the old image up again and send the waiting
+one into another drain, up to its 120 s panic. (3) The bookkeeping is one `Guard` value, so the
+unit tests in `src/snapshot.rs` drive it with stand-in isolates and short timeouts, and owners are
+kept in a map instead of a list. The unit tests cover both fixes (each fails without its fix), a
+single image never waiting under 8 threads, the hold-back running out, and both panics.
+
+Waits that can still last: an isolate waits without a limit while another thread's snapshot creator
+holds the heap open, and a creator waits without a limit for creations and disposals in flight (one
+that V8 runs embedder code in, such as a backing store's deleter, must not wait for a thread that is
+creating a creator). A thread that waits for the group to drain while it holds a lock that the other
+image's disposal needs waits for its 120 s, then panics. An isolate used on another thread than the
+one that created it (through a `Locker`) is counted for its creating thread. None of these happens in
+Deno, whose runtime creates every isolate from `CLI_SNAPSHOT` on the thread that runs it.
+
+Cost, `Isolate::new` + drop on Apple M-series (aarch64-apple-darwin, release, one isolate kept
+alive): about 150 us per isolate on one thread and 49 us per isolate on 8 threads, with and without
+the guard (the runs differ by less than their noise, 2 %); the guard alone, measured with stand-in
+isolates, costs 46 ns per create and dispose on one thread and 193 ns on 8 contending threads.
 
 Deno is not exposed: `JsRuntimeForSnapshot` and `create_runtime_snapshot` are reached only from
 `build.rs` processes and tests, not from the runtime, `deno compile` or desktop packaging (which
