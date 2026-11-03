@@ -3,6 +3,27 @@
 This fork builds rusty_v8 for the Brainwires Deno fork (denext's runtime). It exists to ship V8
 security fixes that upstream rusty_v8 has not released yet. It is not published to crates.io.
 
+## `v156.0.0-denext.4`: V8 15.6.75.38
+
+A patch-level move on `branch-heads/15.6`, which was at its head on 2026-11-03: the `v8` submodule
+moves from 15.6.75.33 (`292c5548f4`) to 15.6.75.38 (`96c8e217cf`). The five merges between them:
+
+- `32bb3bf0bb` "[M156] [modules] Do not cache star exports after linking" (crbug 576122160,
+  574038247).
+- `0ae4806f48` "[M156] [fastapi] Don't catch uncatchable exceptions after deopt" (crbug 578797801,
+  577627207).
+- `0113334b37` "[debug][wasm] Defer debugger break in optimized Wasm frames" (crbug 577352626,
+  579732376).
+- `a78a00bf57` "[M156] [scopes] Fix private name resolution in catch scopes and heritage eval"
+  (crbug 576947634).
+- `0ac55dd376` "[M156] [scopes] Restore synthetic eval heritage skip bit from inner scope" (crbug
+  576947634, 572988453, 573962535).
+
+V8's `DEPS` and public headers did not change between them (only `include/v8-version.h`), and none
+of the merges touches a file the `denext/patches/v8` patches change, so no other submodule, patch or
+binding moved. The read-only heap guard of `denext.3` is unchanged. The crate is
+`156.0.0+denext.4`.
+
 ## `v156.0.0-denext.3`: V8 15.6.75.33, read-only heap guard
 
 V8 is unchanged (15.6.75.33, `292c5548f4`); the crate is `156.0.0+denext.3`. The binding's guard
