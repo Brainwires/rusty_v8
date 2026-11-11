@@ -327,6 +327,14 @@ attestation (`gh attestation verify <file> -R Brainwires/rusty_v8`).
 ## Next
 
 Patch-level bumps on `branch-heads/15.6` are a `v8` submodule move plus a release (the patches
-apply unchanged within a branch). The next major is Extended Stable 160 (V8 16.0, about
+apply unchanged within a branch). `.github/workflows/patch-bump-denext.yml` (dispatch only, never
+scheduled; `tools/denext_patch_bump.py`, upstream's `tools/auto_update_v8.ts` pointed at the
+pinned branch) makes the move: it reads the branch head, refuses one whose `DEPS` moved or that
+`denext/patches/v8` no longer applies to, bumps the crate's `+denext.<n>`, the release workflow's
+default tag and the README, writes the release notes and a section here listing the merges, and
+opens a pull request. It reports how long the pin has lacked the oldest merge it is missing (the
+Deno fork's engine staleness gate fails a runtime tag past 14 days). After the merge, dispatch
+`release-denext.yml` with the new tag. `--dry-run` (the `dry_run` input) writes the bump without
+a branch or pull request. The next major is Extended Stable 160 (V8 16.0, about
 mid-December 2026): move the submodules to its `DEPS`, re-export the patches (`git format-patch`
 from a rebased checkout) and follow the binding changes.

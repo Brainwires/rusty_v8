@@ -1,0 +1,78 @@
+# Brainwires denext patch bump of V8 (see DENEXT.md).
+#
+# Dispatch only; never scheduled. Moves the `v8` submodule of the base branch
+# to the head of the V8 branch it is on (`branch-heads/<major>.<minor>`), when
+# that head has merges the pin lacks, and opens a pull request with the bump:
+# the crate's `+denext.<n>`, release-denext.yml's default tag, the README, the
+# release notes and a DENEXT.md section listing the merges. It refuses a head
+# whose DEPS moved or that the denext/patches/v8 series no longer applies to
+# (not a patch bump). tools/denext_patch_bump.py does the work; it is
+# upstream's tools/auto_update_v8.ts pointed at our branch. The release
+# follows the merge: dispatch release-denext.yml with the new tag.
+#
+# The log and the pull request say how long the pin has lacked the oldest merge
+# it is missing: the deno fork's engine staleness gate fails a runtime tag once
+# that is past 14 days.
+#
+# A pull request opened with the workflow token starts no workflow run; the
+# repository setting "Allow GitHub Actions to create and approve pull
+# requests" must be on for `gh pr create` to work.
+
+name: patch-bump-denext
+
+on:
+  workflow_dispatch:
+    inputs:
+      base:
+        description: The denext branch whose V8 pin moves
+        default: v8-15.6-denext
+        required: true
+        type: string
+      dry_run:
+        description: Write the bump in the runner only (no branch, no pull request)
+        default: false
+        required: false
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  group: patch-bump-denext-${{ inputs.base }}
+  cancel-in-progress: false
+
+jobs:
+  bump:
+    name: patch bump
+    if: github.repository == 'Brainwires/rusty_v8'
+    # The self-hosted Linux runner RUNNER_LINUX_X64 names (a label or a JSON
+    # array), else ubuntu-22.04.
+    runs-on: ${{ fromJSON(startsWith(vars.RUNNER_LINUX_X64, '[') && vars.RUNNER_LINUX_X64 || format('"{0}"', vars.RUNNER_LINUX_X64 || 'ubuntu-22.04')) }}
+    timeout-minutes: 30
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ inputs.base }}
+          # The submodules are not cloned: the script fetches V8's branch
+          # history itself (Chromium serves branch tips only, so a pin that is
+          # no longer one cannot be fetched by its hash).
+          submodules: false
+          # The bump branch is pushed with the workflow token.
+          persist-credentials: true
+      - name: Unit tests of the bump script
+        run: python3 -I tools/denext_patch_bump_test.py
+      - name: Bump
+        env:
+          BASE: ${{ inputs.base }}
+          DRY_RUN: ${{ inputs.dry_run }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          args=(--base "$BASE")
+          if [ "$DRY_RUN" = "true" ]; then args+=(--dry-run); fi
+          python3 -I tools/denext_patch_bump.py "${args[@]}" | tee -a "$GITHUB_STEP_SUMMARY"
