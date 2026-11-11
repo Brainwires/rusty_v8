@@ -389,8 +389,10 @@ void Subgraph<MaglevGraphOptimizer>::Goto(Label* label) {
 
 void Subgraph<MaglevGraphOptimizer>::Bind(Label* label) {
   DCHECK_NULL(reducer_->current_block());
-  DCHECK_NOT_NULL(label->variable_merge_state_);
+  CHECK_NOT_NULL(label->variable_merge_state_);
+  DCHECK_NULL(label->merge_state_);
   MergePointInterpreterFrameState* merge_state = label->variable_merge_state_;
+  label->variable_merge_state_ = nullptr;
   DCHECK_EQ(merge_state->predecessors_so_far(), label->predecessor_count_);
   DCHECK_GT(label->predecessor_count_, 0);
 
@@ -589,6 +591,20 @@ void MaglevGraphOptimizer::RecordBoundsCheckRefinement(
 bool MaglevGraphOptimizer::IsRangeLessEqual(ValueNode* lhs, ValueNode* rhs) {
   if (!ranges_) return false;
   return ranges_->IsLessEqualConstraint(reducer_.current_block(), lhs, rhs);
+}
+
+ProcessResult MaglevGraphOptimizer::OverwriteWith(Opcode opcode) {
+  TRACE(TraceColor::kDarkGreen << "Overwriting "
+                               << PrintNodeLabel(current_node()) << " with "
+                               << opcode);
+
+  current_node()->OverwriteWith(opcode);
+
+  // Since we've changed the type of the node, we need to trigger a revisit,
+  // otherwise the next processors would see a stale static type for this node
+  // and will thus wrongly treat it as a node of the old type instead of the new
+  // one.
+  return ProcessResult::kRevisit;
 }
 
 ProcessResult MaglevGraphOptimizer::ReplaceWith(ValueNode* node) {
@@ -2697,7 +2713,7 @@ UNTAGGING_CASE(UnsafeNumberOrOddballToHoleyFloat64, HoleyFloat64,
     REPLACE_AND_RETURN_IF_DONE(GetUntaggedValueWithRepresentation(    \
         node->input_node(0), UseRepresentation::k##Repr, ConvType));  \
     if (reducer_.CheckType(node->input_node(0), ConvType)) {          \
-      node->OverwriteWith(Opcode::k##UnsafeNode);                     \
+      return OverwriteWith(Opcode::k##UnsafeNode);                    \
     }                                                                 \
     return ProcessResult::kContinue;                                  \
   }
@@ -2749,7 +2765,7 @@ ProcessResult MaglevGraphOptimizer::VisitCheckedSmiUntag(
   // }
   // DCHECK(maybe_input.IsFail());
   if (reducer_.CheckType(node->input_node(0), NodeType::kSmi)) {
-    node->OverwriteWith(Opcode::kUnsafeSmiUntag);
+    return OverwriteWith(Opcode::kUnsafeSmiUntag);
   }
   return ProcessResult::kContinue;
 }
@@ -2771,7 +2787,7 @@ ProcessResult MaglevGraphOptimizer::VisitCheckedNumberToFloat64(
     return ProcessResult::kTruncateBlock;
   }
   if (reducer_.CheckType(node->input_node(0), NodeType::kNumber)) {
-    node->OverwriteWith(Opcode::kUnsafeNumberToFloat64);
+    return OverwriteWith(Opcode::kUnsafeNumberToFloat64);
   }
   return ProcessResult::kContinue;
 }
@@ -2795,7 +2811,7 @@ ProcessResult MaglevGraphOptimizer::VisitUnsafeFloat64ToHoleyFloat64(
   // undefined NaN since the widen was chosen, and widening those would give
   // them back their meaning.
   if (node->ValueInput().node()->MayBeHoleOrUndefinedNan()) {
-    node->OverwriteWith(Opcode::kChangeFloat64ToHoleyFloat64);
+    return OverwriteWith(Opcode::kChangeFloat64ToHoleyFloat64);
   }
   return ProcessResult::kContinue;
 }
@@ -3975,7 +3991,7 @@ ProcessResult MaglevGraphOptimizer::VisitTruncateCheckedNumberAsSafeIntToInt32(
     return ReplaceWith(node->input_node(0)->input_node(0));
   }
   if (reducer_.CheckType(node->input_node(0), NodeType::kNumber)) {
-    node->OverwriteWith(Opcode::kTruncateUnsafeNumberAsSafeIntToInt32);
+    return OverwriteWith(Opcode::kTruncateUnsafeNumberAsSafeIntToInt32);
   }
   return ProcessResult::kContinue;
 }
