@@ -3,6 +3,57 @@
 This fork builds rusty_v8 for the Brainwires Deno fork (denext's runtime). It exists to ship V8
 security fixes that upstream rusty_v8 has not released yet. It is not published to crates.io.
 
+## `v156.0.0-denext.5`: V8 15.6.75.57
+
+A patch-level move on `branch-heads/15.6`, at its head on 2026-11-10: the `v8` submodule moves from
+15.6.75.38 (`96c8e217cf`) to 15.6.75.57 (`5e51e9c607`), by tools/denext_patch_bump.py. The merges
+between them:
+
+- `afdae2c4a4` [M156] [maglev] Don't reuse outer kReceiver call feedback in reduced apply (crbug
+  581669316, 579313083).
+- `5973dddf82` [M156] [maglev] Do not unwrap lossy conversions in KNA (crbug 579236223, 578322433).
+- `35c381facb` [M156] [maglev] Fix bailouts messing up non-escaping use counting (crbug 582139269,
+  577242082).
+- `b269433434` [M156] [wasm] Check value type before i8/i16 load elimination (crbug 581669522,
+  579313193).
+- `6d48417787` [M156] [maglev] Merge dead subgraph loops on early abort (crbug 582139364,
+  577305517).
+- `467188466b` [M156] [maglev] CreateObjectLiteral and CreateArrayLiteral can write (crbug
+  582593299, 575525282, 574059463).
+- `5efaafcabd` [M156] [compiler] Ensure deopt literal is object before comparing to closure (crbug
+  578796230, 577327383).
+- `3c1ccfb529` [M156] [ic] Use StoreGlobalProxy handler for non-contextual stores to global (crbug
+  580877484, 574222006).
+- `ff4fec63d1` [M156] [arm64] Use MacroAssembler::Add in PopTempStackSlots (crbug 582138612,
+  578656106).
+- `c3b6d0db44` [M156] [wasm] Fix exception propagation check on secondary stacks (crbug 582594131,
+  575939904).
+- `9318a91878` [M156] [turbolev] Return kRevisit when overwriting nodes in place (crbug 568633429).
+- `9eeab36fc5` [M156] [ic] Fix handling of detached globals (crbug 580836455, 575524702).
+- `34ad0107f8` [M156] [turbofan] Fix self-referential DeadValue in EscapeAnalysisReducer (crbug
+  582593756, 579278668).
+- `9ba5fcd3c9` [M156] [interpreter] Only track eval ScopeInfos within closure scope (crbug
+  582138459, 577453560).
+- `fceab3ac1c` [M156] [regalloc] Fix off-by-one deferred-region clamp in AllocateBlockedReg (crbug
+  583015431, 560620348).
+- `dfe5a31fd8` [M156] [maglev] Use an explicit resume_mode_ handshake to skip IteratorResult (crbug
+  583947034).
+- `58707c0ea5` [M156] [objects] Disallow JSObject modifications during GC and GC callbacks (crbug
+  584119868, 577366752).
+- `52dff94f2f` [M156] [compiler] Mark string-keyed ordered hash lookups as writing (crbug 582138456,
+  577461556).
+- `197b819859` [M156] [maglev] Check that SubgraphBase::Label is bound before destruction (crbug
+  584118747, 580867734, 558240761).
+
+V8's public headers did not change apart from `include/v8-version.h`. `58707c0ea5` adds a
+`DisallowJSObjectModification` scope around GC callbacks, weak callbacks and Oilpan finalizers; it
+is a `DCHECK` only, so release builds behave as before, and a debug build reports an embedder
+callback that changes an object's shape during GC. The read-only heap guard of `denext.3` is
+unchanged.
+
+V8's `DEPS` did not change, and the `denext/patches/v8` series applies unchanged. The crate is
+`156.0.0+denext.5`.
+
 ## `v156.0.0-denext.4`: V8 15.6.75.38
 
 A patch-level move on `branch-heads/15.6`, which was at its head on 2026-11-03: the `v8` submodule
