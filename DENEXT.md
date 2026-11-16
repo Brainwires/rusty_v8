@@ -3,6 +3,29 @@
 This fork builds rusty_v8 for the Brainwires Deno fork (denext's runtime). It exists to ship V8
 security fixes that upstream rusty_v8 has not released yet. It is not published to crates.io.
 
+## `v156.0.0-denext.6`: V8 15.6.75.63
+
+A patch-level move on `branch-heads/15.6`, at its head on 2026-11-16: the `v8` submodule moves from
+15.6.75.57 (`5e51e9c607`) to 15.6.75.63 (`0c5649e53a`). The merges between them:
+
+- `913311524c` [M156] [turboshaft] Invalidate load elimination on CatchBlockBegin (crbug 583997430,
+  581361633).
+- `95b829dd78` [M156] [ic] Fix cross-context Object.create(..) and prototype access checks (crbug
+  582276825, 577336108).
+- `fc84cf914b` [M156] [parser] Fix heritage scope handling when reparsing class initializers (crbug
+  585801119, 584005343).
+- `7fd7b396c0` [M156] [objects] Clear cached ObjectCreateMap on JSGlobalProxy map migration (crbug
+  582276825, 583109107, 577336108).
+
+`af144bc8d4` [M156] [builtins] Enforce no-JS execution scopes in InvokeApiFunction is in the range
+too, but `a62636bc52` reverts it on the branch, so the two cancel out.
+
+V8's public headers did not change apart from `include/v8-version.h`. The read-only heap guard of
+`denext.3` is unchanged.
+
+V8's `DEPS` did not change, and the `denext/patches/v8` series applies unchanged. The crate is
+`156.0.0+denext.6`.
+
 ## `v156.0.0-denext.5`: V8 15.6.75.57
 
 A patch-level move on `branch-heads/15.6`, at its head on 2026-11-10: the `v8` submodule moves from
