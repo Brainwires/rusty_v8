@@ -102,7 +102,8 @@ void PrototypeInfo::set_cached_handler(int index,
   cached_handler_[index].store(this, value, mode);
 }
 
-Tagged<MaybeObject> PrototypeInfo::ObjectCreateMap() {
+Tagged<MaybeObject> PrototypeInfo::ObjectCreateMap(
+    Tagged<Context> accessing_context) {
   auto derived = derived_maps();
   if (IsUndefined(derived)) {
     return Tagged<MaybeObject>();
@@ -112,6 +113,9 @@ Tagged<MaybeObject> PrototypeInfo::ObjectCreateMap() {
   DCHECK_GT(derived_list->length().value(), 0);
   Tagged<MaybeObject> el = derived_list->Get(0);
   DCHECK(el.IsWeakOrCleared());
+  DCHECK_IMPLIES(!el.IsCleared(),
+                 Cast<Map>(el.GetHeapObjectAssumeWeak())
+                     ->BelongsToSameNativeContextAs(accessing_context));
   return el;
 }
 
@@ -120,7 +124,8 @@ Tagged<MaybeObject> PrototypeInfo::ObjectCreateMap(AcquireLoadTag tag) {
   if (IsUndefined(derived)) {
     return Tagged<MaybeObject>();
   }
-  // Index 0 is the map for object create
+  // Index 0 is the map for object create. Note: concurrent callers must check
+  // that the returned map belongs to the accessing native context.
   Tagged<WeakArrayList> derived_list = Cast<WeakArrayList>(derived);
   DCHECK_GT(derived_list->length().value(), 0);
   Tagged<MaybeObject> el = derived_list->get(0, kAcquireLoad);
@@ -128,10 +133,20 @@ Tagged<MaybeObject> PrototypeInfo::ObjectCreateMap(AcquireLoadTag tag) {
   return el;
 }
 
+void PrototypeInfo::ClearObjectCreateMap() {
+  auto derived = derived_maps();
+  if (IsUndefined(derived)) return;
+  Tagged<WeakArrayList> derived_list = Cast<WeakArrayList>(derived);
+  DCHECK_GT(derived_list->length().value(), 0);
+  derived_list->set(0, kClearedWeakValue, kReleaseStore);
+}
+
 // static
 void PrototypeInfo::SetObjectCreateMap(DirectHandle<PrototypeInfo> info,
                                        DirectHandle<Map> map,
                                        Isolate* isolate) {
+  DCHECK(map->BelongsToSameNativeContextAs(isolate->raw_native_context()));
+  DCHECK(map->BelongsToSameNativeContextAs(map->prototype()->map()));
   if (IsUndefined(info->derived_maps())) {
     Tagged<WeakArrayList> derived = *isolate->factory()->NewWeakArrayList(1);
     derived->Set(0, MakeWeak(*map));
